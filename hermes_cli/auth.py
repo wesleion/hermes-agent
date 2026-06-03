@@ -1194,7 +1194,7 @@ def get_auth_provider_display_name(provider_id: str) -> str:
     return SERVICE_PROVIDER_NAMES.get(normalized, provider_id)
 
 
-def read_credential_pool(provider_id: Optional[str] = None) -> Dict[str, Any]:
+def read_credential_pool(provider_id: Optional[str] = None) -> Any:
     """Return the persisted credential pool, or one provider slice.
 
     In profile mode, the profile's credential pool is authoritative. If a
@@ -1226,17 +1226,19 @@ def read_credential_pool(provider_id: Optional[str] = None) -> Dict[str, Any]:
         for gp_key, gp_entries in global_pool.items():
             if not isinstance(gp_entries, list) or not gp_entries:
                 continue
-            # Per-provider shadowing: profile wins whenever it has ANY entries.
-            existing = merged.get(gp_key)
-            if isinstance(existing, list) and existing:
+            # Per-provider shadowing: profile wins whenever it explicitly has
+            # that provider key, even if the list is empty.  An empty list is a
+            # deliberate local logout/remove state and must not resurrect global
+            # credentials.
+            if gp_key in merged:
                 continue
             merged[gp_key] = list(gp_entries)
         return merged
 
-    provider_entries = pool.get(provider_id)
-    if isinstance(provider_entries, list) and provider_entries:
-        return list(provider_entries)
-    # Profile has no entries for this provider — fall back to global.
+    if provider_id in pool:
+        provider_entries = pool.get(provider_id)
+        return list(provider_entries) if isinstance(provider_entries, list) else []
+    # Profile has no key for this provider — fall back to global.
     global_entries = global_pool.get(provider_id)
     return list(global_entries) if isinstance(global_entries, list) else []
 
@@ -3354,25 +3356,20 @@ def _sync_codex_pool_entries(
     * ``device_code`` — the singleton-seeded entry written by the device-code
       OAuth flow when the user logged in via ``hermes setup`` / the model
       picker.  Always synced with the fresh tokens.
-    * ``manual:device_code`` — entries created by ``hermes auth add openai-codex``
-      that use the same device-code OAuth mechanism.  An interactive re-auth
-      proves the user owns the ChatGPT account, so it is safe (and expected)
-      to refresh these entries too.  Without this, a user who once ran the
-      ``hermes auth add`` workaround for #33000 would silently leave that
-      manual entry stale on every subsequent re-auth, recreating the issue
-      reported in #33538.
 
     What does NOT get refreshed:
 
-    * ``manual:api_key`` and any other non-device-code manual sources — those
-      are independent credentials (an explicit API key, a different ChatGPT
-      account, etc.) and must not be overwritten by a single re-auth.
+    * ``manual:device_code`` entries created by ``hermes auth add openai-codex``
+      are independent ChatGPT/Codex accounts in the pool.  A fresh login to one
+      account must never overwrite those entries, or a multi-account pool
+      collapses into N labels pointing at the same token.
+    * ``manual:api_key`` and any other non-device-code manual sources are also
+      independent credentials and must not be overwritten by a single re-auth.
 
-    Error markers (``last_status``, ``last_error_*``) are also cleared on
-    every device-code-backed entry — even those whose tokens we did not
-    rewrite — so that an interactive re-auth gives every relevant pool entry
-    a fresh selection chance instead of leaving them marked unhealthy from a
-    pre-re-auth 401.
+    Error markers (``last_status``, ``last_error_*``) are cleared only on
+    the singleton entry whose tokens are actually rewritten.  Manual entries
+    keep their health state because this singleton re-auth did not verify or
+    refresh those independent accounts.
     """
     access_token = tokens.get("access_token")
     if not access_token:
@@ -3384,10 +3381,10 @@ def _sync_codex_pool_entries(
     entries = pool.get("openai-codex")
     if not isinstance(entries, list):
         return
-    # Sources whose tokens should be rewritten by a fresh Codex device-code
-    # OAuth re-auth.  ``manual:api_key`` and unknown sources are intentionally
-    # excluded — they represent independent credentials.
-    REFRESHABLE_SOURCES = {"device_code", "manual:device_code"}
+    # Only the singleton-seeded entry should be rewritten by a fresh Codex
+    # device-code OAuth re-auth.  Manually added device-code entries are
+    # independent pool accounts; rewriting them collapses account rotation.
+    REFRESHABLE_SOURCES = {"device_code"}
     for entry in entries:
         if not isinstance(entry, dict):
             continue

@@ -397,11 +397,12 @@ def test_auth_add_codex_oauth_persists_pool_entry(tmp_path, monkeypatch):
 
     payload = json.loads((tmp_path / "hermes" / "auth.json").read_text())
     entries = payload["credential_pool"]["openai-codex"]
-    entry = next(item for item in entries if item["source"] == "device_code")
-    assert payload["active_provider"] == "openai-codex"
-    assert payload["providers"]["openai-codex"]["tokens"]["access_token"] == token
+    assert "openai-codex" not in payload.get("providers", {})
+    assert len(entries) == 1
+    entry = entries[0]
     assert entry["label"] == "codex@example.com"
-    assert entry["source"] == "device_code"
+    assert entry["source"] == "manual:device_code"
+    assert entry["access_token"] == token
     assert entry["refresh_token"] == "refresh-token"
     assert entry["base_url"] == "https://chatgpt.com/backend-api/codex"
 
@@ -456,6 +457,66 @@ def test_auth_add_xai_oauth_sets_active_provider(tmp_path, monkeypatch):
     entries = payload["credential_pool"]["xai-oauth"]
     entry = next(item for item in entries if item["source"] == "loopback_pkce")
     assert entry["refresh_token"] == "xai-refresh-token"
+
+
+def test_codex_singleton_reauth_does_not_overwrite_manual_pool_entries(tmp_path, monkeypatch):
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path / "hermes"))
+    _write_auth_store(
+        tmp_path,
+        {
+            "version": 1,
+            "providers": {},
+            "credential_pool": {
+                "openai-codex": [
+                    {
+                        "id": "singleton",
+                        "label": "singleton",
+                        "auth_type": "oauth",
+                        "priority": 0,
+                        "source": "device_code",
+                        "access_token": "old-singleton-access",
+                        "refresh_token": "old-singleton-refresh",
+                    },
+                    {
+                        "id": "manual-a",
+                        "label": "manual-a",
+                        "auth_type": "oauth",
+                        "priority": 1,
+                        "source": "manual:device_code",
+                        "access_token": "manual-a-access",
+                        "refresh_token": "manual-a-refresh",
+                    },
+                    {
+                        "id": "manual-b",
+                        "label": "manual-b",
+                        "auth_type": "oauth",
+                        "priority": 2,
+                        "source": "manual:device_code",
+                        "access_token": "manual-b-access",
+                        "refresh_token": "manual-b-refresh",
+                    },
+                ]
+            },
+        },
+    )
+
+    from hermes_cli.auth import _save_codex_tokens
+
+    _save_codex_tokens(
+        {"access_token": "new-singleton-access", "refresh_token": "new-singleton-refresh"},
+        last_refresh="2026-03-23T10:00:00Z",
+        label="singleton-new",
+    )
+
+    payload = json.loads((tmp_path / "hermes" / "auth.json").read_text())
+    entries = payload["credential_pool"]["openai-codex"]
+    by_id = {entry["id"]: entry for entry in entries}
+    assert by_id["singleton"]["access_token"] == "new-singleton-access"
+    assert by_id["singleton"]["refresh_token"] == "new-singleton-refresh"
+    assert by_id["manual-a"]["access_token"] == "manual-a-access"
+    assert by_id["manual-a"]["refresh_token"] == "manual-a-refresh"
+    assert by_id["manual-b"]["access_token"] == "manual-b-access"
+    assert by_id["manual-b"]["refresh_token"] == "manual-b-refresh"
 
 
 def test_auth_remove_reindexes_priorities(tmp_path, monkeypatch):
@@ -1315,8 +1376,8 @@ def test_auth_add_codex_clears_suppression_marker(tmp_path, monkeypatch):
     assert "openai-codex" not in payload.get("suppressed_sources", {})
     # New pool entry must be present
     entries = payload["credential_pool"]["openai-codex"]
-    assert any(e["source"] == "device_code" for e in entries)
-    assert payload["active_provider"] == "openai-codex"
+    assert any(e["source"] == "manual:device_code" for e in entries)
+    assert "openai-codex" not in payload.get("providers", {})
 
 
 def test_seed_from_singletons_respects_codex_suppression(tmp_path, monkeypatch):
@@ -1531,12 +1592,14 @@ def test_seed_from_env_respects_openrouter_suppression(tmp_path, monkeypatch):
     assert active == set()
 
 
-# =============================================================================
+# ======================================================================
+
 # Unified credential-source stickiness — every source Hermes reads from has a
 # registered RemovalStep in agent.credential_sources, and every seeding path
 # gates on is_source_suppressed.  Below: one test per source proving remove
 # sticks across a fresh load_pool() call.
-# =============================================================================
+# ======================================================================
+
 
 
 def test_seed_from_singletons_respects_nous_suppression(tmp_path, monkeypatch):
