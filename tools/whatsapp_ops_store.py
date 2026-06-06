@@ -368,6 +368,10 @@ def create_approval(draft_id: str, timeout_minutes: int = 60) -> dict[str, str]:
                 now_dt.isoformat(),
             ),
         )
+        conn.execute(
+            "UPDATE drafts SET status=?, updated_at=? WHERE id=?",
+            ("approved", now_dt.isoformat(), draft_id),
+        )
     return {"approval_id": approval_id, "approval_token": token, "expires_at": expires_at}
 
 
@@ -456,6 +460,36 @@ def mark_outbox_result(draft_id: str, idempotency_key: str, status: str, last_er
                 now,
             ),
         )
+
+
+def reserve_outbox_send(draft_id: str, idempotency_key: str) -> bool:
+    init_db()
+    now = utc_now()
+    with _connect() as conn:
+        try:
+            conn.execute(
+                """
+                INSERT INTO outbox (
+                    id, draft_id, idempotency_key, status, attempt_count,
+                    last_error, scheduled_for, sent_at, created_at, updated_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    "outbox_" + uuid.uuid4().hex[:12],
+                    draft_id,
+                    idempotency_key,
+                    "sending",
+                    0,
+                    None,
+                    None,
+                    None,
+                    now,
+                    now,
+                ),
+            )
+            return True
+        except sqlite3.IntegrityError:
+            return False
 
 
 def update_draft_status(draft_id: str, status: str, send_at: str | None = None) -> None:

@@ -156,6 +156,37 @@ def test_send_guardrails_reject_malformed_string_target_without_crashing():
     assert "payload_invalid" in result.reasons
 
 
+def test_send_guardrails_reject_cancelled_or_sent_draft_status():
+    from tools.whatsapp_ops_policy import evaluate_send_guardrails
+
+    for status in ["cancelled", "sent", "failed", "draft"]:
+        result = evaluate_send_guardrails(
+            config=_base_config(),
+            draft=_draft(status=status),
+            approval=_approval(),
+            idempotency_used=False,
+        )
+        assert result.allowed is False
+        assert "draft_status_invalid" in result.reasons
+
+
+def test_send_guardrails_reject_scheduled_draft_before_send_at():
+    from tools.whatsapp_ops_policy import evaluate_send_guardrails
+
+    result = evaluate_send_guardrails(
+        config=_base_config(),
+        draft=_draft(
+            status="scheduled",
+            send_at=(datetime.now(timezone.utc) + timedelta(minutes=10)).isoformat(),
+        ),
+        approval=_approval(),
+        idempotency_used=False,
+    )
+
+    assert result.allowed is False
+    assert "draft_not_due" in result.reasons
+
+
 def test_send_guardrails_allow_only_when_all_conditions_pass():
     from tools.whatsapp_ops_policy import evaluate_send_guardrails
 

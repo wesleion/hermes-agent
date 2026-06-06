@@ -31,6 +31,18 @@ def _is_expired(value: str | None) -> bool:
     return expires <= datetime.now(timezone.utc)
 
 
+def _is_future(value: str | None) -> bool:
+    if not value:
+        return False
+    try:
+        due_at = datetime.fromisoformat(value.replace("Z", "+00:00"))
+    except ValueError:
+        return True
+    if due_at.tzinfo is None:
+        due_at = due_at.replace(tzinfo=timezone.utc)
+    return due_at > datetime.now(timezone.utc)
+
+
 def evaluate_send_guardrails(
     *,
     config: dict[str, Any],
@@ -54,6 +66,13 @@ def evaluate_send_guardrails(
     if draft is None:
         reasons.append("draft_missing")
         return GuardrailResult(False, reasons)
+
+    draft_status = str(draft.get("status") or "")
+    if draft_status == "scheduled":
+        if _is_future(draft.get("send_at")):
+            reasons.append("draft_not_due")
+    elif draft_status != "approved":
+        reasons.append("draft_status_invalid")
 
     if draft.get("has_untrusted_media"):
         reasons.append("media_untrusted")
