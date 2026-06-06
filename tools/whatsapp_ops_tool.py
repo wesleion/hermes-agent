@@ -12,6 +12,11 @@ from typing import Any, Callable
 from tools.registry import registry
 from tools.whatsapp_ops_policy import evaluate_send_guardrails
 from tools.whatsapp_ops_quepasa import send_via_quepasa
+
+try:  # config loading is best-effort; tool remains fail-closed if unavailable
+    from hermes_cli.config import load_config
+except Exception:  # pragma: no cover - defensive for stripped runtimes
+    load_config = None
 from tools.whatsapp_ops_store import (
     create_approval,
     create_draft,
@@ -40,6 +45,31 @@ def _default_config() -> dict[str, Any]:
         "allowlists": {"contacts": [], "groups": []},
         "quepasa": {"backend": "n8n_or_http", "send_enabled": False},
     }
+
+
+def _deep_merge(base: dict[str, Any], override: dict[str, Any]) -> dict[str, Any]:
+    merged = dict(base)
+    for key, value in override.items():
+        if isinstance(value, dict) and isinstance(merged.get(key), dict):
+            merged[key] = _deep_merge(merged[key], value)
+        else:
+            merged[key] = value
+    return merged
+
+
+def _runtime_config() -> dict[str, Any]:
+    """Load profile-scoped whatsapp_ops config, preserving fail-closed defaults."""
+    cfg = _default_config()
+    if load_config is None:
+        return cfg
+    try:
+        loaded = load_config() or {}
+    except Exception:
+        return cfg
+    whatsapp_ops = loaded.get("whatsapp_ops")
+    if isinstance(whatsapp_ops, dict):
+        return _deep_merge(cfg, whatsapp_ops)
+    return cfg
 
 
 def _draft_for_policy(draft: dict[str, Any] | None) -> dict[str, Any] | None:
@@ -94,7 +124,7 @@ def wpp_send_approved(
 ) -> str:
     """Send an approved draft only if deterministic guardrails allow it."""
     init_db()
-    cfg = config or _default_config()
+    cfg = config if config is not None else _runtime_config()
     draft = get_draft(draft_id)
     approval = get_valid_approval(draft_id, approval_token)
     policy_draft = _draft_for_policy(draft)

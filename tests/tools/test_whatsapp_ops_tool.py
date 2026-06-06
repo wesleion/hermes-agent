@@ -105,6 +105,45 @@ def test_wpp_send_approved_rejects_without_approval_token(tmp_path):
     send_client.assert_not_called()
 
 
+def test_wpp_send_approved_uses_profile_config_when_no_explicit_config(tmp_path):
+    from tools.whatsapp_ops_store import create_approval, create_draft, init_db
+    from tools.whatsapp_ops_tool import wpp_send_approved
+
+    send_client = Mock(return_value={"ok": True, "transport": "mock"})
+    (tmp_path / "config.yaml").write_text(
+        "whatsapp_ops:\n"
+        "  send_enabled: true\n"
+        "  allowlists:\n"
+        "    contacts:\n"
+        "      - c_1\n"
+        "    groups: []\n"
+        "  quepasa:\n"
+        "    send_enabled: true\n",
+        encoding="utf-8",
+    )
+
+    token = set_hermes_home_override(tmp_path)
+    try:
+        init_db()
+        draft = create_draft(
+            targets=[{"type": "contact", "contact_id": "c_1"}],
+            message="Config do profile habilita envio mockado",
+        )
+        approval = create_approval(draft["draft_id"], timeout_minutes=60)
+        result = _parse(
+            wpp_send_approved(
+                draft_id=draft["draft_id"],
+                approval_token=approval["approval_token"],
+                send_client=send_client,
+            )
+        )
+    finally:
+        reset_hermes_home_override(token)
+
+    assert result["ok"] is True
+    send_client.assert_called_once()
+
+
 def test_whatsapp_ops_toolset_is_registered():
     import tools.whatsapp_ops_tool  # noqa: F401
     from tools.registry import registry
