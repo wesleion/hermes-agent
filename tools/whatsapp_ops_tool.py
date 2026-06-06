@@ -7,9 +7,6 @@ code-level guardrails pass; prompt instructions are never the send gate.
 from __future__ import annotations
 
 import json
-import os
-import urllib.error
-import urllib.request
 from typing import Any, Callable
 
 from tools.registry import registry
@@ -24,16 +21,13 @@ from tools.whatsapp_ops_store import (
     create_approval,
     create_draft,
     get_draft,
-    get_latest_approval,
     get_valid_approval,
     idempotency_used,
     init_db,
     list_contacts,
-    lookup_inbound_events,
     mark_outbox_blocked,
     mark_outbox_result,
     reserve_outbox_send,
-    resolve_approval,
     resolve_contact,
     update_draft_status,
 )
@@ -49,7 +43,7 @@ def _default_config() -> dict[str, Any]:
     return {
         "send_enabled": False,
         "kill_switch": False,
-        "approval": {"required": True, "timeout_minutes": 60, "telegram": {}},
+        "approval": {"required": True, "timeout_minutes": 60},
         "allowlists": {"contacts": [], "groups": []},
         "quepasa": {"backend": "n8n_or_http", "send_enabled": False},
     }
@@ -109,81 +103,6 @@ def _approval_for_policy(approval: dict[str, Any] | None) -> dict[str, Any] | No
     }
 
 
-def _telegram_destination(cfg: dict[str, Any]) -> tuple[str, str | None]:
-    raw_approval_cfg = cfg.get("approval")
-    approval_cfg: dict[str, Any] = raw_approval_cfg if isinstance(raw_approval_cfg, dict) else {}
-    raw_tg_cfg = approval_cfg.get("telegram")
-    tg_cfg: dict[str, Any] = raw_tg_cfg if isinstance(raw_tg_cfg, dict) else {}
-    chat_id = str(
-        tg_cfg.get("chat_id")
-        or os.environ.get("WHATSAPP_OPS_APPROVAL_TELEGRAM_CHAT_ID")
-        or os.environ.get("TELEGRAM_HOME_CHANNEL")
-        or ""
-    ).strip()
-    thread_id = str(
-        tg_cfg.get("thread_id")
-        or os.environ.get("WHATSAPP_OPS_APPROVAL_TELEGRAM_THREAD_ID")
-        or os.environ.get("TELEGRAM_HOME_CHANNEL_THREAD_ID")
-        or ""
-    ).strip() or None
-    return chat_id, thread_id
-
-
-def _send_telegram_approval_card(approval: dict[str, Any], draft: dict[str, Any] | None, cfg: dict[str, Any]) -> dict[str, Any]:
-    """Send a Telegram inline approval card without exposing approval secrets."""
-    token = os.environ.get("TELEGRAM_BOT_TOKEN", "").strip()
-    chat_id, thread_id = _telegram_destination(cfg)
-    if not token:
-        return {"ok": False, "reason": "telegram_token_missing"}
-    if not chat_id:
-        return {"ok": False, "reason": "telegram_chat_missing"}
-    approval_id = approval.get("approval_id", "")
-    draft_id = approval.get("draft_id") or (draft or {}).get("id", "")
-    text_preview = str((draft or {}).get("message", ""))[:700]
-    text = (
-        "📲 <b>WhatsApp Ops approval</b>\n\n"
-        f"Draft: <code>{draft_id}</code>\n"
-        f"Approval: <code>{approval_id}</code>\n\n"
-        f"<pre>{text_preview}</pre>\n\n"
-        "Aprovar só marca o draft como approved. O envio continua separado."
-    )
-    payload: dict[str, Any] = {
-        "chat_id": chat_id,
-        "text": text,
-        "parse_mode": "HTML",
-        "reply_markup": {
-            "inline_keyboard": [[
-                {"text": "✅ Aprovar", "callback_data": f"wpp:a:{approval_id}"},
-                {"text": "❌ Negar", "callback_data": f"wpp:d:{approval_id}"},
-            ]]
-        },
-        "disable_web_page_preview": True,
-    }
-    if thread_id:
-        try:
-            payload["message_thread_id"] = int(thread_id)
-        except ValueError:
-            payload["message_thread_id"] = thread_id
-    req = urllib.request.Request(
-        f"https://api.telegram.org/bot{token}/sendMessage",
-        data=json.dumps(payload, ensure_ascii=False).encode("utf-8"),
-        headers={"Content-Type": "application/json"},
-        method="POST",
-    )
-    try:
-        with urllib.request.urlopen(req, timeout=10) as resp:
-            body = json.loads(resp.read().decode("utf-8") or "{}")
-    except urllib.error.HTTPError as exc:
-        return {"ok": False, "reason": "telegram_http_error", "status": exc.code}
-    except Exception as exc:
-        return {"ok": False, "reason": "telegram_error", "error": str(exc)[:120]}
-    result = body.get("result") if isinstance(body, dict) else None
-    return {
-        "ok": bool(body.get("ok")) if isinstance(body, dict) else False,
-        "message_id": str((result or {}).get("message_id", "")) if isinstance(result, dict) else "",
-    }
-
-
 def wpp_create_draft(
     targets: list[dict[str, Any]],
     message: str,
@@ -201,11 +120,11 @@ def wpp_create_draft(
 
 def wpp_send_approved(
     draft_id: str,
-    approval_token: str | None = None,
+    approval_token: str,
     config: dict[str, Any] | None = None,
     send_client: Callable[[dict[str, Any], dict[str, Any]], dict[str, Any]] | None = None,
 ) -> str:
-    """Send an explicitly human-approved draft only if guardrails allow it."""
+    """Send an approved draft only if deterministic guardrails allow it."""
     init_db()
     cfg = config if config is not None else _runtime_config()
     draft = get_draft(draft_id)
@@ -243,29 +162,14 @@ def wpp_send_approved(
 
 
 def wpp_request_approval(draft_id: str) -> str:
-    cfg = _runtime_config()
+    cfg = _default_config()
     timeout = int((cfg.get("approval") or {}).get("timeout_minutes", 60))
     try:
         approval = create_approval(draft_id, timeout_minutes=timeout)
-        draft = get_draft(draft_id)
-        notification = _send_telegram_approval_card(approval, draft, cfg)
+        update_draft_status(draft_id, "approved")
     except Exception as exc:
         return _json({"ok": False, "error": str(exc)[:200]})
-    return _json({"ok": True, "draft_id": draft_id, **approval, "notification": notification})
-
-
-def wpp_resolve_approval(approval_id: str, decision: str, approver_ref: str = "") -> str:
-    if os.environ.get("WHATSAPP_OPS_TRUSTED_APPROVAL_CONTEXT") != "telegram_callback":
-        return _json({
-            "ok": False,
-            "approval_id": approval_id,
-            "error": "trusted_approval_context_required",
-        })
-    try:
-        resolved = resolve_approval(approval_id, decision=decision, approver_ref=approver_ref)
-    except Exception as exc:
-        return _json({"ok": False, "approval_id": approval_id, "error": str(exc)[:200]})
-    return _json(resolved)
+    return _json({"ok": True, "draft_id": draft_id, **approval})
 
 
 def wpp_schedule_draft(draft_id: str, send_at: str) -> str:
@@ -282,23 +186,12 @@ def wpp_status(draft_id: str) -> str:
     draft = get_draft(draft_id)
     if draft is None:
         return _json({"ok": False, "error": "draft_not_found"})
-    approval = get_latest_approval(draft_id)
-    approval_safe = None
-    if approval:
-        approval_safe = {
-            "approval_id": approval.get("id"),
-            "status": approval.get("status"),
-            "expires_at": approval.get("expires_at"),
-            "created_at": approval.get("created_at"),
-            "resolved_at": approval.get("resolved_at"),
-        }
     return _json({
         "ok": True,
         "draft_id": draft_id,
         "status": draft.get("status"),
         "send_at": draft.get("send_at"),
         "created_at": draft.get("created_at"),
-        "approval": approval_safe,
     })
 
 
@@ -310,32 +203,8 @@ def wpp_list_contacts(filtro: str = "") -> str:
     return _json({"ok": True, "filter": str(filtro)[:80], "contacts": list_contacts(filtro)})
 
 
-def wpp_inbound_lookup(thread: str = "", contact: str = "", limit: int = 20) -> str:
-    events = lookup_inbound_events(thread=str(thread or ""), contact=str(contact or ""), limit=limit)
-    return _json({"ok": True, "thread_filter_set": bool(thread), "contact_filter_set": bool(contact), "events": events})
-
-
-def wpp_ingest_inbound_event(payload: dict[str, Any]) -> str:
-    """Ingest a raw QuePasa inbound webhook payload into the sanitized local store."""
-    try:
-        from tools.whatsapp_ops_store import record_inbound_event
-        source_event_id = str(payload.get("id") or payload.get("message_id") or payload.get("msgid") or "")
-        chat_obj = payload.get("chat")
-        chat: dict[str, Any] = chat_obj if isinstance(chat_obj, dict) else {}
-        participant_obj = payload.get("participant")
-        participant: dict[str, Any] = participant_obj if isinstance(participant_obj, dict) else {}
-        contact_ref = str(participant.get("id") or chat.get("id") or payload.get("contact") or "")
-        thread_ref = str(chat.get("id") or payload.get("chatId") or payload.get("thread") or "")
-        result = record_inbound_event(
-            source_event_id=source_event_id,
-            contact_ref=contact_ref,
-            thread_ref=thread_ref,
-            payload=payload,
-            status="received",
-        )
-    except Exception as exc:
-        return _json({"ok": False, "error": str(exc)[:200]})
-    return _json(result)
+def wpp_inbound_lookup(thread: str = "", contact: str = "") -> str:
+    return _json({"ok": True, "thread": str(thread)[:80], "contact": str(contact)[:80], "events": []})
 
 
 def check_whatsapp_ops_requirements() -> bool:
@@ -409,33 +278,11 @@ registry.register(
     toolset=TOOLSET,
     schema=_schema(
         "wpp_request_approval",
-        "Create a pending human approval request for a draft. Does not expose approval tokens.",
+        "Create a one-time approval token for a draft.",
         {"draft_id": {"type": "string"}},
         ["draft_id"],
     ),
     handler=lambda args, **kw: wpp_request_approval(args.get("draft_id", "")),
-    check_fn=check_whatsapp_ops_requirements,
-    emoji="📲",
-)
-
-registry.register(
-    name="wpp_resolve_approval",
-    toolset=TOOLSET,
-    schema=_schema(
-        "wpp_resolve_approval",
-        "Resolve a WhatsApp draft approval as approved or denied from a trusted human approval context. This does not send.",
-        {
-            "approval_id": {"type": "string"},
-            "decision": {"type": "string", "enum": ["approved", "denied"]},
-            "approver_ref": {"type": "string"},
-        },
-        ["approval_id", "decision"],
-    ),
-    handler=lambda args, **kw: wpp_resolve_approval(
-        approval_id=args.get("approval_id", ""),
-        decision=args.get("decision", ""),
-        approver_ref=args.get("approver_ref", ""),
-    ),
     check_fn=check_whatsapp_ops_requirements,
     emoji="📲",
 )
@@ -461,12 +308,13 @@ registry.register(
     toolset=TOOLSET,
     schema=_schema(
         "wpp_send_approved",
-        "Attempt to send a human-approved WhatsApp draft. Fails closed unless all guardrails pass.",
-        {"draft_id": {"type": "string"}},
-        ["draft_id"],
+        "Attempt to send an approved WhatsApp draft. Fails closed unless all guardrails pass.",
+        {"draft_id": {"type": "string"}, "approval_token": {"type": "string"}},
+        ["draft_id", "approval_token"],
     ),
     handler=lambda args, **kw: wpp_send_approved(
         draft_id=args.get("draft_id", ""),
+        approval_token=args.get("approval_token", ""),
     ),
     check_fn=check_whatsapp_ops_requirements,
     emoji="📲",
@@ -506,26 +354,12 @@ registry.register(
     schema=_schema(
         "wpp_inbound_lookup",
         "Lookup sanitized inbound WhatsApp events.",
-        {"thread": {"type": "string"}, "contact": {"type": "string"}, "limit": {"type": "integer"}},
+        {"thread": {"type": "string"}, "contact": {"type": "string"}},
         [],
     ),
     handler=lambda args, **kw: wpp_inbound_lookup(
-        thread=args.get("thread", ""), contact=args.get("contact", ""), limit=args.get("limit", 20)
+        thread=args.get("thread", ""), contact=args.get("contact", "")
     ),
-    check_fn=check_whatsapp_ops_requirements,
-    emoji="📲",
-)
-
-registry.register(
-    name="wpp_ingest_inbound_event",
-    toolset=TOOLSET,
-    schema=_schema(
-        "wpp_ingest_inbound_event",
-        "Ingest a raw QuePasa inbound webhook payload into the sanitized local store. This never sends.",
-        {"payload": {"type": "object"}},
-        ["payload"],
-    ),
-    handler=lambda args, **kw: wpp_ingest_inbound_event(args.get("payload", {})),
     check_fn=check_whatsapp_ops_requirements,
     emoji="📲",
 )
