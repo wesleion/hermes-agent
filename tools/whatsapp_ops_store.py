@@ -425,6 +425,39 @@ def mark_outbox_blocked(draft_id: str, idempotency_key: str, reason: str) -> Non
         )
 
 
+def mark_outbox_result(draft_id: str, idempotency_key: str, status: str, last_error: str | None = None) -> None:
+    init_db()
+    now = utc_now()
+    sent_at = now if status == "sent" else None
+    with _connect() as conn:
+        conn.execute(
+            """
+            INSERT INTO outbox (
+                id, draft_id, idempotency_key, status, attempt_count,
+                last_error, scheduled_for, sent_at, created_at, updated_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            ON CONFLICT(idempotency_key) DO UPDATE SET
+                status=excluded.status,
+                attempt_count=outbox.attempt_count + 1,
+                last_error=excluded.last_error,
+                sent_at=excluded.sent_at,
+                updated_at=excluded.updated_at
+            """,
+            (
+                "outbox_" + uuid.uuid4().hex[:12],
+                draft_id,
+                idempotency_key,
+                status,
+                1,
+                (last_error or "")[:500] if last_error else None,
+                None,
+                sent_at,
+                now,
+                now,
+            ),
+        )
+
+
 def update_draft_status(draft_id: str, status: str, send_at: str | None = None) -> None:
     init_db()
     with _connect() as conn:

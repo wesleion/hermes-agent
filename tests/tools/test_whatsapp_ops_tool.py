@@ -144,6 +144,52 @@ def test_wpp_send_approved_uses_profile_config_when_no_explicit_config(tmp_path)
     send_client.assert_called_once()
 
 
+def test_wpp_send_approved_records_success_for_idempotency(tmp_path):
+    from tools.whatsapp_ops_store import create_approval, create_draft, init_db
+    from tools.whatsapp_ops_tool import wpp_send_approved
+
+    send_client = Mock(return_value={"ok": True, "transport": "mock"})
+    config = {
+        "send_enabled": True,
+        "kill_switch": False,
+        "approval": {"required": True, "timeout_minutes": 60},
+        "allowlists": {"contacts": ["c_1"], "groups": []},
+        "quepasa": {"send_enabled": True},
+    }
+
+    token = set_hermes_home_override(tmp_path)
+    try:
+        init_db()
+        draft = create_draft(
+            targets=[{"type": "contact", "contact_id": "c_1"}],
+            message="Envio unico com idempotencia",
+        )
+        approval = create_approval(draft["draft_id"], timeout_minutes=60)
+        first = _parse(
+            wpp_send_approved(
+                draft_id=draft["draft_id"],
+                approval_token=approval["approval_token"],
+                config=config,
+                send_client=send_client,
+            )
+        )
+        second = _parse(
+            wpp_send_approved(
+                draft_id=draft["draft_id"],
+                approval_token=approval["approval_token"],
+                config=config,
+                send_client=send_client,
+            )
+        )
+    finally:
+        reset_hermes_home_override(token)
+
+    assert first["ok"] is True
+    assert second["ok"] is False
+    assert "idempotency_duplicate" in second["reasons"]
+    send_client.assert_called_once()
+
+
 def test_whatsapp_ops_toolset_is_registered():
     import tools.whatsapp_ops_tool  # noqa: F401
     from tools.registry import registry

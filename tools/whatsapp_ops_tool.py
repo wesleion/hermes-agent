@@ -26,6 +26,7 @@ from tools.whatsapp_ops_store import (
     init_db,
     list_contacts,
     mark_outbox_blocked,
+    mark_outbox_result,
     resolve_contact,
     update_draft_status,
 )
@@ -148,6 +149,12 @@ def wpp_send_approved(
         "idempotency_key": idempotency_key,
     }
     send_result = client(payload, cfg)
+    if idempotency_key:
+        if bool(send_result.get("ok")):
+            mark_outbox_result(draft_id, idempotency_key, "sent")
+            update_draft_status(draft_id, "sent")
+        else:
+            mark_outbox_result(draft_id, idempotency_key, "failed", str(send_result.get("error", "send_failed")))
     return _json({"ok": bool(send_result.get("ok")), "draft_id": draft_id, "send_result": send_result})
 
 
