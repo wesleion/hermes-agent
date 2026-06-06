@@ -19,7 +19,9 @@ from tools.whatsapp_ops_store import (
     get_valid_approval,
     idempotency_used,
     init_db,
+    list_contacts,
     mark_outbox_blocked,
+    resolve_contact,
     update_draft_status,
 )
 
@@ -154,12 +156,11 @@ def wpp_status(draft_id: str) -> str:
 
 
 def wpp_resolve_contact(nome_ou_numero: str) -> str:
-    # Conservative v0.1: do not resolve unknown contacts from free text.
-    return _json({"ok": True, "ambiguous": True, "matches": [], "query": str(nome_ou_numero)[:80]})
+    return _json(resolve_contact(nome_ou_numero))
 
 
 def wpp_list_contacts(filtro: str = "") -> str:
-    return _json({"ok": True, "filter": str(filtro)[:80], "contacts": []})
+    return _json({"ok": True, "filter": str(filtro)[:80], "contacts": list_contacts(filtro)})
 
 
 def wpp_inbound_lookup(thread: str = "", contact: str = "") -> str:

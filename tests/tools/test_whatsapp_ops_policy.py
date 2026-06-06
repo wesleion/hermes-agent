@@ -142,6 +142,20 @@ def test_send_guardrails_reject_ambiguous_contact_and_untrusted_media():
     assert "media_untrusted" in result.reasons
 
 
+def test_send_guardrails_reject_malformed_string_target_without_crashing():
+    from tools.whatsapp_ops_policy import evaluate_send_guardrails
+
+    result = evaluate_send_guardrails(
+        config=_base_config(),
+        draft=_draft(targets=["+551****0000"]),
+        approval=_approval(),
+        idempotency_used=False,
+    )
+
+    assert result.allowed is False
+    assert "payload_invalid" in result.reasons
+
+
 def test_send_guardrails_allow_only_when_all_conditions_pass():
     from tools.whatsapp_ops_policy import evaluate_send_guardrails
 

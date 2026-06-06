@@ -122,3 +122,35 @@ def test_whatsapp_ops_toolset_is_registered():
         "wpp_status",
         "wpp_inbound_lookup",
     }.issubset(names)
+
+
+def test_wpp_resolve_and_list_contacts_use_sanitized_synthetic_seed(tmp_path):
+    from hermes_constants import reset_hermes_home_override, set_hermes_home_override
+    from tools.whatsapp_ops_store import init_db, upsert_contact
+    from tools.whatsapp_ops_tool import wpp_list_contacts, wpp_resolve_contact
+
+    token = set_hermes_home_override(tmp_path)
+    try:
+        init_db()
+        upsert_contact(
+            contact_id="synthetic_alice",
+            display_name="Alice Synthetic",
+            phone_e164="+551199990000",
+            aliases=["alice", "arquiteta teste"],
+            whitelisted=True,
+            metadata={"seed": "synthetic"},
+        )
+
+        resolved = _parse(wpp_resolve_contact("alice"))
+        listed = _parse(wpp_list_contacts("synthetic"))
+    finally:
+        reset_hermes_home_override(token)
+
+    assert resolved["ok"] is True
+    assert resolved["ambiguous"] is False
+    assert resolved["match"]["contact_id"] == "synthetic_alice"
+    assert resolved["match"]["phone_masked"].startswith("+55")
+    assert "99990000" not in json.dumps(resolved)
+    assert listed["ok"] is True
+    assert listed["contacts"][0]["contact_id"] == "synthetic_alice"
+    assert "99990000" not in json.dumps(listed)

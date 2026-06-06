@@ -68,6 +68,9 @@ def evaluate_send_guardrails(
     allowed_groups = set(allowlists.get("groups") or [])
 
     for target in targets:
+        if not isinstance(target, dict):
+            reasons.append("payload_invalid")
+            continue
         if target.get("ambiguous"):
             reasons.append("target_ambiguous")
             continue
