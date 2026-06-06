@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import re
 import secrets
 import sqlite3
 import uuid
@@ -141,6 +142,148 @@ def init_db() -> Path:
 
 def _row_to_dict(row: sqlite3.Row | None) -> dict[str, Any] | None:
     return dict(row) if row is not None else None
+
+
+def _normalize(value: str) -> str:
+    return re.sub(r"\s+", " ", str(value or "").strip().casefold())
+
+
+def _phone_digits(value: str) -> str:
+    return re.sub(r"\D+", "", str(value or ""))
+
+
+def mask_phone(value: str | None) -> str:
+    digits = _phone_digits(value or "")
+    if not digits:
+        return ""
+    if len(digits) <= 4:
+        return "****" + digits[-2:]
+    prefix = "+" + digits[:2] if len(digits) >= 12 else "+" + digits[:1]
+    return f"{prefix}***{digits[-4:]}"
+
+
+def _safe_contact(row: dict[str, Any]) -> dict[str, Any]:
+    return {
+        "contact_id": row["id"],
+        "display_name": row["display_name"],
+        "phone_masked": mask_phone(row.get("phone_e164_enc")),
+        "whitelisted": bool(row.get("whitelisted")),
+        "policy_group": row.get("policy_group"),
+    }
+
+
+def upsert_contact(
+    *,
+    contact_id: str,
+    display_name: str,
+    phone_e164: str = "",
+    aliases: list[str] | None = None,
+    whitelisted: bool = False,
+    policy_group: str | None = None,
+    metadata: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    init_db()
+    if not contact_id or not display_name:
+        raise ValueError("contact_id and display_name are required")
+    now = utc_now()
+    phone_digits = _phone_digits(phone_e164)
+    with _connect() as conn:
+        conn.execute(
+            """
+            INSERT INTO contacts (
+                id, display_name, phone_e164_hash, phone_e164_enc, whitelisted,
+                policy_group, metadata_json, created_at, updated_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+            ON CONFLICT(id) DO UPDATE SET
+                display_name=excluded.display_name,
+                phone_e164_hash=excluded.phone_e164_hash,
+                phone_e164_enc=excluded.phone_e164_enc,
+                whitelisted=excluded.whitelisted,
+                policy_group=excluded.policy_group,
+                metadata_json=excluded.metadata_json,
+                updated_at=excluded.updated_at
+            """,
+            (
+                contact_id,
+                display_name,
+                hash_text(phone_digits) if phone_digits else None,
+                phone_e164,
+                1 if whitelisted else 0,
+                policy_group,
+                json.dumps(metadata or {}, ensure_ascii=False, sort_keys=True),
+                now,
+                now,
+            ),
+        )
+        alias_values = {_normalize(display_name), *( _normalize(alias) for alias in (aliases or []) )}
+        if phone_digits:
+            alias_values.add(phone_digits)
+        for alias_norm in sorted(a for a in alias_values if a):
+            conn.execute(
+                """
+                INSERT OR IGNORE INTO contact_aliases (id, contact_id, alias_norm, created_at)
+                VALUES (?, ?, ?, ?)
+                """,
+                ("alias_" + uuid.uuid4().hex[:12], contact_id, alias_norm, now),
+            )
+    return {
+        "contact_id": contact_id,
+        "display_name": display_name,
+        "phone_masked": mask_phone(phone_e164),
+        "whitelisted": bool(whitelisted),
+        "policy_group": policy_group,
+    }
+
+
+def resolve_contact(query: str) -> dict[str, Any]:
+    init_db()
+    query_norm = _normalize(query)
+    query_digits = _phone_digits(query)
+    if not query_norm and not query_digits:
+        return {"ok": True, "ambiguous": True, "matches": [], "query": ""}
+    with _connect() as conn:
+        rows = conn.execute(
+            """
+            SELECT DISTINCT c.*
+            FROM contacts c
+            LEFT JOIN contact_aliases a ON a.contact_id = c.id
+            WHERE c.id = ?
+               OR a.alias_norm = ?
+               OR (? != '' AND c.phone_e164_hash = ?)
+               OR lower(c.display_name) LIKE ?
+            ORDER BY c.display_name ASC
+            LIMIT 6
+            """,
+            (query, query_norm, query_digits, hash_text(query_digits) if query_digits else "", f"%{query_norm}%"),
+        ).fetchall()
+    matches = [_safe_contact(dict(row)) for row in rows]
+    if len(matches) == 1:
+        return {"ok": True, "ambiguous": False, "match": matches[0], "matches": matches}
+    return {"ok": True, "ambiguous": True, "matches": matches, "query": str(query)[:80]}
+
+
+def list_contacts(filter_text: str = "", limit: int = 50) -> list[dict[str, Any]]:
+    init_db()
+    filter_norm = _normalize(filter_text)
+    limit = max(1, min(int(limit or 50), 100))
+    with _connect() as conn:
+        if filter_norm:
+            rows = conn.execute(
+                """
+                SELECT DISTINCT c.*
+                FROM contacts c
+                LEFT JOIN contact_aliases a ON a.contact_id = c.id
+                WHERE a.alias_norm LIKE ?
+                   OR lower(c.display_name) LIKE ?
+                   OR lower(COALESCE(c.metadata_json, '')) LIKE ?
+                ORDER BY c.display_name ASC
+                LIMIT ?
+                """,
+                (f"%{filter_norm}%", f"%{filter_norm}%", f"%{filter_norm}%", limit),
+            ).fetchall()
+        else:
+            rows = conn.execute("SELECT * FROM contacts ORDER BY display_name ASC LIMIT ?", (limit,)).fetchall()
+    return [_safe_contact(dict(row)) for row in rows]
 
 
 def create_draft(
