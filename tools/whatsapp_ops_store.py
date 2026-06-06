@@ -158,7 +158,10 @@ def mask_phone(value: str | None) -> str:
         return ""
     if len(digits) <= 4:
         return "****" + digits[-2:]
-    prefix = "+" + digits[:2] if len(digits) >= 12 else "+" + digits[:1]
+    if digits.startswith("55"):
+        prefix = "+55"
+    else:
+        prefix = "+" + digits[:2] if len(digits) >= 12 else "+" + digits[:1]
     return f"{prefix}***{digits[-4:]}"
 
 
@@ -344,9 +347,13 @@ def create_approval(draft_id: str, timeout_minutes: int = 60) -> dict[str, str]:
     draft = get_draft(draft_id)
     if draft is None:
         raise ValueError("draft not found")
-    token = secrets.token_urlsafe(24)
     approval_id = "approval_" + uuid.uuid4().hex[:12]
+    # Keep a non-guessable hash for compatibility/audit, but never return the
+    # plaintext token to the model. Human approval resolves by approval_id plus
+    # trusted gateway/approver context.
+    token_hash = hash_text(secrets.token_urlsafe(32))
     now_dt = datetime.now(timezone.utc)
+    now = now_dt.isoformat()
     expires_at = (now_dt + timedelta(minutes=timeout_minutes)).isoformat()
     with _connect() as conn:
         conn.execute(
@@ -359,38 +366,100 @@ def create_approval(draft_id: str, timeout_minutes: int = 60) -> dict[str, str]:
             (
                 approval_id,
                 draft_id,
-                hash_text(token),
+                token_hash,
                 None,
                 draft["message_hash"],
-                "approved",
+                "pending",
                 expires_at,
-                now_dt.isoformat(),
-                now_dt.isoformat(),
+                now,
+                None,
             ),
         )
         conn.execute(
             "UPDATE drafts SET status=?, updated_at=? WHERE id=?",
-            ("approved", now_dt.isoformat(), draft_id),
+            ("pending_approval", now, draft_id),
         )
-    return {"approval_id": approval_id, "approval_token": token, "expires_at": expires_at}
+    return {"approval_id": approval_id, "status": "pending", "expires_at": expires_at}
 
 
-def get_valid_approval(draft_id: str, approval_token: str) -> dict[str, Any] | None:
-    if not approval_token:
-        return None
+def get_valid_approval(draft_id: str, approval_token: str | None = None) -> dict[str, Any] | None:
+    """Return the latest approved approval for a draft.
+
+    ``approval_token`` is retained for backward-compatible direct calls. The
+    public tool no longer exposes or requires it; production approval is state-
+    based after a trusted human resolve action.
+    """
     init_db()
-    token_hash = hash_text(approval_token)
+    params: tuple[Any, ...]
+    token_clause = ""
+    if approval_token:
+        token_clause = " AND approval_token_hash=?"
+        params = (draft_id, hash_text(approval_token))
+    else:
+        params = (draft_id,)
+    with _connect() as conn:
+        return _row_to_dict(
+            conn.execute(
+                f"""
+                SELECT * FROM approvals
+                WHERE draft_id=? AND status='approved'{token_clause}
+                ORDER BY resolved_at DESC, created_at DESC LIMIT 1
+                """,
+                params,
+            ).fetchone()
+        )
+
+
+def get_latest_approval(draft_id: str) -> dict[str, Any] | None:
+    init_db()
     with _connect() as conn:
         return _row_to_dict(
             conn.execute(
                 """
                 SELECT * FROM approvals
-                WHERE draft_id=? AND approval_token_hash=?
+                WHERE draft_id=?
                 ORDER BY created_at DESC LIMIT 1
                 """,
-                (draft_id, token_hash),
+                (draft_id,),
             ).fetchone()
         )
+
+
+def resolve_approval(approval_id: str, decision: str, approver_ref: str | None = None) -> dict[str, Any]:
+    init_db()
+    decision_norm = str(decision or "").strip().lower()
+    if decision_norm not in {"approved", "denied"}:
+        return {"ok": False, "approval_id": approval_id, "error": "decision_invalid"}
+    now = utc_now()
+    with _connect() as conn:
+        row = conn.execute("SELECT * FROM approvals WHERE id=?", (approval_id,)).fetchone()
+        if row is None:
+            return {"ok": False, "approval_id": approval_id, "error": "approval_not_found"}
+        approval = dict(row)
+        if approval.get("status") != "pending":
+            return {"ok": False, "approval_id": approval_id, "error": "approval_not_pending", "status": approval.get("status")}
+        try:
+            expires = datetime.fromisoformat(str(approval.get("expires_at", "")).replace("Z", "+00:00"))
+            if expires.tzinfo is None:
+                expires = expires.replace(tzinfo=timezone.utc)
+        except ValueError:
+            expires = datetime.now(timezone.utc) - timedelta(seconds=1)
+        if expires <= datetime.now(timezone.utc):
+            conn.execute(
+                "UPDATE approvals SET status=?, resolved_at=? WHERE id=?",
+                ("expired", now, approval_id),
+            )
+            return {"ok": False, "approval_id": approval_id, "error": "approval_expired", "status": "expired"}
+        approver_hash = hash_text(str(approver_ref)) if approver_ref else None
+        conn.execute(
+            "UPDATE approvals SET status=?, approver_ref_hash=?, resolved_at=? WHERE id=?",
+            (decision_norm, approver_hash, now, approval_id),
+        )
+        conn.execute(
+            "UPDATE drafts SET status=?, updated_at=? WHERE id=?",
+            (decision_norm, now, approval["draft_id"]),
+        )
+    return {"ok": True, "approval_id": approval_id, "draft_id": approval["draft_id"], "status": decision_norm}
 
 
 def idempotency_used(idempotency_key: str) -> bool:
@@ -490,6 +559,114 @@ def reserve_outbox_send(draft_id: str, idempotency_key: str) -> bool:
             return True
         except sqlite3.IntegrityError:
             return False
+
+
+def _sanitize_payload(value: Any) -> Any:
+    secret_keys = {"token", "api_key", "apikey", "authorization", "password", "secret", "key"}
+    pii_keys = {"id", "wid", "lid", "phone", "phone_e164", "number", "contact", "contact_ref", "chatid", "chat_id", "thread_ref"}
+    if isinstance(value, dict):
+        safe: dict[str, Any] = {}
+        for key, item in value.items():
+            key_str = str(key)
+            key_norm = key_str.strip().lower()
+            if key_norm in secret_keys or any(part in key_norm for part in ("token", "secret", "password", "api_key")):
+                safe[key_str] = "<redacted>"
+            elif key_norm in pii_keys:
+                safe[key_str] = "<redacted>"
+            else:
+                safe[key_str] = _sanitize_payload(item)
+        return safe
+    if isinstance(value, list):
+        return [_sanitize_payload(item) for item in value[:50]]
+    if isinstance(value, str):
+        cleaned = value[:500]
+        cleaned = re.sub(r"\+?\d[\d\s().-]{6,}\d", "<redacted-phone>", cleaned)
+        cleaned = re.sub(r"\b\d{8,}@(?:lid|g\.us|s\.whatsapp\.net)\b", "<redacted-wa-ref>", cleaned)
+        return cleaned
+    return value
+
+
+def record_inbound_event(
+    *,
+    source_event_id: str,
+    contact_ref: str = "",
+    thread_ref: str = "",
+    payload: dict[str, Any] | None = None,
+    status: str = "received",
+) -> dict[str, Any]:
+    init_db()
+    if not source_event_id:
+        return {"ok": False, "error": "source_event_id_required"}
+    event_id = "inbound_" + uuid.uuid4().hex[:12]
+    now = utc_now()
+    safe_payload = _sanitize_payload(payload or {})
+    with _connect() as conn:
+        try:
+            conn.execute(
+                """
+                INSERT INTO inbound_events (
+                    id, source_event_id_hash, contact_ref_hash, thread_ref_hash,
+                    payload_redacted_json, status, created_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    event_id,
+                    hash_text(source_event_id),
+                    hash_text(contact_ref) if contact_ref else None,
+                    hash_text(thread_ref) if thread_ref else None,
+                    json.dumps(safe_payload, ensure_ascii=False, sort_keys=True),
+                    str(status or "received")[:40],
+                    now,
+                ),
+            )
+        except sqlite3.IntegrityError:
+            row = conn.execute(
+                "SELECT id FROM inbound_events WHERE source_event_id_hash=?",
+                (hash_text(source_event_id),),
+            ).fetchone()
+            return {"ok": True, "event_id": row["id"] if row else "", "deduped": True}
+    return {"ok": True, "event_id": event_id, "deduped": False, "status": str(status or "received")[:40]}
+
+
+def lookup_inbound_events(thread: str = "", contact: str = "", limit: int = 20) -> list[dict[str, Any]]:
+    init_db()
+    limit = max(1, min(int(limit or 20), 100))
+    clauses: list[str] = []
+    params: list[Any] = []
+    if thread:
+        clauses.append("thread_ref_hash=?")
+        params.append(hash_text(thread))
+    if contact:
+        clauses.append("contact_ref_hash=?")
+        params.append(hash_text(contact))
+    where = " WHERE " + " AND ".join(clauses) if clauses else ""
+    params.append(limit)
+    with _connect() as conn:
+        rows = conn.execute(
+            f"""
+            SELECT id, payload_redacted_json, status, created_at
+            FROM inbound_events
+            {where}
+            ORDER BY created_at DESC
+            LIMIT ?
+            """,
+            tuple(params),
+        ).fetchall()
+    events: list[dict[str, Any]] = []
+    for row in rows:
+        try:
+            payload = json.loads(row["payload_redacted_json"] or "{}")
+        except json.JSONDecodeError:
+            payload = {}
+        events.append(
+            {
+                "event_id": row["id"],
+                "status": row["status"],
+                "created_at": row["created_at"],
+                "payload": payload,
+            }
+        )
+    return events
 
 
 def update_draft_status(draft_id: str, status: str, send_at: str | None = None) -> None:

@@ -3263,6 +3263,59 @@ class TelegramAdapter(BasePlatformAdapter):
             )
             return
 
+        # --- WhatsApp Ops approval callbacks (wpp:a|d:approval_id) ---
+        if data.startswith("wpp:"):
+            parts = data.split(":", 2)
+            if len(parts) != 3 or parts[1] not in {"a", "d"} or not parts[2]:
+                await query.answer(text="Invalid WhatsApp approval data.")
+                return
+
+            caller_id = str(getattr(query.from_user, "id", ""))
+            if not self._is_callback_user_authorized(
+                caller_id,
+                chat_id=query_chat_id,
+                chat_type=str(query_chat_type) if query_chat_type is not None else None,
+                thread_id=str(query_thread_id) if query_thread_id is not None else None,
+                user_name=query_user_name,
+            ):
+                await query.answer(text="⛔ You are not authorized to approve WhatsApp drafts.")
+                return
+
+            approval_id = parts[2]
+            decision = "approved" if parts[1] == "a" else "denied"
+            user_display = getattr(query.from_user, "first_name", "User")
+            try:
+                from tools.whatsapp_ops_store import resolve_approval as _resolve_wpp_approval
+                resolved = _resolve_wpp_approval(
+                    approval_id,
+                    decision=decision,
+                    approver_ref=f"telegram:{caller_id}",
+                )
+            except Exception as exc:
+                logger.error("[%s] WhatsApp approval callback failed: %s", self.name, exc, exc_info=True)
+                await query.answer(text="Failed to resolve WhatsApp approval.")
+                return
+
+            if not resolved.get("ok"):
+                await query.answer(text=str(resolved.get("error") or "Approval not resolved")[:80])
+                return
+
+            label = "✅ WhatsApp draft approved" if decision == "approved" else "❌ WhatsApp draft denied"
+            await query.answer(text=label)
+            try:
+                await query.edit_message_text(
+                    text=(
+                        f"{label} by {_html.escape(str(user_display))}\n"
+                        f"Draft: <code>{_html.escape(str(resolved.get('draft_id', '')))}</code>\n"
+                        "Envio não foi disparado; use wpp_send_approved separadamente."
+                    ),
+                    parse_mode=ParseMode.HTML,
+                    reply_markup=None,
+                )
+            except Exception:
+                pass
+            return
+
         # --- Exec approval callbacks (ea:choice:id) ---
         if data.startswith("ea:"):
             parts = data.split(":", 2)
