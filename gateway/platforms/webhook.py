@@ -33,6 +33,7 @@ import hashlib
 import hmac
 import json
 import logging
+import os
 import re
 import subprocess
 import time
@@ -159,7 +160,7 @@ class WebhookAdapter(BasePlatformAdapter):
 
         # Validate routes at startup — secret is required per route
         for name, route in self._routes.items():
-            secret = route.get("secret", self._global_secret)
+            secret = self._resolve_route_secret(route)
             if not secret:
                 raise ValueError(
                     f"[webhook] Route '{name}' has no HMAC secret. "
@@ -343,6 +344,19 @@ class WebhookAdapter(BasePlatformAdapter):
     async def get_chat_info(self, chat_id: str) -> Dict[str, Any]:
         return {"name": chat_id, "type": "webhook"}
 
+    def _resolve_route_secret(self, route: dict) -> str:
+        """Resolve a route secret from inline config or an environment variable.
+
+        `secret_env` lets production profiles keep HMAC material in the
+        systemd/Infisical-rendered environment instead of committing a literal
+        secret into config.yaml or dynamic subscription JSON. Inline `secret`
+        remains supported for existing routes and tests.
+        """
+        secret_env = str(route.get("secret_env") or "").strip()
+        if secret_env:
+            return os.getenv(secret_env, "")
+        return str(route.get("secret", self._global_secret) or "")
+
     # ------------------------------------------------------------------
     # HTTP handlers
     # ------------------------------------------------------------------
@@ -377,7 +391,7 @@ class WebhookAdapter(BasePlatformAdapter):
             for k, v in data.items():
                 if k in self._static_routes:
                     continue
-                effective_secret = v.get("secret", self._global_secret)
+                effective_secret = self._resolve_route_secret(v)
                 if not effective_secret:
                     logger.warning(
                         "[webhook] Dynamic route '%s' skipped: 'secret' is "
@@ -476,9 +490,20 @@ class WebhookAdapter(BasePlatformAdapter):
                 {"error": "Payload too large"}, status=413
             )
 
-        # Read body (must be done before any validation)
+        # Read body with an explicit streaming limit.  Content-Length is absent
+        # for chunked requests, so checking only request.content_length would
+        # allow oversized bodies to be read fully before rejection.
         try:
-            raw_body = await request.read()
+            chunks: list[bytes] = []
+            total = 0
+            async for chunk in request.content.iter_chunked(64 * 1024):
+                total += len(chunk)
+                if total > self._max_body_bytes:
+                    return web.json_response(
+                        {"error": "Payload too large"}, status=413
+                    )
+                chunks.append(chunk)
+            raw_body = b"".join(chunks)
         except Exception as e:
             logger.error("[webhook] Failed to read body: %s", e)
             return web.json_response({"error": "Bad request"}, status=400)
@@ -487,7 +512,7 @@ class WebhookAdapter(BasePlatformAdapter):
         # INSECURE_NO_AUTH mode). Missing/empty secrets must fail closed here,
         # not only during connect(), so direct handler reuse cannot turn a
         # network webhook route into an unauthenticated agent-dispatch surface.
-        secret = route_config.get("secret", self._global_secret)
+        secret = self._resolve_route_secret(route_config)
         if not secret:
             logger.error(
                 "[webhook] Route %s has no HMAC secret; refusing request",
@@ -528,6 +553,14 @@ class WebhookAdapter(BasePlatformAdapter):
                 return web.json_response(
                     {"error": "Cannot parse body"}, status=400
                 )
+
+        # Receive-only WhatsApp Ops / QuePasa inbound route.  This path is
+        # intentionally before prompt rendering, generic idempotency, direct
+        # delivery, and agent dispatch: provider inbound events are sanitized
+        # into the local WhatsApp Ops store and must not trigger any outbound
+        # transport or LLM run by themselves.
+        if self._is_quepasa_inbound_route(route_config):
+            return await self._handle_quepasa_inbound(route_name, payload)
 
         # Check event type filter
         event_type = (
@@ -722,6 +755,73 @@ class WebhookAdapter(BasePlatformAdapter):
                 "delivery_id": delivery_id,
             },
             status=202,
+        )
+
+    # ------------------------------------------------------------------
+    # WhatsApp Ops / QuePasa receive-only ingest
+    # ------------------------------------------------------------------
+
+    def _is_quepasa_inbound_route(self, route_config: dict) -> bool:
+        """Return True for routes that ingest QuePasa inbound events only."""
+        kind = str(route_config.get("kind") or route_config.get("type") or "").strip().lower()
+        ingest = str(route_config.get("ingest") or "").strip().lower()
+        return kind in {"quepasa_inbound", "whatsapp_ops_inbound"} or ingest == "whatsapp_ops"
+
+    async def _handle_quepasa_inbound(
+        self,
+        route_name: str,
+        payload: dict,
+    ) -> "web.Response":
+        """Persist a sanitized QuePasa inbound payload without agent dispatch.
+
+        The WhatsApp Ops tool/store layer owns sanitization and persistent
+        idempotency.  This gateway branch is deliberately receive-only: it does
+        not call handle_message(), _direct_deliver(), or any WhatsApp send
+        client.
+        """
+        try:
+            from tools.whatsapp_ops_tool import wpp_ingest_inbound_event
+
+            result_raw = wpp_ingest_inbound_event(payload)
+            result = json.loads(result_raw) if isinstance(result_raw, str) else result_raw
+        except Exception:
+            logger.exception("[webhook] QuePasa inbound ingest failed route=%s", route_name)
+            return web.json_response(
+                {"status": "error", "error": "Inbound ingest failed", "route": route_name},
+                status=500,
+            )
+
+        if not isinstance(result, dict):
+            return web.json_response(
+                {"status": "error", "error": "Invalid inbound ingest result", "route": route_name},
+                status=500,
+            )
+
+        if not result.get("ok"):
+            error = str(result.get("error") or "inbound_ingest_failed")[:120]
+            status = 400 if error == "source_event_id_required" else 422
+            return web.json_response(
+                {"status": "error", "error": error, "route": route_name},
+                status=status,
+            )
+
+        deduped = bool(result.get("deduped"))
+        status_text = "duplicate" if deduped else "ingested"
+        event_id = str(result.get("event_id") or "")
+        logger.info(
+            "[webhook] QuePasa inbound %s route=%s event_id=%s",
+            status_text,
+            route_name,
+            event_id,
+        )
+        return web.json_response(
+            {
+                "status": status_text,
+                "route": route_name,
+                "event_id": event_id,
+                "deduped": deduped,
+            },
+            status=200,
         )
 
     # ------------------------------------------------------------------
