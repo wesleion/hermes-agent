@@ -422,6 +422,75 @@ class TestTelegramApprovalCallback:
         assert runner.last_source.chat_id == "12345"
 
     @pytest.mark.asyncio
+    async def test_whatsapp_ops_approval_callback_resolves_without_sending(self):
+        adapter = _make_adapter()
+
+        query = AsyncMock()
+        query.data = "wpp:a:approval-123"
+        query.message = MagicMock()
+        query.message.chat_id = 12345
+        query.message.chat.type = "private"
+        query.from_user = MagicMock()
+        query.from_user.id = "12345"
+        query.from_user.first_name = "Alice & Bob"
+        query.answer = AsyncMock()
+        query.edit_message_text = AsyncMock()
+
+        update = MagicMock()
+        update.callback_query = query
+        context = MagicMock()
+
+        resolved = {"ok": True, "draft_id": "draft-9", "status": "approved"}
+        with patch.dict(os.environ, {"TELEGRAM_ALLOWED_USERS": "*"}, clear=False):
+            with patch("tools.whatsapp_ops_store.resolve_approval", return_value=resolved) as mock_resolve:
+                await adapter._handle_callback_query(update, context)
+
+        mock_resolve.assert_called_once_with(
+            "approval-123",
+            decision="approved",
+            approver_ref="telegram:12345",
+        )
+        query.answer.assert_called_once()
+        assert "approved" in query.answer.call_args[1]["text"].lower()
+        edit_kwargs = query.edit_message_text.call_args[1]
+        assert "HTML" in repr(edit_kwargs["parse_mode"])
+        assert "draft-9" in edit_kwargs["text"]
+        assert "Envio não foi disparado" in edit_kwargs["text"]
+
+    @pytest.mark.asyncio
+    async def test_whatsapp_ops_approval_callback_rejects_unauthorized_user(self):
+        adapter = _make_adapter()
+        runner = _AuthRunner(authorized=False)
+        adapter._message_handler = runner._handle_message
+
+        query = AsyncMock()
+        query.data = "wpp:d:approval-123"
+        query.message = MagicMock()
+        query.message.chat_id = 12345
+        query.message.chat.type = "private"
+        query.from_user = MagicMock()
+        query.from_user.id = 222
+        query.from_user.first_name = "Mallory"
+        query.answer = AsyncMock()
+        query.edit_message_text = AsyncMock()
+
+        update = MagicMock()
+        update.callback_query = query
+        context = MagicMock()
+
+        with patch("tools.whatsapp_ops_store.resolve_approval") as mock_resolve:
+            await adapter._handle_callback_query(update, context)
+
+        mock_resolve.assert_not_called()
+        query.answer.assert_called_once()
+        assert "not authorized" in query.answer.call_args[1]["text"].lower()
+        query.edit_message_text.assert_not_called()
+        assert runner.last_source is not None
+        assert runner.last_source.platform == Platform.TELEGRAM
+        assert runner.last_source.user_id == "222"
+        assert runner.last_source.chat_id == "12345"
+
+    @pytest.mark.asyncio
     async def test_already_resolved(self):
         adapter = _make_adapter()
         # No state for approval_id 99 — already resolved
