@@ -89,6 +89,9 @@ Rules:
     and the system will route to the default_assignee.
   - Each child task body is what a fresh worker will read with no other
     context — be specific about goal, approach, and acceptance criteria.
+  - Copy these exact hard-boundary phrases into every child body:
+    no secrets; no provider/auth/fallback; no gateway; no cron;
+    no external accounts; no production mutation.
 
 When the task is genuinely a single unit of work (no useful decomposition),
 return:
@@ -140,6 +143,39 @@ def _truncate(text: str, limit: int) -> str:
     if len(text) <= limit:
         return text
     return text[: limit - 1] + "…"
+
+
+_REQUIRED_BOUNDARY_PHRASES = (
+    "no secrets",
+    "no provider/auth/fallback",
+    "no gateway",
+    "no cron",
+    "no external accounts",
+    "no production mutation",
+)
+
+_BOUNDARY_FOOTER = (
+    "\n\nHard operational boundaries: "
+    "no secrets. no provider/auth/fallback. no gateway. no cron. "
+    "no external accounts. no production mutation."
+)
+
+
+def _ensure_required_boundaries(body: str) -> str:
+    """Ensure every decomposed/promoted task body carries hard boundaries.
+
+    The LLM prompt asks for these phrases, but production safety should not rely
+    on prompt compliance alone. This deterministic footer preserves the model's
+    body and appends the required guardrail text only when any phrase is missing.
+    """
+    clean = (body or "").strip()
+    low = clean.lower()
+    if all(phrase in low for phrase in _REQUIRED_BOUNDARY_PHRASES):
+        return clean
+    return f"{clean}{_BOUNDARY_FOOTER}" if clean else _BOUNDARY_FOOTER.strip()
+
+
+_FENCE_RE = re.compile(r"^```(?:json)?\s*|\s*```$", re.MULTILINE)
 
 
 def _extract_json_blob(raw: str) -> Optional[dict]:
@@ -358,7 +394,7 @@ def decompose_task(
         new_title = parsed.get("title")
         new_body = parsed.get("body")
         title_val = new_title.strip() if isinstance(new_title, str) and new_title.strip() else None
-        body_val = new_body if isinstance(new_body, str) and new_body.strip() else None
+        body_val = _ensure_required_boundaries(new_body) if isinstance(new_body, str) and new_body.strip() else None
         assignee_val = None
         if not task.assignee:
             assignee_val = _normalize_assignee_choice(
@@ -433,7 +469,7 @@ def decompose_task(
         clean_parents = [p for p in parents if isinstance(p, int) and 0 <= p < len(raw_tasks) and p != idx]
         children.append({
             "title": title.strip()[:200],
-            "body": body.strip(),
+            "body": _ensure_required_boundaries(body),
             "assignee": chosen,
             "parents": clean_parents,
         })
