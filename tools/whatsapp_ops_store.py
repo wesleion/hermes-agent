@@ -21,6 +21,9 @@ from hermes_constants import get_hermes_home
 
 DB_FILENAME = "wpp_ops.sqlite"
 
+# Raw refs staged for registration are purged after this age.
+_STAGING_TTL = timedelta(minutes=5)
+
 
 def utc_now() -> str:
     return datetime.now(timezone.utc).isoformat()
@@ -126,6 +129,15 @@ def init_db() -> Path:
                 status TEXT NOT NULL,
                 created_at TEXT NOT NULL
             );
+            CREATE TABLE IF NOT EXISTS registration_staging (
+                id TEXT PRIMARY KEY,
+                contact_ref_raw TEXT,
+                thread_ref_raw TEXT,
+                display_name TEXT,
+                kind TEXT NOT NULL DEFAULT 'inbound',
+                expires_at TEXT NOT NULL,
+                created_at TEXT NOT NULL
+            );
             CREATE TABLE IF NOT EXISTS audit_log (
                 id TEXT PRIMARY KEY,
                 event_type TEXT NOT NULL,
@@ -181,6 +193,115 @@ def _safe_contact(row: dict[str, Any]) -> dict[str, Any]:
         "whitelisted": bool(row.get("whitelisted")),
         "policy_group": row.get("policy_group"),
     }
+
+
+# ---------------------------------------------------------------------------
+# Staging raw inbound refs for registration
+# ---------------------------------------------------------------------------
+
+
+def _staging_cleanup() -> None:
+    """Remove expired staging rows."""
+    now = utc_now()
+    with _connect() as conn:
+        conn.execute("DELETE FROM registration_staging WHERE expires_at <= ?", (now,))
+
+
+def stage_raw_ref(*, contact_ref: str = "", thread_ref: str = "", display_name: str = "") -> dict[str, Any]:
+    """Store raw inbound refs temporarily for registration use.
+
+    Auto-purges old staging first.  Expires after ``_STAGING_TTL``.
+    The caller is responsible for calling this only from trusted ingest
+    code paths, never from model-driven tool calls.
+    """
+    init_db()
+    _staging_cleanup()
+    if not contact_ref and not thread_ref:
+        return {"ok": False, "error": "no_ref"}
+    now_dt = datetime.now(timezone.utc)
+    now = now_dt.isoformat()
+    expires_at = (now_dt + _STAGING_TTL).isoformat()
+    kind = "group" if thread_ref and thread_ref != contact_ref else "contact"
+    row_id = "staging_" + uuid.uuid4().hex[:12]
+    with _connect() as conn:
+        conn.execute(
+            """
+            INSERT INTO registration_staging (
+                id, contact_ref_raw, thread_ref_raw, display_name,
+                kind, expires_at, created_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?)
+            """,
+            (row_id, contact_ref or None, thread_ref or None,
+             (display_name or "")[:80], kind, expires_at, now),
+        )
+    return {"ok": True, "staging_id": row_id, "kind": kind, "expires_at": expires_at}
+
+
+def _latest_staging(kind: str = "contact") -> dict[str, Any] | None:
+    """Return the most recent non-expired staging row for *kind*."""
+    init_db()
+    _staging_cleanup()
+    with _connect() as conn:
+        row = conn.execute(
+            """
+            SELECT * FROM registration_staging
+            WHERE kind=? AND expires_at > ?
+            ORDER BY created_at DESC LIMIT 1
+            """,
+            (kind, utc_now()),
+        ).fetchone()
+    if row is None:
+        return None
+    result = dict(row)
+    # Consume on read — remove so it can't be used twice.
+    with _connect() as conn:
+        conn.execute("DELETE FROM registration_staging WHERE id=?", (result["id"],))
+    return result
+
+
+def consume_latest_raw_ref(kind: str = "contact") -> str | None:
+    """Return the raw ref from the latest inbound staging, or None.
+
+    ``kind="contact"`` returns ``contact_ref_raw``.
+    ``kind="group"`` returns ``thread_ref_raw``.
+    The staging row is consumed (deleted) after read.
+    """
+    row = _latest_staging(kind)
+    if row is None:
+        return None
+    key = "contact_ref_raw" if kind == "contact" else "thread_ref_raw"
+    return str(row.get(key) or "") or None
+
+
+def peek_staging() -> list[dict[str, Any]]:
+    """Return sanitized info about what's staged for registration (no raw refs)."""
+    init_db()
+    _staging_cleanup()
+    with _connect() as conn:
+        rows = conn.execute(
+            """
+            SELECT id, display_name, kind, created_at, expires_at
+            FROM registration_staging
+            WHERE expires_at > ?
+            ORDER BY created_at DESC
+            """,
+            (utc_now(),),
+        ).fetchall()
+    return [
+        {
+            "staging_id": row["id"],
+            "display_name": row["display_name"] or "",
+            "kind": row["kind"],
+            "created_at": row["created_at"],
+            "available_until": row["expires_at"],
+        }
+        for row in rows
+    ]
+
+
+# ---------------------------------------------------------------------------
+# Contacts & aliases
+# ---------------------------------------------------------------------------
 
 
 def upsert_contact(
@@ -295,6 +416,111 @@ def list_contacts(filter_text: str = "", limit: int = 50) -> list[dict[str, Any]
         else:
             rows = conn.execute("SELECT * FROM contacts ORDER BY display_name ASC LIMIT ?", (limit,)).fetchall()
     return [_safe_contact(dict(row)) for row in rows]
+
+
+# ---------------------------------------------------------------------------
+# Local registration (writes to SQLite directly, not via env/Infisical)
+# ---------------------------------------------------------------------------
+
+
+def register_contact_local(
+    *,
+    alias: str,
+    raw_ref: str,
+    display_name: str | None = None,
+    policy_group: str = "manual",
+    allow_send: bool = False,
+) -> dict[str, Any]:
+    """Register a contact in the local SQLite allowlist cache.
+
+    This writes directly to the operational DB, bypassing Infisical/env.
+    The registration survives runtime sync_allowlist_from_env() calls
+    because upsert only adds/updates — it never deletes existing rows.
+
+    Returns sanitized contact info (no raw ref in output).
+    """
+    init_db()
+    if not alias.strip():
+        return {"ok": False, "error": "alias_required"}
+    if not raw_ref.strip():
+        return {"ok": False, "error": "raw_ref_required"}
+    contact_id = _contact_id_from_target(raw_ref)
+    display = (display_name or alias).strip() or alias
+    metadata = {
+        "source": "local_registration",
+        "target_ref_hash": hash_text(raw_ref),
+    }
+    try:
+        result = upsert_contact(
+            contact_id=contact_id,
+            display_name=display,
+            aliases=[alias],
+            whitelisted=allow_send,
+            policy_group=policy_group,
+            metadata=metadata,
+        )
+    except ValueError as exc:
+        return {"ok": False, "error": str(exc)[:200]}
+    return {"ok": True, **result}
+
+
+def register_group_local(
+    *,
+    alias: str,
+    raw_ref: str,
+    display_name: str | None = None,
+    policy_group: str = "manual",
+    allow_send: bool = False,
+) -> dict[str, Any]:
+    """Register a group in the local SQLite allowlist cache.
+
+    Same semantics as ``register_contact_local`` but for groups/lists.
+    """
+    init_db()
+    if not alias.strip():
+        return {"ok": False, "error": "alias_required"}
+    if not raw_ref.strip():
+        return {"ok": False, "error": "raw_ref_required"}
+    list_id = "list_" + hash_text(raw_ref)[:16]
+    name = (display_name or alias).strip() or alias
+    now = utc_now()
+    metadata = {
+        "source": "local_registration",
+        "target_ref_hash": hash_text(raw_ref),
+    }
+    with _connect() as conn:
+        conn.execute(
+            """
+            INSERT INTO lists (id, name, name_norm, allowed, metadata_json, created_at, updated_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?)
+            ON CONFLICT(name_norm) DO UPDATE SET
+                name=excluded.name,
+                allowed=excluded.allowed,
+                metadata_json=excluded.metadata_json,
+                updated_at=excluded.updated_at
+            """,
+            (
+                list_id,
+                name,
+                _normalize(name),
+                1 if allow_send else 0,
+                json.dumps(metadata, ensure_ascii=False, sort_keys=True),
+                now,
+                now,
+            ),
+        )
+    return {
+        "ok": True,
+        "group_id": list_id,
+        "name": name,
+        "allow_send": bool(allow_send),
+        "policy_group": policy_group,
+    }
+
+
+# ---------------------------------------------------------------------------
+# Env-based allowlist sync
+# ---------------------------------------------------------------------------
 
 
 def _load_allowlist_json(env_name: str, default: Any, *fallback_env_names: str) -> Any:
@@ -438,6 +664,11 @@ def sync_allowlist_from_env() -> dict[str, Any]:
     }
 
 
+# ---------------------------------------------------------------------------
+# Drafts & approvals
+# ---------------------------------------------------------------------------
+
+
 def create_draft(
     targets: list[dict[str, Any]],
     message: str,
@@ -497,9 +728,6 @@ def create_approval(draft_id: str, timeout_minutes: int = 60) -> dict[str, str]:
     if draft is None:
         raise ValueError("draft not found")
     approval_id = "approval_" + uuid.uuid4().hex[:12]
-    # Keep a non-guessable hash for compatibility/audit, but never return the
-    # plaintext token to the model. Human approval resolves by approval_id plus
-    # trusted gateway/approver context.
     token_hash = hash_text(secrets.token_urlsafe(32))
     now_dt = datetime.now(timezone.utc)
     now = now_dt.isoformat()
@@ -919,6 +1147,7 @@ def get_cockpit_overview(limit: int = 10) -> dict[str, Any]:
             "wpp_request_approval",
             "wpp_status",
             "wpp_cancel",
+            "wpp_register_alias",
         ],
     }
 
