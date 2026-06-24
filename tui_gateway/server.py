@@ -8,6 +8,7 @@ import json
 import logging
 import os
 import queue
+import shlex
 import subprocess
 import sys
 import threading
@@ -8856,8 +8857,11 @@ def _(rid, params: dict) -> dict:
     if name in qcmds:
         qc = qcmds[name]
         if qc.get("type") == "exec":
+            exec_cmd = qc.get("command", "")
+            if qc.get("pass_args") and arg:
+                exec_cmd = f"{exec_cmd} {shlex.quote(arg)}"
             r = subprocess.run(
-                qc.get("command", ""),
+                exec_cmd,
                 shell=True,
                 capture_output=True,
                 text=True,
