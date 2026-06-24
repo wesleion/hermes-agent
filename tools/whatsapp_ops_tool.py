@@ -25,6 +25,7 @@ from tools.whatsapp_ops_store import (
     create_approval,
     create_draft,
     get_cockpit_overview,
+    registration_staging_diagnostics,
     get_draft,
     get_latest_approval,
     get_send_allowlist_ids,
@@ -512,13 +513,21 @@ def wpp_register_staging_status() -> str:
     """
     try:
         staged = peek_staging()
+        diagnostics = registration_staging_diagnostics()
     except Exception as exc:
         return _json({"ok": False, "error": str(exc)[:200]})
+    hint = "Use wpp_register_alias(nome='...', ref='...') com o número, ou wpp_register_alias(nome='...') após um inbound novo."
+    if not staged and diagnostics.get("empty_reason") == "no_active_staging_or_expired":
+        hint = "Nenhum inbound ativo em staging. Envie uma nova mensagem WhatsApp do contato/grupo e cadastre dentro da janela TTL."
     return _json({
         "ok": True,
         "staged": staged,
-        "hint": "Use wpp_register_alias(nome='...', ref='...') com o número, ou "
-                "wpp_register_alias(nome='...') para usar o último inbound automaticamente.",
+        "staged_count": len(staged),
+        "staging_ttl_seconds": diagnostics.get("staging_ttl_seconds"),
+        "inbound_count": diagnostics.get("inbound_count"),
+        "latest_inbound_created_at": diagnostics.get("latest_inbound_created_at"),
+        "empty_reason": diagnostics.get("empty_reason"),
+        "hint": hint,
     })
 
 

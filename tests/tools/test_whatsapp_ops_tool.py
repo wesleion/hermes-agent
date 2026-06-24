@@ -535,6 +535,53 @@ def test_wpp_ingest_inbound_event_records_quepasa_payload_safely(tmp_path):
     assert "+352****6457" not in serialized
 
 
+def test_wpp_registration_staging_status_has_diagnostics_and_profile_ttl(tmp_path):
+    from datetime import datetime
+
+    from tools.whatsapp_ops_store import init_db
+    from tools.whatsapp_ops_tool import (
+        wpp_ingest_inbound_event,
+        wpp_register_alias,
+        wpp_register_staging_status,
+    )
+
+    (tmp_path / "config.yaml").write_text(
+        "whatsapp_ops:\n"
+        "  registration_staging_ttl_seconds: 86400\n"
+    )
+    payload = {
+        "id": "REG_MSG_001",
+        "chat": {"id": "synthetic-contact@internal.invalid"},
+        "participant": {"id": "synthetic-contact@internal.invalid", "title": "Lead Teste"},
+        "text": "cadastro teste",
+    }
+    token = set_hermes_home_override(tmp_path)
+    try:
+        init_db()
+        ingested = _parse(wpp_ingest_inbound_event(payload))
+        status = _parse(wpp_register_staging_status())
+        registered = _parse(wpp_register_alias(nome="Lead Teste"))
+        empty_status = _parse(wpp_register_staging_status())
+    finally:
+        reset_hermes_home_override(token)
+
+    assert ingested["ok"] is True
+    assert status["ok"] is True
+    assert status["staged_count"] == 1
+    assert status["staging_ttl_seconds"] == 86400
+    assert status["empty_reason"] == "none"
+    created = datetime.fromisoformat(status["staged"][0]["created_at"])
+    available = datetime.fromisoformat(status["staged"][0]["available_until"])
+    assert (available - created).total_seconds() >= 23 * 60 * 60
+    assert registered["ok"] is True
+    assert empty_status["staged_count"] == 0
+    assert empty_status["inbound_count"] == 1
+    assert empty_status["empty_reason"] == "no_active_staging_or_expired"
+    serialized = json.dumps({"status": status, "registered": registered, "empty": empty_status}, ensure_ascii=False)
+    assert "synthetic-contact@internal.invalid" not in serialized
+    assert "@internal.invalid" not in serialized
+
+
 
 def test_wpp_ingest_inbound_event_supports_nested_quepasa_shape(tmp_path):
     from tools.whatsapp_ops_store import init_db
