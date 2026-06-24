@@ -19,14 +19,55 @@ from typing import Any
 
 from hermes_constants import get_hermes_home
 
+try:
+    import yaml
+except Exception:  # pragma: no cover - PyYAML is normally available in Hermes
+    yaml = None  # type: ignore[assignment]
+
 DB_FILENAME = "wpp_ops.sqlite"
 
 # Raw refs staged for registration are purged after this age.
 _STAGING_TTL = timedelta(minutes=5)
+_STAGING_TTL_MIN_SECONDS = 60
+_STAGING_TTL_MAX_SECONDS = 7 * 24 * 60 * 60
 
 
 def utc_now() -> str:
     return datetime.now(timezone.utc).isoformat()
+
+
+def _registration_staging_ttl() -> timedelta:
+    """Return the profile-configured registration staging TTL.
+
+    The framework default stays conservative (5 minutes), but operator-facing
+    gateway profiles can opt into a longer window with:
+
+      whatsapp_ops.registration_staging_ttl_seconds: <seconds>
+
+    This is behavioral config, not a secret. Values are clamped to avoid raw
+    refs being kept indefinitely by accident.
+    """
+    if yaml is None:
+        return _STAGING_TTL
+    try:
+        config_path = get_hermes_home() / "config.yaml"
+        data = yaml.safe_load(config_path.read_text()) or {}
+        wpp = data.get("whatsapp_ops") if isinstance(data, dict) else {}
+        if not isinstance(wpp, dict):
+            return _STAGING_TTL
+        raw = wpp.get("registration_staging_ttl_seconds")
+        if raw is None:
+            raw = wpp.get("registration_staging_ttl")
+        seconds = int(raw)
+        seconds = max(_STAGING_TTL_MIN_SECONDS, min(seconds, _STAGING_TTL_MAX_SECONDS))
+        return timedelta(seconds=seconds)
+    except Exception:
+        return _STAGING_TTL
+
+
+def registration_staging_ttl_seconds() -> int:
+    """Public, sanitized TTL value for status/UX output."""
+    return int(_registration_staging_ttl().total_seconds())
 
 
 def get_db_path(hermes_home: str | Path | None = None) -> Path:
@@ -220,7 +261,7 @@ def stage_raw_ref(*, contact_ref: str = "", thread_ref: str = "", display_name: 
         return {"ok": False, "error": "no_ref"}
     now_dt = datetime.now(timezone.utc)
     now = now_dt.isoformat()
-    expires_at = (now_dt + _STAGING_TTL).isoformat()
+    expires_at = (now_dt + _registration_staging_ttl()).isoformat()
     kind = "group" if thread_ref and thread_ref != contact_ref else "contact"
     row_id = "staging_" + uuid.uuid4().hex[:12]
     with _connect() as conn:
@@ -297,6 +338,32 @@ def peek_staging() -> list[dict[str, Any]]:
         }
         for row in rows
     ]
+
+
+def registration_staging_diagnostics() -> dict[str, Any]:
+    """Return sanitized registration-staging diagnostics for operator UX."""
+    init_db()
+    _staging_cleanup()
+    with _connect() as conn:
+        staging_count = conn.execute(
+            "SELECT COUNT(*) FROM registration_staging WHERE expires_at > ?",
+            (utc_now(),),
+        ).fetchone()[0]
+        inbound_count = conn.execute("SELECT COUNT(*) FROM inbound_events").fetchone()[0]
+        latest = conn.execute(
+            "SELECT created_at FROM inbound_events ORDER BY created_at DESC LIMIT 1"
+        ).fetchone()
+    latest_created_at = latest["created_at"] if latest else None
+    empty_reason = "none"
+    if not staging_count:
+        empty_reason = "no_inbound_yet" if not inbound_count else "no_active_staging_or_expired"
+    return {
+        "staging_ttl_seconds": registration_staging_ttl_seconds(),
+        "staged_count": int(staging_count),
+        "inbound_count": int(inbound_count),
+        "latest_inbound_created_at": latest_created_at,
+        "empty_reason": empty_reason,
+    }
 
 
 # ---------------------------------------------------------------------------
