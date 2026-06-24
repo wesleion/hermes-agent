@@ -21,10 +21,11 @@ try:  # config loading is best-effort; tool remains fail-closed if unavailable
 except Exception:  # pragma: no cover - defensive for stripped runtimes
     load_config = None
 from tools.whatsapp_ops_store import (
+    consume_latest_raw_ref,
     create_approval,
     create_draft,
-    get_draft,
     get_cockpit_overview,
+    get_draft,
     get_latest_approval,
     get_send_allowlist_ids,
     get_valid_approval,
@@ -34,9 +35,13 @@ from tools.whatsapp_ops_store import (
     lookup_inbound_events,
     mark_outbox_blocked,
     mark_outbox_result,
+    peek_staging,
+    register_contact_local,
+    register_group_local,
     reserve_outbox_send,
     resolve_approval,
     resolve_contact,
+    stage_raw_ref,
     sync_allowlist_from_env,
     update_draft_status,
 )
@@ -423,9 +428,117 @@ def wpp_ingest_inbound_event(payload: dict[str, Any]) -> str:
             payload=payload,
             status="received",
         )
+        # Stage raw refs temporarily for registration use.
+        if result.get("ok"):
+            try:
+                stage_raw_ref(
+                    contact_ref=contact_ref,
+                    thread_ref=thread_ref,
+                    display_name=data.get("pushName", "") or payload.get("senderName", "") or "",
+                )
+            except Exception:
+                pass  # staging is best-effort; never fail ingest
     except Exception as exc:
         return _json({"ok": False, "error": str(exc)[:200]})
     return _json(result)
+
+
+def wpp_register_alias(
+    nome: str,
+    ref: str = "",
+    tipo: str = "contact",
+    policy_group: str = "manual",
+    allow_send: bool = False,
+) -> str:
+    """Register a contact or group alias in the local allowlist cache.
+
+    If ``ref`` is empty, uses the most recently received inbound's raw ref.
+    Use ``wpp_register_staging_status`` to see what's available for registration.
+
+    Fail-closed: never sends, never exposes raw refs in output.
+    """
+    init_db()
+    if not nome.strip():
+        return _json({"ok": False, "error": "nome_required"})
+    ref_raw = str(ref or "").strip()
+    tipo_norm = str(tipo or "contact").strip().lower()
+    if tipo_norm not in ("contact", "group"):
+        return _json({"ok": False, "error": "tipo_invalid"})
+
+    # Resolve raw ref: explicit > staging consume > error
+    if not ref_raw:
+        consumed = consume_latest_raw_ref(kind=tipo_norm)
+        if not consumed:
+            return _json({
+                "ok": False,
+                "error": "ref_required",
+                "hint": "Informe 'ref' como o número/ID do WhatsApp, ou aguarde um inbound novo.",
+            })
+        ref_raw = consumed
+
+    policy_group = str(policy_group or "manual").strip().lower()
+    if tipo_norm == "contact":
+        result = register_contact_local(
+            alias=nome.strip(),
+            raw_ref=ref_raw,
+            policy_group=policy_group,
+            allow_send=bool(allow_send),
+        )
+    else:
+        result = register_group_local(
+            alias=nome.strip(),
+            raw_ref=ref_raw,
+            policy_group=policy_group,
+            allow_send=bool(allow_send),
+        )
+    if not result.get("ok"):
+        return _json(result)
+    return _json({
+        "ok": True,
+        "tipo": tipo_norm,
+        "alias": nome.strip(),
+        "policy_group": policy_group,
+        "allow_send": bool(allow_send),
+        "contact_id": result.get("contact_id", ""),
+        "display_name": result.get("display_name") or result.get("name", ""),
+    })
+
+
+def wpp_register_staging_status() -> str:
+    """Show what inbound refs are staged and ready for registration.
+
+    Returns sanitized info only (no raw WhatsApp refs).
+    Use this before 'ref_from_staging' to see what's available.
+    """
+    try:
+        staged = peek_staging()
+    except Exception as exc:
+        return _json({"ok": False, "error": str(exc)[:200]})
+    return _json({
+        "ok": True,
+        "staged": staged,
+        "hint": "Use wpp_register_alias(nome='...', ref='...') com o número, ou "
+                "wpp_register_alias(nome='...') para usar o último inbound automaticamente.",
+    })
+
+
+def wpp_register_group(
+    nome: str,
+    ref: str = "",
+    policy_group: str = "manual",
+    allow_send: bool = False,
+) -> str:
+    """Register a group alias in the local allowlist cache.  Shorthand for ``wpp_register_alias`` with ``tipo=group``.
+
+    Fail-closed: never sends, never exposes raw refs in output.
+    """
+    return wpp_register_alias(
+        nome=nome,
+        ref=ref,
+        tipo="group",
+        policy_group=policy_group,
+        allow_send=allow_send,
+    )
 
 
 def check_whatsapp_ops_requirements() -> bool:
@@ -443,6 +556,10 @@ def _schema(name: str, description: str, properties: dict[str, Any], required: l
         },
     }
 
+
+# ---------------------------------------------------------------------------
+# Tool registrations
+# ---------------------------------------------------------------------------
 
 registry.register(
     name="wpp_resolve_contact",
@@ -621,6 +738,20 @@ registry.register(
 )
 
 registry.register(
+    name="wpp_ingest_inbound_event",
+    toolset=TOOLSET,
+    schema=_schema(
+        "wpp_ingest_inbound_event",
+        "Ingest a raw QuePasa inbound webhook payload into the sanitized local store. This never sends.",
+        {"payload": {"type": "object"}},
+        ["payload"],
+    ),
+    handler=lambda args, **kw: wpp_ingest_inbound_event(args.get("payload", {})),
+    check_fn=check_whatsapp_ops_requirements,
+    emoji="📲",
+)
+
+registry.register(
     name="wpp_cockpit_overview",
     toolset=TOOLSET,
     schema=_schema(
@@ -635,15 +766,68 @@ registry.register(
 )
 
 registry.register(
-    name="wpp_ingest_inbound_event",
+    name="wpp_register_alias",
     toolset=TOOLSET,
     schema=_schema(
-        "wpp_ingest_inbound_event",
-        "Ingest a raw QuePasa inbound webhook payload into the sanitized local store. This never sends.",
-        {"payload": {"type": "object"}},
-        ["payload"],
+        "wpp_register_alias",
+        "Register a contact or group alias in the local allowlist cache by name. "
+        "If 'ref' is empty, uses the most recently received inbound's raw ref. "
+        "Use wpp_register_staging_status to see available inbounds. Never sends.",
+        {
+            "nome": {"type": "string"},
+            "ref": {"type": "string"},
+            "tipo": {"type": "string", "enum": ["contact", "group"]},
+            "policy_group": {"type": "string"},
+            "allow_send": {"type": "boolean"},
+        },
+        ["nome"],
     ),
-    handler=lambda args, **kw: wpp_ingest_inbound_event(args.get("payload", {})),
+    handler=lambda args, **kw: wpp_register_alias(
+        nome=args.get("nome", ""),
+        ref=args.get("ref", ""),
+        tipo=args.get("tipo", "contact"),
+        policy_group=args.get("policy_group", "manual"),
+        allow_send=bool(args.get("allow_send", False)),
+    ),
+    check_fn=check_whatsapp_ops_requirements,
+    emoji="📲",
+)
+
+registry.register(
+    name="wpp_register_staging_status",
+    toolset=TOOLSET,
+    schema=_schema(
+        "wpp_register_staging_status",
+        "Show what inbound refs are staged and available for registration. Sanitized output.",
+        {},
+        [],
+    ),
+    handler=lambda args, **kw: wpp_register_staging_status(),
+    check_fn=check_whatsapp_ops_requirements,
+    emoji="📲",
+)
+
+registry.register(
+    name="wpp_register_group",
+    toolset=TOOLSET,
+    schema=_schema(
+        "wpp_register_group",
+        "Register a group alias in the local allowlist cache. "
+        "If 'ref' is empty, uses the most recently received inbound group ref. Never sends.",
+        {
+            "nome": {"type": "string"},
+            "ref": {"type": "string"},
+            "policy_group": {"type": "string"},
+            "allow_send": {"type": "boolean"},
+        },
+        ["nome"],
+    ),
+    handler=lambda args, **kw: wpp_register_group(
+        nome=args.get("nome", ""),
+        ref=args.get("ref", ""),
+        policy_group=args.get("policy_group", "manual"),
+        allow_send=bool(args.get("allow_send", False)),
+    ),
     check_fn=check_whatsapp_ops_requirements,
     emoji="📲",
 )
