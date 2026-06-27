@@ -191,12 +191,28 @@ def init_db() -> Path:
             );
             """
         )
+        _ensure_registration_staging_columns(conn)
+        _backfill_registration_staging_metadata(conn)
     return db_path
+
+
+
+def _ensure_registration_staging_columns(conn: sqlite3.Connection) -> None:
+    columns = {row["name"] for row in conn.execute("PRAGMA table_info(registration_staging)")}
+    additions = {
+        "ref_hash": "ref_hash TEXT",
+        "last_seen_at": "last_seen_at TEXT",
+        "message_count": "message_count INTEGER NOT NULL DEFAULT 1",
+        "safe_hint_json": "safe_hint_json TEXT",
+    }
+    for name, ddl in additions.items():
+        if name not in columns:
+            conn.execute(f"ALTER TABLE registration_staging ADD COLUMN {ddl}")
+
 
 
 def _row_to_dict(row: sqlite3.Row | None) -> dict[str, Any] | None:
     return dict(row) if row is not None else None
-
 
 def _normalize(value: str) -> str:
     return re.sub(r"\s+", " ", str(value or "").strip().casefold())
@@ -236,6 +252,153 @@ def _safe_contact(row: dict[str, Any]) -> dict[str, Any]:
     }
 
 
+
+def _safe_registration_id(kind: str, raw_ref: str) -> str:
+    prefix = "grp" if kind == "group" else "ctt"
+    return f"{prefix}_{hash_text(raw_ref)[:8]}"
+
+
+
+def _clean_registration_text(value: Any, limit: int = 80) -> str:
+    text = re.sub(r"\s+", " ", str(value or "").strip())
+    if not text:
+        return ""
+    if re.search(r"(?i)https?://", text) or "@" in text:
+        return ""
+    text = re.sub(r"\+?\d[\d\s().-]{6,}\d", "", text).strip()
+    return text[:limit]
+
+
+
+def _safe_message_type(value: Any) -> str:
+    text = re.sub(r"[^a-z0-9_.-]+", "", str(value or "").strip().lower())
+    return text[:40]
+
+
+
+def _coerce_safe_hint(value: dict[str, Any] | None) -> dict[str, Any]:
+    if not isinstance(value, dict):
+        return {}
+    hint: dict[str, Any] = {}
+    for key in ("display_name", "group_name", "participant_name", "source_group_name"):
+        cleaned = _clean_registration_text(value.get(key))
+        if cleaned:
+            hint[key] = cleaned
+    for key in ("safe_id", "source_group_safe_id"):
+        cleaned = _safe_message_type(value.get(key))
+        if cleaned:
+            hint[key] = cleaned
+    msg_type = _safe_message_type(value.get("last_message_type"))
+    if msg_type:
+        hint["last_message_type"] = msg_type
+    if "has_media" in value:
+        hint["has_media"] = bool(value.get("has_media"))
+    return hint
+
+
+
+def _raw_ref_for_kind(kind: str, contact_ref: str, thread_ref: str) -> str:
+    if kind == "group":
+        return str(thread_ref or contact_ref or "")
+    return str(contact_ref or thread_ref or "")
+
+
+
+def _build_staging_hint(
+    *,
+    kind: str,
+    raw_ref: str,
+    contact_ref: str = "",
+    thread_ref: str = "",
+    display_name: str = "",
+    safe_hint: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    hint = _coerce_safe_hint(safe_hint)
+    hint["safe_id"] = _safe_registration_id(kind, raw_ref)
+    digits = _phone_digits(raw_ref)
+    if kind == "contact" and digits:
+        masked = mask_phone(raw_ref)
+        if masked:
+            hint["phone_masked"] = masked
+        hint["last4"] = digits[-4:]
+    if kind == "contact" and thread_ref and thread_ref != contact_ref:
+        hint["source_group_safe_id"] = _safe_registration_id("group", thread_ref)
+        source_name = _clean_registration_text(hint.get("source_group_name") or "")
+        if source_name:
+            hint["source_group_name"] = source_name
+    display = _clean_registration_text(display_name)
+    if kind == "group":
+        display = hint.get("group_name") or display
+    else:
+        display = hint.get("participant_name") or display
+    if display:
+        hint["display_name"] = display
+    return hint
+
+
+
+def _load_staging_hint(raw: Any) -> dict[str, Any]:
+    if not raw:
+        return {}
+    try:
+        data = json.loads(str(raw))
+    except json.JSONDecodeError:
+        return {}
+    return data if isinstance(data, dict) else {}
+
+
+
+def _merge_staging_hints(old: dict[str, Any], new: dict[str, Any]) -> dict[str, Any]:
+    merged = dict(old)
+    for key, value in new.items():
+        if value not in (None, "", [], {}):
+            merged[key] = value
+    return merged
+
+
+
+def _backfill_registration_staging_metadata(conn: sqlite3.Connection) -> None:
+    try:
+        rows = conn.execute(
+            """
+            SELECT id, contact_ref_raw, thread_ref_raw, display_name, kind,
+                   created_at, ref_hash, last_seen_at, safe_hint_json
+            FROM registration_staging
+            WHERE ref_hash IS NULL OR last_seen_at IS NULL OR safe_hint_json IS NULL
+            """
+        ).fetchall()
+    except sqlite3.OperationalError:
+        return
+    for row in rows:
+        kind = str(row["kind"] or "contact").strip().lower()
+        if kind not in {"contact", "group"}:
+            kind = "group" if row["thread_ref_raw"] and row["thread_ref_raw"] != row["contact_ref_raw"] else "contact"
+        contact_ref = str(row["contact_ref_raw"] or "")
+        thread_ref = str(row["thread_ref_raw"] or "")
+        raw_ref = _raw_ref_for_kind(kind, contact_ref, thread_ref)
+        if not raw_ref:
+            continue
+        existing_hint = _load_staging_hint(row["safe_hint_json"])
+        hint = _merge_staging_hints(existing_hint, _build_staging_hint(
+            kind=kind,
+            raw_ref=raw_ref,
+            contact_ref=contact_ref,
+            thread_ref=thread_ref,
+            display_name=row["display_name"] or "",
+            safe_hint=existing_hint,
+        ))
+        conn.execute(
+            """
+            UPDATE registration_staging
+            SET ref_hash=?, last_seen_at=COALESCE(last_seen_at, created_at),
+                message_count=COALESCE(message_count, 1), safe_hint_json=?
+            WHERE id=?
+            """,
+            (hash_text(raw_ref), json.dumps(hint, ensure_ascii=False, sort_keys=True), row["id"]),
+        )
+
+
+
 # ---------------------------------------------------------------------------
 # Staging raw inbound refs for registration
 # ---------------------------------------------------------------------------
@@ -248,70 +411,203 @@ def _staging_cleanup() -> None:
         conn.execute("DELETE FROM registration_staging WHERE expires_at <= ?", (now,))
 
 
-def stage_raw_ref(*, contact_ref: str = "", thread_ref: str = "", display_name: str = "") -> dict[str, Any]:
+def stage_raw_ref(
+    *,
+    contact_ref: str = "",
+    thread_ref: str = "",
+    display_name: str = "",
+    kind: str | None = None,
+    safe_hint: dict[str, Any] | None = None,
+) -> dict[str, Any]:
     """Store raw inbound refs temporarily for registration use.
 
-    Auto-purges old staging first.  Expires after ``_STAGING_TTL``.
+    Auto-purges old staging first.  Expires after the profile TTL.
     The caller is responsible for calling this only from trusted ingest
     code paths, never from model-driven tool calls.
     """
     init_db()
     _staging_cleanup()
-    if not contact_ref and not thread_ref:
+    contact_ref = str(contact_ref or "")
+    thread_ref = str(thread_ref or "")
+    kind_norm = str(kind or "").strip().lower()
+    if kind_norm not in {"contact", "group"}:
+        kind_norm = "group" if thread_ref and thread_ref != contact_ref else "contact"
+    raw_ref = _raw_ref_for_kind(kind_norm, contact_ref, thread_ref)
+    if not raw_ref:
         return {"ok": False, "error": "no_ref"}
+
     now_dt = datetime.now(timezone.utc)
     now = now_dt.isoformat()
     expires_at = (now_dt + _registration_staging_ttl()).isoformat()
-    kind = "group" if thread_ref and thread_ref != contact_ref else "contact"
-    row_id = "staging_" + uuid.uuid4().hex[:12]
-    with _connect() as conn:
-        conn.execute(
-            """
-            INSERT INTO registration_staging (
-                id, contact_ref_raw, thread_ref_raw, display_name,
-                kind, expires_at, created_at
-            ) VALUES (?, ?, ?, ?, ?, ?, ?)
-            """,
-            (row_id, contact_ref or None, thread_ref or None,
-             (display_name or "")[:80], kind, expires_at, now),
-        )
-    return {"ok": True, "staging_id": row_id, "kind": kind, "expires_at": expires_at}
+    ref_hash = hash_text(raw_ref)
+    hint = _build_staging_hint(
+        kind=kind_norm,
+        raw_ref=raw_ref,
+        contact_ref=contact_ref,
+        thread_ref=thread_ref,
+        display_name=display_name,
+        safe_hint=safe_hint,
+    )
+    display = hint.get("display_name", "")[:80]
 
-
-def _latest_staging(kind: str = "contact") -> dict[str, Any] | None:
-    """Return the most recent non-expired staging row for *kind*."""
-    init_db()
-    _staging_cleanup()
     with _connect() as conn:
-        row = conn.execute(
+        existing = conn.execute(
             """
             SELECT * FROM registration_staging
-            WHERE kind=? AND expires_at > ?
-            ORDER BY created_at DESC LIMIT 1
+            WHERE kind=? AND ref_hash=? AND expires_at > ?
+            ORDER BY COALESCE(last_seen_at, created_at) DESC, created_at DESC
+            LIMIT 1
             """,
-            (kind, utc_now()),
+            (kind_norm, ref_hash, utc_now()),
         ).fetchone()
-    if row is None:
-        return None
-    result = dict(row)
-    # Consume on read — remove so it can't be used twice.
+        if existing:
+            row_id = existing["id"]
+            merged_hint = _merge_staging_hints(_load_staging_hint(existing["safe_hint_json"]), hint)
+            message_count = int(existing["message_count"] or 1) + 1
+            conn.execute(
+                """
+                UPDATE registration_staging
+                SET contact_ref_raw=?, thread_ref_raw=?, display_name=?, expires_at=?,
+                    last_seen_at=?, message_count=?, safe_hint_json=?
+                WHERE id=?
+                """,
+                (
+                    contact_ref or None,
+                    thread_ref or None,
+                    display,
+                    expires_at,
+                    now,
+                    message_count,
+                    json.dumps(merged_hint, ensure_ascii=False, sort_keys=True),
+                    row_id,
+                ),
+            )
+        else:
+            row_id = "staging_" + uuid.uuid4().hex[:12]
+            conn.execute(
+                """
+                INSERT INTO registration_staging (
+                    id, contact_ref_raw, thread_ref_raw, display_name,
+                    kind, expires_at, created_at, ref_hash, last_seen_at,
+                    message_count, safe_hint_json
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    row_id,
+                    contact_ref or None,
+                    thread_ref or None,
+                    display,
+                    kind_norm,
+                    expires_at,
+                    now,
+                    ref_hash,
+                    now,
+                    1,
+                    json.dumps(hint, ensure_ascii=False, sort_keys=True),
+                ),
+            )
+            message_count = 1
+    return {
+        "ok": True,
+        "staging_id": row_id,
+        "kind": kind_norm,
+        "expires_at": expires_at,
+        "safe_id": hint.get("safe_id", ""),
+        "message_count": message_count,
+    }
+
+
+
+def _delete_staging_row(conn: sqlite3.Connection, row: dict[str, Any]) -> None:
+    ref_hash = row.get("ref_hash")
+    if ref_hash:
+        conn.execute(
+            "DELETE FROM registration_staging WHERE kind=? AND ref_hash=?",
+            (row.get("kind"), ref_hash),
+        )
+    else:
+        conn.execute("DELETE FROM registration_staging WHERE id=?", (row["id"],))
+
+
+
+def _latest_staging(kind: str = "contact", staging_id: str = "") -> dict[str, Any] | None:
+    """Return and consume a non-expired staging row for *kind*."""
+    init_db()
+    _staging_cleanup()
+    kind_norm = str(kind or "contact").strip().lower()
+    if kind_norm not in {"contact", "group"}:
+        kind_norm = "contact"
+    if staging_id:
+        where = "id=? AND kind=? AND expires_at > ?"
+        params: tuple[Any, ...] = (staging_id, kind_norm, utc_now())
+    else:
+        where = "kind=? AND expires_at > ?"
+        params = (kind_norm, utc_now())
     with _connect() as conn:
-        conn.execute("DELETE FROM registration_staging WHERE id=?", (result["id"],))
+        row = conn.execute(
+            f"""
+            SELECT * FROM registration_staging
+            WHERE {where}
+            ORDER BY COALESCE(last_seen_at, created_at) DESC, created_at DESC
+            LIMIT 1
+            """,
+            params,
+        ).fetchone()
+        if row is None:
+            return None
+        result = dict(row)
+        _delete_staging_row(conn, result)
     return result
 
 
-def consume_latest_raw_ref(kind: str = "contact") -> str | None:
-    """Return the raw ref from the latest inbound staging, or None.
+
+def consume_latest_raw_ref(kind: str = "contact", staging_id: str = "") -> str | None:
+    """Return the raw ref from staging, optionally selecting a staging id.
 
     ``kind="contact"`` returns ``contact_ref_raw``.
     ``kind="group"`` returns ``thread_ref_raw``.
-    The staging row is consumed (deleted) after read.
+    Matching staging rows are consumed after read.
     """
-    row = _latest_staging(kind)
+    row = _latest_staging(kind, staging_id=staging_id)
     if row is None:
         return None
-    key = "contact_ref_raw" if kind == "contact" else "thread_ref_raw"
+    kind_norm = str(kind or "contact").strip().lower()
+    key = "thread_ref_raw" if kind_norm == "group" else "contact_ref_raw"
     return str(row.get(key) or "") or None
+
+
+
+def _public_staging_item(row: dict[str, Any]) -> dict[str, Any]:
+    kind = str(row.get("kind") or "contact")
+    hint = _load_staging_hint(row.get("safe_hint_json"))
+    raw_ref = _raw_ref_for_kind(kind, str(row.get("contact_ref_raw") or ""), str(row.get("thread_ref_raw") or ""))
+    if raw_ref and not hint.get("safe_id"):
+        hint["safe_id"] = _safe_registration_id(kind, raw_ref)
+    display_name = row.get("display_name") or hint.get("display_name") or ""
+    if not display_name:
+        display_name = hint.get("group_name") or hint.get("participant_name") or ""
+    item = {
+        "staging_id": row["id"],
+        "display_name": display_name,
+        "kind": kind,
+        "created_at": row.get("created_at"),
+        "last_seen_at": row.get("last_seen_at") or row.get("created_at"),
+        "available_until": row.get("expires_at"),
+        "message_count": int(row.get("message_count") or 1),
+        "safe_id": hint.get("safe_id") or "",
+    }
+    for key in (
+        "phone_masked",
+        "last4",
+        "source_group_safe_id",
+        "source_group_name",
+        "last_message_type",
+        "has_media",
+    ):
+        if key in hint and hint[key] not in (None, ""):
+            item[key] = hint[key]
+    return item
+
 
 
 def peek_staging() -> list[dict[str, Any]]:
@@ -319,25 +615,25 @@ def peek_staging() -> list[dict[str, Any]]:
     init_db()
     _staging_cleanup()
     with _connect() as conn:
-        rows = conn.execute(
+        rows = [dict(row) for row in conn.execute(
             """
-            SELECT id, display_name, kind, created_at, expires_at
+            SELECT *
             FROM registration_staging
             WHERE expires_at > ?
-            ORDER BY created_at DESC
+            ORDER BY COALESCE(last_seen_at, created_at) DESC, created_at DESC
             """,
             (utc_now(),),
-        ).fetchall()
-    return [
-        {
-            "staging_id": row["id"],
-            "display_name": row["display_name"] or "",
-            "kind": row["kind"],
-            "created_at": row["created_at"],
-            "available_until": row["expires_at"],
-        }
-        for row in rows
-    ]
+        ).fetchall()]
+    grouped: dict[tuple[str, str], dict[str, Any]] = {}
+    for row in rows:
+        key = (str(row.get("kind") or "contact"), str(row.get("ref_hash") or row.get("id")))
+        if key not in grouped:
+            grouped[key] = dict(row)
+            grouped[key]["message_count"] = int(row.get("message_count") or 1)
+            continue
+        grouped[key]["message_count"] = int(grouped[key].get("message_count") or 1) + int(row.get("message_count") or 1)
+    return [_public_staging_item(row) for row in grouped.values()]
+
 
 
 def registration_staging_diagnostics() -> dict[str, Any]:

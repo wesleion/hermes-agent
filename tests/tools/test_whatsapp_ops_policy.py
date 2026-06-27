@@ -199,3 +199,31 @@ def test_send_guardrails_allow_only_when_all_conditions_pass():
 
     assert result.allowed is True
     assert result.reasons == []
+
+
+def test_group_create_guardrails_require_group_flag_and_participant_whitelist():
+    from tools.whatsapp_ops_policy import evaluate_send_guardrails
+
+    draft = _draft(targets=[{
+        "type": "group_create",
+        "name": "Grupo Teste",
+        "participant_contact_ids": ["c_1"],
+    }])
+
+    blocked = evaluate_send_guardrails(
+        config=_base_config(quepasa={"send_enabled": True, "group_create_enabled": False}),
+        draft=draft,
+        approval=_approval(),
+        idempotency_used=False,
+    )
+    allowed = evaluate_send_guardrails(
+        config=_base_config(quepasa={"send_enabled": True, "group_create_enabled": True}),
+        draft=draft,
+        approval=_approval(),
+        idempotency_used=False,
+    )
+
+    assert blocked.allowed is False
+    assert "quepasa_group_create_disabled" in blocked.reasons
+    assert allowed.allowed is True
+    assert allowed.reasons == []

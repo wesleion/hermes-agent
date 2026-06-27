@@ -14,7 +14,7 @@ from typing import Any, Callable
 
 from tools.registry import registry
 from tools.whatsapp_ops_policy import evaluate_send_guardrails
-from tools.whatsapp_ops_quepasa import send_via_quepasa
+from tools.whatsapp_ops_quepasa import create_group_via_quepasa, send_via_quepasa
 
 try:  # config loading is best-effort; tool remains fail-closed if unavailable
     from hermes_cli.config import load_config
@@ -126,6 +126,27 @@ def _normalize_target_for_policy(target: Any) -> dict[str, Any]:
                 normalized["display_name"] = match.get("display_name")
                 normalized["whitelisted"] = bool(match.get("whitelisted"))
         return normalized
+    if target_type == "group_create":
+        members = normalized.get("member_aliases") or normalized.get("participants") or []
+        if not isinstance(members, list):
+            members = []
+        participant_contact_ids: list[str] = []
+        unresolved = 0
+        for member in members:
+            query = str(member or "").strip()
+            resolved = resolve_contact(query) if query else {"ok": True, "ambiguous": True, "matches": []}
+            if resolved.get("ambiguous") or not resolved.get("match"):
+                unresolved += 1
+                continue
+            contact_id = str((resolved.get("match") or {}).get("contact_id") or "").strip()
+            if contact_id:
+                participant_contact_ids.append(contact_id)
+        normalized["participant_contact_ids"] = participant_contact_ids
+        normalized["participant_count"] = len(participant_contact_ids)
+        if unresolved or not participant_contact_ids:
+            normalized["ambiguous"] = True
+            normalized["unresolved_members"] = unresolved or len(members)
+        return normalized
     return normalized
 
 
@@ -152,6 +173,109 @@ def _approval_for_policy(approval: dict[str, Any] | None) -> dict[str, Any] | No
         "expires_at": approval.get("expires_at"),
         "message_hash": approval.get("message_hash"),
     }
+
+
+def _load_json_env(env_name: str, default: Any, *fallback_env_names: str) -> Any:
+    for name in (env_name, *fallback_env_names):
+        raw = os.environ.get(name)
+        if raw:
+            try:
+                return json.loads(raw)
+            except json.JSONDecodeError:
+                return default
+    return default
+
+
+def _raw_contact_entries() -> list[dict[str, Any]]:
+    contacts = _load_json_env("CONTACTS_JSON", [], "WHATSAPP_OPS_ALLOWLIST_CONTACTS_JSON")
+    alias_map = _load_json_env("ALIAS_MAP_JSON", {}, "WHATSAPP_OPS_ALIAS_MAP_JSON")
+    entries: list[dict[str, Any]] = []
+    if isinstance(contacts, list):
+        entries.extend(item for item in contacts if isinstance(item, dict))
+    if isinstance(alias_map, dict):
+        for alias, value in alias_map.items():
+            if isinstance(value, dict):
+                item = dict(value)
+                item.setdefault("alias", alias)
+                entries.append(item)
+            elif isinstance(value, str):
+                entries.append({"alias": alias, "target_ref": value, "kind": "contact"})
+    return entries
+
+
+def _digits(value: str) -> str:
+    return "".join(ch for ch in str(value or "") if ch.isdigit())
+
+
+def _resolve_raw_contact_ref(query: str) -> str:
+    """Resolve an operator alias to a raw provider ref for transport only.
+
+    Raw refs are sourced from env/Infisical-rendered allowlists and are never
+    returned to model/user output. Empty string means fail closed.
+    """
+    needle = str(query or "").strip()
+    if not needle:
+        return ""
+    needle_norm = needle.casefold()
+    needle_digits = _digits(needle)
+    matches: list[str] = []
+    for item in _raw_contact_entries():
+        kind = str(item.get("kind") or "contact").strip().lower()
+        if kind not in {"contact", "dm"}:
+            continue
+        raw_ref = str(item.get("target_ref") or item.get("ref") or item.get("contact_ref") or "").strip()
+        if not raw_ref:
+            continue
+        candidates = {
+            str(item.get("alias") or "").strip().casefold(),
+            str(item.get("display_name") or "").strip().casefold(),
+            raw_ref.casefold(),
+        }
+        raw_digits = _digits(raw_ref)
+        if needle_norm in candidates or (needle_digits and needle_digits == raw_digits):
+            if bool(item.get("allow_send", False)):
+                matches.append(raw_ref)
+    unique = list(dict.fromkeys(matches))
+    return unique[0] if len(unique) == 1 else ""
+
+
+def _extract_group_create_target(draft: dict[str, Any] | None) -> dict[str, Any] | None:
+    if not draft:
+        return None
+    try:
+        raw_targets = json.loads(draft.get("targets_json") or "[]")
+    except (TypeError, json.JSONDecodeError):
+        return None
+    if not isinstance(raw_targets, list):
+        return None
+    matches = [t for t in raw_targets if isinstance(t, dict) and str(t.get("type") or "").lower() == "group_create"]
+    return matches[0] if len(matches) == 1 else None
+
+
+def _group_create_provider_payload(draft_id: str, draft: dict[str, Any] | None, idempotency_key: str) -> tuple[dict[str, Any] | None, str | None]:
+    target = _extract_group_create_target(draft)
+    if not target:
+        return None, "payload_invalid"
+    title = str(target.get("name") or target.get("title") or "").strip()
+    members = target.get("member_aliases") or target.get("participants") or []
+    if not title or not isinstance(members, list) or not members:
+        return None, "payload_invalid"
+    participants: list[str] = []
+    for member in members:
+        raw_ref = _resolve_raw_contact_ref(str(member or ""))
+        if not raw_ref:
+            return None, "participant_ref_unresolved"
+        participants.append(raw_ref)
+    return {
+        "draft_id": draft_id,
+        "group_create": {"title": title, "participants": participants},
+        "idempotency_key": idempotency_key,
+    }, None
+
+
+def _is_group_create_policy_draft(policy_draft: dict[str, Any] | None) -> bool:
+    targets = (policy_draft or {}).get("targets") or []
+    return any(isinstance(t, dict) and t.get("type") == "group_create" for t in targets)
 
 
 def _telegram_destination(cfg: dict[str, Any]) -> tuple[str, str | None]:
@@ -185,12 +309,23 @@ def _send_telegram_approval_card(approval: dict[str, Any], draft: dict[str, Any]
     approval_id = approval.get("approval_id", "")
     draft_id = approval.get("draft_id") or (draft or {}).get("id", "")
     text_preview = str((draft or {}).get("message", ""))[:700]
+    is_group_create = False
+    try:
+        targets = json.loads(str((draft or {}).get("targets_json") or "[]"))
+        is_group_create = any(isinstance(t, dict) and t.get("type") == "group_create" for t in targets)
+    except Exception:
+        is_group_create = False
+    approval_note = (
+        "Aprovar tenta executar a criação via QuePasa/direct, respeitando flags e allowlist."
+        if is_group_create
+        else "Aprovar só marca o draft como approved. O envio continua separado."
+    )
     text = (
         "📲 <b>WhatsApp Ops approval</b>\n\n"
         f"Draft: <code>{draft_id}</code>\n"
         f"Approval: <code>{approval_id}</code>\n\n"
         f"<pre>{text_preview}</pre>\n\n"
-        "Aprovar só marca o draft como approved. O envio continua separado."
+        f"{approval_note}"
     )
     payload: dict[str, Any] = {
         "chat_id": chat_id,
@@ -266,16 +401,24 @@ def wpp_send_approved(
     if not result.allowed:
         return _json({"ok": False, "draft_id": draft_id, "reasons": result.reasons})
 
+    is_group_create = _is_group_create_policy_draft(policy_draft)
+    if is_group_create:
+        payload, payload_error = _group_create_provider_payload(draft_id, draft, idempotency_key)
+        if payload_error:
+            return _json({"ok": False, "draft_id": draft_id, "reasons": [payload_error]})
+        client = send_client or create_group_via_quepasa
+    else:
+        client = send_client or send_via_quepasa
+        payload = {
+            "draft_id": draft_id,
+            "targets": policy_draft["targets"] if policy_draft else [],
+            "message": draft["message"] if draft else "",
+            "idempotency_key": idempotency_key,
+        }
+
     if idempotency_key and not reserve_outbox_send(draft_id, idempotency_key):
         return _json({"ok": False, "draft_id": draft_id, "reasons": ["idempotency_duplicate"]})
 
-    client = send_client or send_via_quepasa
-    payload = {
-        "draft_id": draft_id,
-        "targets": policy_draft["targets"] if policy_draft else [],
-        "message": draft["message"] if draft else "",
-        "idempotency_key": idempotency_key,
-    }
     send_result = client(payload, cfg)
     if idempotency_key:
         if bool(send_result.get("ok")):
@@ -385,6 +528,83 @@ def _nested_dict(value: Any, *keys: str) -> dict[str, Any]:
     return current if isinstance(current, dict) else {}
 
 
+
+def _first_text(*values: Any) -> str:
+    for value in values:
+        text = str(value or "").strip()
+        if text:
+            return text
+    return ""
+
+
+
+def _registration_message_type(payload: dict[str, Any], data: dict[str, Any]) -> str:
+    msg_type = _first_text(
+        payload.get("type"),
+        payload.get("messageType"),
+        data.get("messageType"),
+        data.get("type"),
+    ).lower()
+    if msg_type:
+        return msg_type[:40]
+    if payload.get("attachment") or payload.get("mediaUrl"):
+        return "media"
+    message = data.get("message") if isinstance(data.get("message"), dict) else {}
+    for key in ("imageMessage", "audioMessage", "videoMessage", "documentMessage"):
+        if key in message:
+            return key.removesuffix("Message").lower()
+    return "text" if payload.get("text") or message.get("conversation") else "unknown"
+
+
+
+def _registration_has_media(payload: dict[str, Any], data: dict[str, Any], msg_type: str) -> bool:
+    if payload.get("attachment") or payload.get("mediaUrl"):
+        return True
+    if msg_type in {"image", "audio", "video", "document", "media"}:
+        return True
+    message = data.get("message") if isinstance(data.get("message"), dict) else {}
+    return any(key in message for key in ("imageMessage", "audioMessage", "videoMessage", "documentMessage"))
+
+
+
+def _registration_hints(
+    payload: dict[str, Any],
+    data: dict[str, Any],
+    chat: dict[str, Any],
+    participant: dict[str, Any],
+) -> tuple[dict[str, Any], dict[str, Any]]:
+    msg_type = _registration_message_type(payload, data)
+    has_media = _registration_has_media(payload, data, msg_type)
+    group_name = _first_text(
+        chat.get("subject"),
+        chat.get("name"),
+        chat.get("title"),
+        chat.get("displayName"),
+        payload.get("groupName"),
+        payload.get("chatName"),
+        data.get("groupName"),
+        data.get("chatName"),
+    )
+    participant_name = _first_text(
+        participant.get("title"),
+        participant.get("name"),
+        participant.get("pushName"),
+        payload.get("senderName"),
+        payload.get("pushName"),
+        data.get("pushName"),
+    )
+    base = {"last_message_type": msg_type, "has_media": has_media}
+    group_hint = dict(base)
+    contact_hint = dict(base)
+    if group_name:
+        group_hint["group_name"] = group_name
+        contact_hint["source_group_name"] = group_name
+    if participant_name:
+        contact_hint["participant_name"] = participant_name
+    return group_hint, contact_hint
+
+
+
 def wpp_ingest_inbound_event(payload: dict[str, Any]) -> str:
     """Ingest a raw QuePasa inbound webhook payload into the sanitized local store."""
     try:
@@ -429,14 +649,35 @@ def wpp_ingest_inbound_event(payload: dict[str, Any]) -> str:
             payload=payload,
             status="received",
         )
-        # Stage raw refs temporarily for registration use.
-        if result.get("ok"):
+        # Stage raw refs temporarily for registration use. For group messages,
+        # expose both actionable targets: the group and the participant/contact.
+        if result.get("ok") and not result.get("deduped"):
             try:
-                stage_raw_ref(
-                    contact_ref=contact_ref,
-                    thread_ref=thread_ref,
-                    display_name=data.get("pushName", "") or payload.get("senderName", "") or "",
-                )
+                group_hint, contact_hint = _registration_hints(payload, data, chat, participant)
+                if thread_ref and thread_ref != contact_ref:
+                    stage_raw_ref(
+                        contact_ref=contact_ref,
+                        thread_ref=thread_ref,
+                        display_name=group_hint.get("group_name", ""),
+                        kind="group",
+                        safe_hint=group_hint,
+                    )
+                    if contact_ref:
+                        stage_raw_ref(
+                            contact_ref=contact_ref,
+                            thread_ref=thread_ref,
+                            display_name=contact_hint.get("participant_name", ""),
+                            kind="contact",
+                            safe_hint=contact_hint,
+                        )
+                else:
+                    stage_raw_ref(
+                        contact_ref=contact_ref or thread_ref,
+                        thread_ref=thread_ref or contact_ref,
+                        display_name=contact_hint.get("participant_name", ""),
+                        kind="contact",
+                        safe_hint=contact_hint,
+                    )
             except Exception:
                 pass  # staging is best-effort; never fail ingest
     except Exception as exc:
@@ -450,6 +691,7 @@ def wpp_register_alias(
     tipo: str = "contact",
     policy_group: str = "manual",
     allow_send: bool = False,
+    staging_id: str = "",
 ) -> str:
     """Register a contact or group alias in the local allowlist cache.
 
@@ -466,14 +708,15 @@ def wpp_register_alias(
     if tipo_norm not in ("contact", "group"):
         return _json({"ok": False, "error": "tipo_invalid"})
 
-    # Resolve raw ref: explicit > staging consume > error
+    # Resolve raw ref: explicit > selected staging > latest staging > error
     if not ref_raw:
-        consumed = consume_latest_raw_ref(kind=tipo_norm)
+        consumed = consume_latest_raw_ref(kind=tipo_norm, staging_id=str(staging_id or "").strip())
         if not consumed:
+            hint = "Item de staging não encontrado/expirado. Use /fila e escolha um item válido." if staging_id else "Informe 'ref' como o número/ID do WhatsApp, ou aguarde um inbound novo."
             return _json({
                 "ok": False,
                 "error": "ref_required",
-                "hint": "Informe 'ref' como o número/ID do WhatsApp, ou aguarde um inbound novo.",
+                "hint": hint,
             })
         ref_raw = consumed
 
@@ -536,6 +779,7 @@ def wpp_register_group(
     ref: str = "",
     policy_group: str = "manual",
     allow_send: bool = False,
+    staging_id: str = "",
 ) -> str:
     """Register a group alias in the local allowlist cache.  Shorthand for ``wpp_register_alias`` with ``tipo=group``.
 
@@ -547,6 +791,7 @@ def wpp_register_group(
         tipo="group",
         policy_group=policy_group,
         allow_send=allow_send,
+        staging_id=staging_id,
     )
 
 
@@ -788,6 +1033,7 @@ registry.register(
             "tipo": {"type": "string", "enum": ["contact", "group"]},
             "policy_group": {"type": "string"},
             "allow_send": {"type": "boolean"},
+            "staging_id": {"type": "string"},
         },
         ["nome"],
     ),
@@ -797,6 +1043,7 @@ registry.register(
         tipo=args.get("tipo", "contact"),
         policy_group=args.get("policy_group", "manual"),
         allow_send=bool(args.get("allow_send", False)),
+        staging_id=args.get("staging_id", ""),
     ),
     check_fn=check_whatsapp_ops_requirements,
     emoji="📲",
@@ -828,6 +1075,7 @@ registry.register(
             "ref": {"type": "string"},
             "policy_group": {"type": "string"},
             "allow_send": {"type": "boolean"},
+            "staging_id": {"type": "string"},
         },
         ["nome"],
     ),
@@ -836,6 +1084,7 @@ registry.register(
         ref=args.get("ref", ""),
         policy_group=args.get("policy_group", "manual"),
         allow_send=bool(args.get("allow_send", False)),
+        staging_id=args.get("staging_id", ""),
     ),
     check_fn=check_whatsapp_ops_requirements,
     emoji="📲",

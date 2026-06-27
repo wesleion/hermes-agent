@@ -1103,6 +1103,92 @@ class GatewaySlashCommandsMixin:
             getattr(getattr(event, "source", None), "platform", None),
         )
 
+    async def _handle_wpp_create_group_command(self, event: MessageEvent) -> str:
+        """Handle /crgp — create a fail-closed group-create approval draft.
+
+        This records a structured action draft and sends the WhatsApp Ops approval
+        card when approval Telegram env/config is available. It never creates the
+        WhatsApp group; a separate executor/gate must consume the approved draft.
+        """
+        from gateway.run import _telegramize_command_mentions
+        import json
+
+        def _load_tool_json(raw: str) -> dict[str, Any]:
+            try:
+                data = json.loads(raw)
+            except Exception as exc:
+                return {"ok": False, "error": f"invalid_tool_json:{exc}"}
+            return data if isinstance(data, dict) else {"ok": False, "error": "invalid_tool_payload"}
+
+        raw = event.get_command_args().strip()
+        if not raw:
+            return "Uso: /crgp Nome do Grupo | contato1, contato2"
+        if "|" in raw:
+            group_name, members_raw = raw.split("|", 1)
+        else:
+            group_name, members_raw = raw, ""
+        group_name = group_name.strip()
+        members = [part.strip() for part in members_raw.split(",") if part.strip()]
+        if not group_name:
+            return "Nome obrigatório. Uso: /crgp Nome do Grupo | contato1, contato2"
+
+        from tools.whatsapp_ops_tool import wpp_create_draft, wpp_request_approval
+
+        message = (
+            "AÇÃO WHATSAPP OPS — CRIAR GRUPO\n\n"
+            f"Grupo: {group_name}\n"
+            f"Membros solicitados: {', '.join(members) if members else 'não informados'}\n\n"
+            "Status: approval_required\n"
+            "Aprovar este draft tenta executar a criação via QuePasa/direct, "
+            "respeitando flags, allowlist e idempotência."
+        )
+        draft_data = _load_tool_json(
+            wpp_create_draft(
+                targets=[{
+                    "type": "group_create",
+                    "name": group_name,
+                    "member_aliases": members,
+                    "requires_executor": "quepasa_group_create",
+                }],
+                message=message,
+            )
+        )
+        if not draft_data.get("ok"):
+            return f"Criação de grupo não preparada. Erro: {draft_data.get('error') or 'draft_failed'}"
+
+        draft_id = str(draft_data.get("draft_id") or draft_data.get("id") or "")
+        approval_data = _load_tool_json(wpp_request_approval(draft_id)) if draft_id else {"ok": False, "error": "draft_id_missing"}
+        approval_id = str(approval_data.get("approval_id") or "")
+        notification = approval_data.get("notification") if isinstance(approval_data.get("notification"), dict) else {}
+        notification_ok = bool(notification.get("ok"))
+        notification_reason = notification.get("reason") or notification.get("error") or ""
+
+        lines = [
+            "Criação de grupo preparada",
+            "",
+            f"Grupo: {group_name}",
+            f"Membros: {', '.join(members) if members else 'não informados'}",
+            f"Draft: {draft_id or 'indisponível'}",
+            f"Approval: {approval_id or 'indisponível'}",
+            "Status: pending_approval" if approval_data.get("ok") else "Status: approval_not_created",
+            "",
+        ]
+        if notification_ok:
+            lines.append("Gate: card de aprovação enviado no Telegram.")
+        else:
+            lines.append("Gate: approval local criado, mas card Telegram não enviado automaticamente.")
+            if notification_reason:
+                lines.append(f"Motivo: {notification_reason}")
+        lines.extend([
+            "",
+            "Criação real ainda NÃO foi executada neste passo; ela é tentada no clique de aprovação e respeita flags/allowlist.",
+            "Com flags fechadas, o callback mostrará o bloqueio em vez de criar grupo.",
+        ])
+        return _telegramize_command_mentions(
+            "\n".join(lines),
+            getattr(getattr(event, "source", None), "platform", None),
+        )
+
     async def _handle_model_command(self, event: MessageEvent) -> Optional[str]:
         """Handle /model command — switch model.
 

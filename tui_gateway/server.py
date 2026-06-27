@@ -10981,8 +10981,12 @@ def _(rid, params: dict) -> dict:
             COMMAND_REGISTRY,
             SUBCOMMANDS,
             _build_description,
+            _resolve_config_gates_from_config,
+            resolve_command,
         )
 
+        cfg = _load_cfg()
+        config_gates = _resolve_config_gates_from_config(cfg)
         all_pairs: list[list[str]] = []
         canon: dict[str, str] = {}
         categories: list[dict] = []
@@ -10991,6 +10995,8 @@ def _(rid, params: dict) -> dict:
 
         for cmd in COMMAND_REGISTRY:
             if cmd.name in _TUI_HIDDEN or cmd.gateway_only:
+                continue
+            if cmd.gateway_config_gate and cmd.name not in config_gates:
                 continue
 
             c = f"/{cmd.name}"
@@ -11016,14 +11022,17 @@ def _(rid, params: dict) -> dict:
 
         warning = ""
         try:
-            qcmds = _load_cfg().get("quick_commands", {}) or {}
+            qcmds = (cfg or {}).get("quick_commands", {}) or {}
             if isinstance(qcmds, dict) and qcmds:
-                bucket = "User commands"
-                if bucket not in cat_map:
-                    cat_map[bucket] = []
-                    cat_order.append(bucket)
+                quick_pairs: list[list[str]] = []
                 for qname, qc in sorted(qcmds.items()):
                     if not isinstance(qc, dict):
+                        continue
+                    # If the quick command is now represented by CommandDef
+                    # (canonical or alias), keep the catalog's single source of
+                    # truth in the registry/category and avoid duplicate/legacy
+                    # entries in the command bar.
+                    if resolve_command(qname) is not None:
                         continue
                     key = f"/{qname}"
                     canon[key.lower()] = key
@@ -11036,8 +11045,14 @@ def _(rid, params: dict) -> dict:
                         default_desc = qtype or "quick command"
                     qdesc = str(qc.get("description") or default_desc)
                     qdesc = qdesc[:120] + ("…" if len(qdesc) > 120 else "")
-                    all_pairs.append([key, qdesc])
-                    cat_map[bucket].append([key, qdesc])
+                    quick_pairs.append([key, qdesc])
+                if quick_pairs:
+                    bucket = "User commands"
+                    if bucket not in cat_map:
+                        cat_map[bucket] = []
+                        cat_order.append(bucket)
+                    all_pairs.extend(quick_pairs)
+                    cat_map[bucket].extend(quick_pairs)
         except Exception as e:
             if not warning:
                 warning = f"quick_commands discovery unavailable: {e}"
