@@ -1414,6 +1414,175 @@ def lookup_inbound_events(thread: str = "", contact: str = "", limit: int = 20) 
     return events
 
 
+_CONTEXT_MODES = {"summary", "operator", "debug"}
+_TEXT_PREVIEW_KEYS = {"text", "body", "conversation", "caption", "content"}
+_MEDIA_MESSAGE_KEYS = {
+    "imageMessage": "image",
+    "audioMessage": "audio",
+    "videoMessage": "video",
+    "documentMessage": "document",
+}
+_MEDIA_META_KEYS = {
+    "mimetype",
+    "mime",
+    "filelength",
+    "file_length",
+    "filesize",
+    "fileName",
+    "filename",
+    "seconds",
+    "duration",
+    "width",
+    "height",
+}
+
+
+def _truncate_text(value: str, max_chars: int) -> str:
+    text = re.sub(r"\s+", " ", str(value or "")).strip()
+    if max_chars <= 0:
+        return ""
+    if len(text) <= max_chars:
+        return text
+    return text[: max(0, max_chars - 1)].rstrip() + "…"
+
+
+def _first_text_preview(value: Any, max_chars: int) -> str:
+    if isinstance(value, dict):
+        for key, item in value.items():
+            key_norm = str(key or "").strip()
+            if key_norm in _TEXT_PREVIEW_KEYS and isinstance(item, str):
+                return _truncate_text(item, max_chars)
+            nested = _first_text_preview(item, max_chars)
+            if nested:
+                return nested
+    if isinstance(value, list):
+        for item in value[:20]:
+            nested = _first_text_preview(item, max_chars)
+            if nested:
+                return nested
+    return ""
+
+
+def _message_type_from_payload(payload: dict[str, Any]) -> str:
+    for key in ("messageType", "type"):
+        raw = str(payload.get(key) or "").strip().lower()
+        if raw:
+            return raw[:40]
+    stack: list[Any] = [payload]
+    while stack:
+        value = stack.pop()
+        if isinstance(value, dict):
+            for key, item in value.items():
+                if key in _MEDIA_MESSAGE_KEYS:
+                    return _MEDIA_MESSAGE_KEYS[key]
+                if isinstance(item, (dict, list)):
+                    stack.append(item)
+        elif isinstance(value, list):
+            stack.extend(value[:20])
+    return "text" if _first_text_preview(payload, 1) else "unknown"
+
+
+def _collect_media_metadata(value: Any, media: dict[str, Any]) -> None:
+    if len(media) >= 12:
+        return
+    if isinstance(value, dict):
+        for key, item in value.items():
+            key_norm = str(key or "")
+            if key_norm in _MEDIA_MESSAGE_KEYS:
+                media["type"] = _MEDIA_MESSAGE_KEYS[key_norm]
+            key_lower = key_norm.casefold()
+            if key_lower in {name.casefold() for name in _MEDIA_META_KEYS} and not isinstance(item, (dict, list)):
+                if "url" not in key_lower and "token" not in key_lower:
+                    media[key_norm] = item
+            if isinstance(item, (dict, list)):
+                _collect_media_metadata(item, media)
+    elif isinstance(value, list):
+        for item in value[:20]:
+            _collect_media_metadata(item, media)
+
+
+def _media_summary_from_payload(payload: dict[str, Any], message_type: str) -> dict[str, Any]:
+    media: dict[str, Any] = {}
+    _collect_media_metadata(payload, media)
+    if message_type in {"image", "audio", "video", "document", "media"}:
+        media.setdefault("type", message_type)
+    if not media:
+        return {}
+    media["has_media"] = True
+    return media
+
+
+def _suggested_actions(message_type: str, has_media: bool) -> list[str]:
+    actions = ["wpp_inbound_lookup", "wpp_register_staging_status"]
+    if has_media and message_type in {"audio", "video"}:
+        actions.append("wpp_transcribe_media")
+    if has_media and message_type in {"image", "document"}:
+        actions.append("review_media_metadata")
+    return actions
+
+
+def _event_context(event: dict[str, Any], mode: str, max_text_chars: int) -> dict[str, Any]:
+    payload_obj = event.get("payload")
+    payload: dict[str, Any] = payload_obj if isinstance(payload_obj, dict) else {}
+    message_type = _message_type_from_payload(payload)
+    media = _media_summary_from_payload(payload, message_type)
+    item: dict[str, Any] = {
+        "safe_event_id": event.get("event_id", ""),
+        "status": event.get("status", ""),
+        "created_at": event.get("created_at", ""),
+        "message_type": message_type,
+        "has_media": bool(media),
+        "suggested_actions": _suggested_actions(message_type, bool(media)),
+    }
+    if mode in {"operator", "debug"}:
+        preview = _first_text_preview(payload, max_text_chars)
+        if preview:
+            item["text_preview"] = preview
+        if media:
+            item["media"] = media
+    if mode == "debug":
+        item["payload_redacted"] = payload
+    return item
+
+
+def get_thread_context(
+    thread: str = "",
+    contact: str = "",
+    limit: int = 20,
+    mode: str = "summary",
+    max_text_chars: int = 160,
+) -> dict[str, Any]:
+    """Return a bounded, sanitized local-store context view for a WPP thread.
+
+    Uses only already-ingested local inbound events.  It never fetches provider
+    history, never sends, and never exposes raw WhatsApp refs or media URLs.
+    """
+    mode_norm = str(mode or "summary").strip().lower()
+    if mode_norm not in _CONTEXT_MODES:
+        mode_norm = "summary"
+    max_text = max(0, min(int(max_text_chars or 160), 500))
+    events_raw = lookup_inbound_events(thread=thread, contact=contact, limit=limit)
+    events = [_event_context(event, mode_norm, max_text) for event in events_raw]
+    type_counts: dict[str, int] = {}
+    media_counts: dict[str, int] = {}
+    for event in events:
+        msg_type = str(event.get("message_type") or "unknown")
+        type_counts[msg_type] = type_counts.get(msg_type, 0) + 1
+        if event.get("has_media"):
+            media_counts[msg_type] = media_counts.get(msg_type, 0) + 1
+    return {
+        "ok": True,
+        "source": "local_inbound_store",
+        "mode": mode_norm,
+        "thread_filter_set": bool(thread),
+        "contact_filter_set": bool(contact),
+        "message_count": len(events),
+        "type_counts": type_counts,
+        "media_counts": media_counts,
+        "events": events,
+    }
+
+
 _COUNT_QUERIES = {
     "contacts": "SELECT count(*) FROM contacts",
     "lists": "SELECT count(*) FROM lists",

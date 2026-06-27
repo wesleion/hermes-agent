@@ -392,6 +392,61 @@ def test_cockpit_overview_returns_sanitized_admin_queue(tmp_path):
     assert "evt-real-123" not in serialized
 
 
+def test_thread_context_operator_mode_summarizes_local_store_without_raw_refs(tmp_path):
+    from tools.whatsapp_ops_store import get_thread_context, init_db, record_inbound_event
+
+    token = set_hermes_home_override(tmp_path)
+    try:
+        init_db()
+        record_inbound_event(
+            source_event_id="ctx-real-001",
+            contact_ref="172185238905034@lid",
+            thread_ref="120363375521827492@g.us",
+            payload={
+                "id": "ctx-real-001",
+                "type": "text",
+                "text": "Olá contexto com telefone 551199998888 e ref 172185238905034@lid",
+                "mediaUrl": "https://cdn.example.invalid/a.jpg?token=secret",
+            },
+        )
+        record_inbound_event(
+            source_event_id="ctx-real-002",
+            contact_ref="172185238905034@lid",
+            thread_ref="120363375521827492@g.us",
+            payload={
+                "id": "ctx-real-002",
+                "message": {"audioMessage": {"mimetype": "audio/ogg", "seconds": 4, "url": "https://cdn.example.invalid/audio?token=secret"}},
+            },
+        )
+        context = get_thread_context(
+            thread="120363375521827492@g.us",
+            mode="operator",
+            limit=10,
+            max_text_chars=80,
+        )
+    finally:
+        reset_hermes_home_override(token)
+
+    serialized = json.dumps(context, ensure_ascii=False)
+    assert context["ok"] is True
+    assert context["source"] == "local_inbound_store"
+    assert context["mode"] == "operator"
+    assert context["message_count"] == 2
+    assert context["type_counts"]["text"] == 1
+    assert context["type_counts"]["audio"] == 1
+    assert context["media_counts"]["audio"] == 1
+    assert any(event.get("text_preview") for event in context["events"])
+    assert any(event.get("media") for event in context["events"])
+    assert "@lid" not in serialized
+    assert "@g.us" not in serialized
+    assert "172185238905034" not in serialized
+    assert "120363375521827492" not in serialized
+    assert "551199998888" not in serialized
+    assert "ctx-real-001" not in serialized
+    assert "cdn.example.invalid" not in serialized
+    assert "secret" not in serialized
+
+
 def test_sync_allowlist_from_env_fails_closed_on_malformed_json(tmp_path, monkeypatch):
     from tools.whatsapp_ops_store import init_db, list_contacts, sync_allowlist_from_env
 
