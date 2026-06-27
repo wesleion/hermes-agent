@@ -170,6 +170,20 @@ def init_db() -> Path:
                 status TEXT NOT NULL,
                 created_at TEXT NOT NULL
             );
+            CREATE TABLE IF NOT EXISTS media_transcriptions (
+                id TEXT PRIMARY KEY,
+                event_id TEXT NOT NULL UNIQUE REFERENCES inbound_events(id),
+                status TEXT NOT NULL,
+                reason TEXT NOT NULL,
+                mode TEXT NOT NULL,
+                language TEXT,
+                provider TEXT NOT NULL,
+                media_type TEXT NOT NULL,
+                media_metadata_json TEXT,
+                safety_flags_json TEXT NOT NULL,
+                created_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL
+            );
             CREATE TABLE IF NOT EXISTS registration_staging (
                 id TEXT PRIMARY KEY,
                 contact_ref_raw TEXT,
@@ -1595,6 +1609,308 @@ def get_thread_context(
         "type_counts": type_counts,
         "media_counts": media_counts,
         "events": events,
+    }
+
+
+_TRANSCRIBABLE_MEDIA_TYPES = {"audio", "voice", "video", "ptt"}
+_TRANSCRIPTION_SAFETY_FLAGS = {
+    "transcription_performed": False,
+    "download_performed": False,
+    "stt_provider_called": False,
+    "provider_history_used": False,
+    "send_performed": False,
+    "llm_used": False,
+    "transcript_persisted": False,
+    "raw_media_exposed": False,
+}
+
+
+def _transcription_safety_flags() -> dict[str, bool]:
+    return dict(_TRANSCRIPTION_SAFETY_FLAGS)
+
+
+def _safe_inbound_event_id(value: Any) -> str:
+    event_id = str(value or "").strip()
+    if re.fullmatch(r"inbound_[A-Za-z0-9_-]{1,80}", event_id):
+        return event_id
+    return ""
+
+
+def _safe_short_token(value: Any, default: str, max_len: int = 40) -> str:
+    token = str(value or "").strip().lower()[:max_len]
+    if re.fullmatch(r"[a-z0-9][a-z0-9_-]{0,79}", token):
+        return token
+    return default
+
+
+def _safe_language(value: Any) -> str:
+    language = str(value or "").strip().lower()[:32]
+    if not language:
+        return ""
+    if re.fullmatch(r"[a-z]{2,8}(?:[-_][a-z0-9]{2,8})?", language):
+        return language
+    return ""
+
+
+def _payload_has_voice_hint(value: Any) -> bool:
+    if isinstance(value, dict):
+        for key, item in value.items():
+            key_norm = str(key or "").strip().lower()
+            if key_norm in {"ptt", "voice", "isvoice", "is_voice"} and bool(item):
+                return True
+            if key_norm in {"messagetype", "type"} and str(item or "").strip().lower() in {"ptt", "voice"}:
+                return True
+            if isinstance(item, (dict, list)) and _payload_has_voice_hint(item):
+                return True
+    elif isinstance(value, list):
+        return any(_payload_has_voice_hint(item) for item in value[:20])
+    return False
+
+
+def _transcribable_media_from_payload(payload: dict[str, Any]) -> tuple[bool, str, dict[str, Any]]:
+    message_type = _message_type_from_payload(payload)
+    media = _media_summary_from_payload(payload, message_type)
+    media_type = str(media.get("type") or message_type or "unknown").strip().lower()[:40]
+    if media_type == "audio" and _payload_has_voice_hint(payload):
+        media_type = "voice"
+    is_transcribable = media_type in _TRANSCRIBABLE_MEDIA_TYPES
+    safe_media = _safe_media_for_summary(media) if media else {}
+    if is_transcribable:
+        safe_media.setdefault("type", "voice" if media_type == "ptt" else media_type)
+    return is_transcribable, ("voice" if media_type == "ptt" else media_type), safe_media
+
+
+def _media_transcription_row_to_status(row: sqlite3.Row) -> dict[str, Any]:
+    try:
+        media = json.loads(row["media_metadata_json"] or "{}")
+    except json.JSONDecodeError:
+        media = {}
+    try:
+        flags = json.loads(row["safety_flags_json"] or "{}")
+    except json.JSONDecodeError:
+        flags = {}
+    safe_flags = _transcription_safety_flags()
+    if isinstance(flags, dict):
+        for key in safe_flags:
+            safe_flags[key] = bool(flags.get(key, safe_flags[key]))
+    return {
+        "status_id": row["id"],
+        "event_id": row["event_id"],
+        "status": row["status"],
+        "reason": row["reason"],
+        "mode": row["mode"],
+        "language": row["language"] or "",
+        "provider": row["provider"],
+        "media_type": row["media_type"],
+        "media": media if isinstance(media, dict) else {},
+        **safe_flags,
+        "status_persisted": True,
+        "created_at": row["created_at"],
+        "updated_at": row["updated_at"],
+    }
+
+
+def request_media_transcription(
+    event_id: str,
+    mode: str = "on_request",
+    language: str = "",
+    provider: str = "disabled",
+    force: bool = False,
+    persist_status: bool = True,
+) -> dict[str, Any]:
+    """Request fail-closed local transcription status for a sanitized inbound media event.
+
+    Phase 1 intentionally does not download media, call STT/cloud/LLM, fetch
+    provider history, send messages, expose raw media, or persist transcripts.
+    It only records a local status row for safe ``inbound_*`` event IDs whose
+    already-sanitized payload indicates audio/voice/video media.
+    """
+    init_db()
+    safe_event_id = _safe_inbound_event_id(event_id)
+    flags = _transcription_safety_flags()
+    if not safe_event_id:
+        return {
+            "ok": False,
+            "status": "invalid_event_id",
+            "error": "event_id_must_be_internal_inbound_id",
+            "event_id_accepted": False,
+            "status_persisted": False,
+            **flags,
+        }
+
+    mode_norm = _safe_short_token(mode, "on_request")
+    if mode_norm != "on_request":
+        mode_norm = "on_request"
+    language_norm = _safe_language(language)
+    provider_norm = _safe_short_token(provider, "disabled")
+    now = utc_now()
+
+    with _connect() as conn:
+        event = conn.execute(
+            """
+            SELECT id, payload_redacted_json, status, created_at
+            FROM inbound_events
+            WHERE id=?
+            """,
+            (safe_event_id,),
+        ).fetchone()
+        if event is None:
+            return {
+                "ok": False,
+                "event_id": safe_event_id,
+                "status": "not_found",
+                "error": "inbound_event_not_found",
+                "status_persisted": False,
+                **flags,
+            }
+        try:
+            payload = json.loads(event["payload_redacted_json"] or "{}")
+        except json.JSONDecodeError:
+            payload = {}
+        payload = payload if isinstance(payload, dict) else {}
+        is_transcribable, media_type, media = _transcribable_media_from_payload(payload)
+        if not is_transcribable:
+            return {
+                "ok": False,
+                "event_id": safe_event_id,
+                "status": "no_transcribable_media",
+                "reason": "event_has_no_audio_voice_or_video_media",
+                "message_type": _message_type_from_payload(payload),
+                "status_persisted": False,
+                **flags,
+            }
+
+        status_id = "transcription_" + uuid.uuid4().hex[:12]
+        existing = conn.execute(
+            "SELECT * FROM media_transcriptions WHERE event_id=?",
+            (safe_event_id,),
+        ).fetchone()
+        if persist_status and existing is not None and not force:
+            status = _media_transcription_row_to_status(existing)
+            return {
+                "ok": True,
+                "source": "local_inbound_store",
+                "local_status_only": True,
+                "existing_status": True,
+                **status,
+            }
+
+        result: dict[str, Any] = {
+            "ok": True,
+            "source": "local_inbound_store",
+            "event_id": safe_event_id,
+            "status": "blocked",
+            "reason": "provider_not_configured",
+            "mode": mode_norm,
+            "language": language_norm,
+            "provider": provider_norm,
+            "media_type": media_type,
+            "media": media,
+            "local_status_only": True,
+            "transcript_available": False,
+            "status_persisted": False,
+            **flags,
+        }
+        if persist_status:
+            if existing is None:
+                conn.execute(
+                    """
+                    INSERT INTO media_transcriptions (
+                        id, event_id, status, reason, mode, language, provider,
+                        media_type, media_metadata_json, safety_flags_json,
+                        created_at, updated_at
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    """,
+                    (
+                        status_id,
+                        safe_event_id,
+                        "blocked",
+                        "provider_not_configured",
+                        mode_norm,
+                        language_norm,
+                        provider_norm,
+                        media_type,
+                        json.dumps(media, ensure_ascii=False, sort_keys=True),
+                        json.dumps(flags, ensure_ascii=False, sort_keys=True),
+                        now,
+                        now,
+                    ),
+                )
+            else:
+                status_id = existing["id"]
+                conn.execute(
+                    """
+                    UPDATE media_transcriptions
+                    SET status=?, reason=?, mode=?, language=?, provider=?,
+                        media_type=?, media_metadata_json=?, safety_flags_json=?,
+                        updated_at=?
+                    WHERE event_id=?
+                    """,
+                    (
+                        "blocked",
+                        "provider_not_configured",
+                        mode_norm,
+                        language_norm,
+                        provider_norm,
+                        media_type,
+                        json.dumps(media, ensure_ascii=False, sort_keys=True),
+                        json.dumps(flags, ensure_ascii=False, sort_keys=True),
+                        now,
+                        safe_event_id,
+                    ),
+                )
+            result["status_id"] = status_id
+            result["status_persisted"] = True
+        return result
+
+
+def get_media_transcription_status(event_id: str = "", limit: int = 20) -> dict[str, Any]:
+    """Read fail-closed media transcription status rows from the local store only."""
+    init_db()
+    try:
+        limit_value = int(limit or 20)
+    except (TypeError, ValueError):
+        limit_value = 20
+    limit_value = max(1, min(limit_value, 100))
+    safe_event_id = _safe_inbound_event_id(event_id) if str(event_id or "").strip() else ""
+    if str(event_id or "").strip() and not safe_event_id:
+        return {
+            "ok": False,
+            "status": "invalid_event_id",
+            "error": "event_id_must_be_internal_inbound_id",
+            "event_id_accepted": False,
+            "statuses": [],
+            **_transcription_safety_flags(),
+        }
+    with _connect() as conn:
+        if safe_event_id:
+            rows = conn.execute(
+                """
+                SELECT * FROM media_transcriptions
+                WHERE event_id=?
+                ORDER BY updated_at DESC
+                LIMIT ?
+                """,
+                (safe_event_id, limit_value),
+            ).fetchall()
+        else:
+            rows = conn.execute(
+                """
+                SELECT * FROM media_transcriptions
+                ORDER BY updated_at DESC
+                LIMIT ?
+                """,
+                (limit_value,),
+            ).fetchall()
+    return {
+        "ok": True,
+        "source": "local_inbound_store",
+        "local_status_only": True,
+        "event_filter_set": bool(safe_event_id),
+        "limit": limit_value,
+        "count": len(rows),
+        "statuses": [_media_transcription_row_to_status(row) for row in rows],
+        **_transcription_safety_flags(),
     }
 
 
