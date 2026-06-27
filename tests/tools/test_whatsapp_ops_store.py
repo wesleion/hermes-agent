@@ -465,3 +465,99 @@ def test_sync_allowlist_from_env_fails_closed_on_malformed_json(tmp_path, monkey
     assert synced["ok"] is False
     assert synced["error"] == "allowlist_json_invalid"
     assert contacts == []
+
+
+def test_sanitize_payload_redacts_data_blob_base64_and_media_tokens(tmp_path):
+    """Verify _sanitize_payload redacts data:/blob: URLs, long base64,
+    jpegThumbnail, thumbnail fields, mediaKey/directPath/fileSha256
+    fields, and base64/blob field names from serialized JSON."""
+    from tools.whatsapp_ops_store import _sanitize_payload, init_db, record_inbound_event
+
+    payload = {
+        "text": "Mensagem normal",
+        "dataUrl": "data:audio/ogg;base64,T3J0aVNwZWNpZmljVGVzdERhdGFVUkw=",
+        "blobUrl": "blob:https://example.com/a1b2c3d4-e5f6-7890-abcd-ef1234567890",
+        "jpegThumbnail": "/9j/4AAQSkZJRgABAQEAYABgAAD/2wBDAAg...base64ThumbnailData",
+        "thumbnail": {"url": "https://cdn.example.invalid/thumb.jpg", "width": 100},
+        "mediaKey": "a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4",
+        "directPath": "/v/media/a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4",
+        "fileSha256": "a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4",
+        "fileEncSha256": "f6a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4",
+        "base64": "T3J0aVNwZWNpZmljVGVzdEJhc2U2NA==",
+        "blob": "a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4",
+        "longBase64String": "T3J0aVNwZWNpZmljVGVzdExvbmdCYXNlNjRTdHJpbmc=",
+        "nested": {
+            "mediaKey": "nest_media_key_value",
+            "directPath": "/nest/media/path",
+            "jpegThumbnail": "nest_thumb_data_base64",
+        },
+        "innocentField": "Olá mundo",
+    }
+
+    safe = _sanitize_payload(payload)
+    serialized = json.dumps(safe, ensure_ascii=False)
+
+    # Normal text must survive
+    assert "Mensagem normal" in serialized
+    assert "Olá mundo" in serialized
+
+    # data: and blob: URLs must be redacted (values replaced)
+    assert "data:audio/ogg;base64" not in serialized
+    assert "blob:https://example.com" not in serialized
+    assert "T3J0aVNwZWNpZmljVGVzdERhdGFVUkw=" not in serialized
+    assert "a1b2c3d4-e5f6-7890-abcd-ef1234567890" not in serialized
+
+    # jpegThumbnail value must be redacted (the key name persists in JSON)
+    assert "/9j/4AAQSkZJRgABAQEAYABgAAD/2wBDAAg" not in serialized
+    assert "base64ThumbnailData" not in serialized
+
+    # thumbnail object values must be redacted (thumbnail key value is replaced)
+    assert "cdn.example.invalid" not in serialized
+
+    # mediaKey / directPath / fileSha256 / fileEncSha256 values must be redacted
+    assert "a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4" not in serialized
+    assert "/v/media/" not in serialized
+    assert "f6a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4" not in serialized
+
+    # base64 and blob field values must be redacted
+    assert "T3J0aVNwZWNpZmljVGVzdEJhc2U2NA==" not in serialized
+    assert '"a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4"' not in serialized  # blob value as JSON string
+
+    # Long bare base64 string value must be redacted
+    assert "T3J0aVNwZWNpZmljVGVzdExvbmdCYXNlNjRTdHJpbmc=" not in serialized
+
+    # Nested mediaKey value must be redacted
+    assert "nest_media_key_value" not in serialized
+    assert "/nest/media/path" not in serialized
+    assert "nest_thumb_data_base64" not in serialized
+
+    # Verify redacted placeholders appear
+    assert "<redacted>" in serialized
+    assert "<redacted-url>" in serialized
+    assert "<redacted-base64>" in serialized
+
+    # Verify it works end-to-end through record_inbound_event + lookup
+    token = set_hermes_home_override(tmp_path)
+    try:
+        init_db()
+        result = record_inbound_event(
+            source_event_id="sanitize-e2e-001",
+            contact_ref="sanitize_test@lid",
+            thread_ref="sanitize_thread@g.us",
+            payload=payload,
+        )
+        from tools.whatsapp_ops_store import lookup_inbound_events
+        stored = lookup_inbound_events(contact="sanitize_test@lid", limit=5)
+    finally:
+        reset_hermes_home_override(token)
+
+    assert result["ok"] is True
+    stored_json = json.dumps(stored, ensure_ascii=False)
+    # The sensitive values must not leak into the stored/retrieved JSON
+    assert "data:audio/ogg;base64" not in stored_json
+    assert "blob:https://example.com" not in stored_json
+    assert "/9j/4AAQSkZJRgABAQEAYABgAAD/2wBDAAg" not in stored_json
+    assert "a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4" not in stored_json
+    assert "/v/media/" not in stored_json
+    assert "nest_media_key_value" not in stored_json
+    assert "T3J0aVNwZWNpZmljVGVzdExvbmdCYXNlNjRTdHJpbmc=" not in stored_json

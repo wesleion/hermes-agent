@@ -252,6 +252,10 @@ COMMAND_REGISTRY: list[CommandDef] = [
     CommandDef("crgp", "WhatsApp Ops: preparar criação de grupo com aprovação",
                "WhatsApp Ops", cli_only=True, args_hint="<nome> [| membros]",
                gateway_config_gate="whatsapp_ops.slash_commands_enabled"),
+    CommandDef("ctxwpp", "WhatsApp Ops: contexto local da conversa (somente leitura)",
+               "WhatsApp Ops", cli_only=True, args_hint="[thread|contact] [limit]",
+               aliases=("wpp_thread_context",),
+               gateway_config_gate="whatsapp_ops.slash_commands_enabled"),
     CommandDef("copy", "Copy the last assistant response to clipboard", "Info",
                cli_only=True, args_hint="[number]"),
     CommandDef("paste", "Attach clipboard image from your clipboard", "Info",
@@ -586,6 +590,7 @@ _TELEGRAM_MENU_PRIORITY = (
     # Profile-gated WhatsApp Ops cockpit commands — only surface when enabled.
     "wpp",
     "fila",
+    "ctxwpp",
     "addct",
     "addgp",
     "crgp",

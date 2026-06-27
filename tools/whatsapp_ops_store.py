@@ -1305,6 +1305,9 @@ def _sanitize_payload(value: Any) -> Any:
     secret_keys = {"token", "api_key", "apikey", "authorization", "password", "secret", "key"}
     pii_keys = {"id", "wid", "lid", "phone", "phone_e164", "number", "contact", "contact_ref", "chatid", "chat_id", "thread_ref"}
     url_keys = {"url", "mediaurl", "media_url", "fileurl", "file_url", "downloadurl", "download_url", "thumbnailurl", "thumbnail_url"}
+    media_meta_keys = {"directpath", "filesha256", "fileencsha256", "mediakey", "mediakeytimestamp"}
+    thumbnail_keys = {"jpegthumbnail", "thumbnail"}
+    binary_keys = {"base64", "blob"}
     if isinstance(value, dict):
         safe: dict[str, Any] = {}
         for key, item in value.items():
@@ -1316,6 +1319,12 @@ def _sanitize_payload(value: Any) -> Any:
                 safe[key_str] = "<redacted>"
             elif key_norm in url_keys or key_norm.endswith("url") or key_norm.endswith("uri"):
                 safe[key_str] = "<redacted-url>"
+            elif key_norm in media_meta_keys:
+                safe[key_str] = "<redacted>"
+            elif key_norm in thumbnail_keys:
+                safe[key_str] = "<redacted>"
+            elif key_norm in binary_keys:
+                safe[key_str] = "<redacted>"
             else:
                 safe[key_str] = _sanitize_payload(item)
         return safe
@@ -1323,8 +1332,14 @@ def _sanitize_payload(value: Any) -> Any:
         return [_sanitize_payload(item) for item in value[:50]]
     if isinstance(value, str):
         cleaned = value[:500]
+        # data: and blob: URLs (including data: URIs with base64 payloads)
+        if re.match(r"(?i)^(?:data|blob):", cleaned):
+            return "<redacted-url>"
         if re.match(r"(?i)^https?://", cleaned):
             return "<redacted-url>"
+        # Long bare base64 strings (>=32 chars of base64 alphabet with optional padding)
+        if re.match(r"^[A-Za-z0-9+/=]{32,}$", cleaned):
+            return "<redacted-base64>"
         cleaned = re.sub(r"(?i)\b[\w.-]+@(?:lid|g\.us|s\.whatsapp\.net)\b", "<redacted-wa-ref>", cleaned)
         cleaned = re.sub(r"\+?\d[\d\s().-]{6,}\d", "<redacted-phone>", cleaned)
         return cleaned
