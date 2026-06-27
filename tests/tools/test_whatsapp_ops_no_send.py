@@ -34,6 +34,8 @@ def _read_only_functions():
         "wpp_inbound_lookup": tool.wpp_inbound_lookup,
         "wpp_thread_context": tool.wpp_thread_context,
         "wpp_conversation_summary": tool.wpp_conversation_summary,
+        "wpp_transcribe_media": tool.wpp_transcribe_media,
+        "wpp_media_transcription_status": tool.wpp_media_transcription_status,
         "wpp_cockpit_overview": tool.wpp_cockpit_overview,
     }
 
@@ -56,7 +58,12 @@ def test_read_only_whatsapp_tools_bytecode_has_no_send_references():
 
 def test_read_only_context_tools_do_not_import_gateway_or_quepasa_modules(tmp_path, monkeypatch):
     from tools.whatsapp_ops_store import init_db
-    from tools.whatsapp_ops_tool import wpp_conversation_summary, wpp_thread_context
+    from tools.whatsapp_ops_tool import (
+        wpp_conversation_summary,
+        wpp_media_transcription_status,
+        wpp_thread_context,
+        wpp_transcribe_media,
+    )
 
     forbidden_modules = {
         "gateway.platforms.whatsapp_common",
@@ -70,11 +77,15 @@ def test_read_only_context_tools_do_not_import_gateway_or_quepasa_modules(tmp_pa
         init_db()
         thread_result = wpp_thread_context(limit=1)
         summary_result = wpp_conversation_summary(limit=1, mode="stats")
+        transcribe_result = wpp_transcribe_media(event_id="not-a-safe-provider-ref")
+        transcription_status_result = wpp_media_transcription_status(limit=1)
     finally:
         reset_hermes_home_override(token)
 
     assert '"ok": true' in thread_result
     assert '"ok": true' in summary_result
+    assert '"ok": false' in transcribe_result
+    assert '"ok": true' in transcription_status_result
     for module_name in forbidden_modules:
         assert module_name not in sys.modules
 
