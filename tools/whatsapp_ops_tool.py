@@ -14,7 +14,6 @@ from typing import Any, Callable
 
 from tools.registry import registry
 from tools.whatsapp_ops_policy import evaluate_send_guardrails
-from tools.whatsapp_ops_quepasa import create_group_via_quepasa, send_via_quepasa
 
 try:  # config loading is best-effort; tool remains fail-closed if unavailable
     from hermes_cli.config import load_config
@@ -25,6 +24,7 @@ from tools.whatsapp_ops_store import (
     create_approval,
     create_draft,
     get_cockpit_overview,
+    get_conversation_summary,
     get_thread_context,
     registration_staging_diagnostics,
     get_draft,
@@ -407,9 +407,19 @@ def wpp_send_approved(
         payload, payload_error = _group_create_provider_payload(draft_id, draft, idempotency_key)
         if payload_error:
             return _json({"ok": False, "draft_id": draft_id, "reasons": [payload_error]})
-        client = send_client or create_group_via_quepasa
+        if send_client is None:
+            from tools.whatsapp_ops_quepasa import create_group_via_quepasa
+
+            client = create_group_via_quepasa
+        else:
+            client = send_client
     else:
-        client = send_client or send_via_quepasa
+        if send_client is None:
+            from tools.whatsapp_ops_quepasa import send_via_quepasa
+
+            client = send_via_quepasa
+        else:
+            client = send_client
         payload = {
             "draft_id": draft_id,
             "targets": policy_draft["targets"] if policy_draft else [],
@@ -523,6 +533,25 @@ def wpp_thread_context(
         max_text_chars=max_text_chars,
     )
     return _json(context)
+
+
+def wpp_conversation_summary(
+    thread: str = "",
+    contact: str = "",
+    limit: int = 50,
+    mode: str = "brief",
+    max_text_chars: int = 160,
+    include_evidence: bool = False,
+) -> str:
+    summary = get_conversation_summary(
+        thread=str(thread or ""),
+        contact=str(contact or ""),
+        limit=limit,
+        mode=str(mode or "brief"),
+        max_text_chars=max_text_chars,
+        include_evidence=bool(include_evidence),
+    )
+    return _json(summary)
 
 
 def wpp_cockpit_overview(limit: int = 10) -> str:
@@ -1030,6 +1059,34 @@ registry.register(
         limit=args.get("limit", 20),
         mode=args.get("mode", "summary"),
         max_text_chars=args.get("max_text_chars", 160),
+    ),
+    check_fn=check_whatsapp_ops_requirements,
+    emoji="📲",
+)
+
+registry.register(
+    name="wpp_conversation_summary",
+    toolset=TOOLSET,
+    schema=_schema(
+        "wpp_conversation_summary",
+        "Return a deterministic read-only local WhatsApp conversation summary from sanitized inbound_events. Never sends, never creates drafts/approvals/outbox, never calls an LLM, never fetches provider history, and never persists summaries.",
+        {
+            "thread": {"type": "string"},
+            "contact": {"type": "string"},
+            "limit": {"type": "integer"},
+            "mode": {"type": "string", "enum": ["stats", "brief", "timeline", "evidence"]},
+            "max_text_chars": {"type": "integer"},
+            "include_evidence": {"type": "boolean"},
+        },
+        [],
+    ),
+    handler=lambda args, **kw: wpp_conversation_summary(
+        thread=args.get("thread", ""),
+        contact=args.get("contact", ""),
+        limit=args.get("limit", 50),
+        mode=args.get("mode", "brief"),
+        max_text_chars=args.get("max_text_chars", 160),
+        include_evidence=bool(args.get("include_evidence", False)),
     ),
     check_fn=check_whatsapp_ops_requirements,
     emoji="📲",

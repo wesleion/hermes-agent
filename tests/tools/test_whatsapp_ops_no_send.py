@@ -15,6 +15,12 @@ FORBIDDEN_SEND_NAMES = {
     "_direct_deliver",
     "handle_message",
     "direct_deliver",
+    "create_draft",
+    "create_approval",
+    "reserve_outbox_send",
+    "mark_outbox_result",
+    "mark_outbox_blocked",
+    "update_draft_status",
 }
 
 
@@ -27,6 +33,7 @@ def _read_only_functions():
         "wpp_list_contacts": tool.wpp_list_contacts,
         "wpp_inbound_lookup": tool.wpp_inbound_lookup,
         "wpp_thread_context": tool.wpp_thread_context,
+        "wpp_conversation_summary": tool.wpp_conversation_summary,
         "wpp_cockpit_overview": tool.wpp_cockpit_overview,
     }
 
@@ -47,21 +54,29 @@ def test_read_only_whatsapp_tools_bytecode_has_no_send_references():
             assert forbidden not in names, f"{name} bytecode references {forbidden}"
 
 
-def test_wpp_thread_context_does_not_import_gateway_send_modules(tmp_path, monkeypatch):
+def test_read_only_context_tools_do_not_import_gateway_or_quepasa_modules(tmp_path, monkeypatch):
     from tools.whatsapp_ops_store import init_db
-    from tools.whatsapp_ops_tool import wpp_thread_context
+    from tools.whatsapp_ops_tool import wpp_conversation_summary, wpp_thread_context
 
-    monkeypatch.delitem(sys.modules, "gateway.platforms.whatsapp_common", raising=False)
+    forbidden_modules = {
+        "gateway.platforms.whatsapp_common",
+        "tools.whatsapp_ops_quepasa",
+    }
+    for module_name in forbidden_modules:
+        monkeypatch.delitem(sys.modules, module_name, raising=False)
 
     token = set_hermes_home_override(tmp_path)
     try:
         init_db()
-        result = wpp_thread_context(limit=1)
+        thread_result = wpp_thread_context(limit=1)
+        summary_result = wpp_conversation_summary(limit=1, mode="stats")
     finally:
         reset_hermes_home_override(token)
 
-    assert '"ok": true' in result
-    assert "gateway.platforms.whatsapp_common" not in sys.modules
+    assert '"ok": true' in thread_result
+    assert '"ok": true' in summary_result
+    for module_name in forbidden_modules:
+        assert module_name not in sys.modules
 
 
 def test_wpp_send_approved_positive_control_references_send_path():
