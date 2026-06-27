@@ -11948,6 +11948,14 @@ def _(rid, params: dict) -> dict:
         name = resolved
     session = _sessions.get(params.get("session_id", ""))
 
+    if name == "ctxwpp":
+        from hermes_cli.whatsapp_ops_commands import render_thread_context_command
+
+        return _ok(
+            rid,
+            {"type": "builtin", "output": render_thread_context_command(arg)},
+        )
+
     qcmds = _load_cfg().get("quick_commands", {})
     if name in qcmds:
         qc = qcmds[name]
