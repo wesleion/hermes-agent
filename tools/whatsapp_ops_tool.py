@@ -25,6 +25,7 @@ from tools.whatsapp_ops_store import (
     create_draft,
     get_cockpit_overview,
     get_conversation_summary,
+    get_media_transcription_status,
     get_thread_context,
     registration_staging_diagnostics,
     get_draft,
@@ -40,6 +41,7 @@ from tools.whatsapp_ops_store import (
     peek_staging,
     register_contact_local,
     register_group_local,
+    request_media_transcription,
     reserve_outbox_send,
     resolve_approval,
     resolve_contact,
@@ -552,6 +554,34 @@ def wpp_conversation_summary(
         include_evidence=bool(include_evidence),
     )
     return _json(summary)
+
+
+def wpp_transcribe_media(
+    event_id: str,
+    mode: str = "on_request",
+    language: str = "",
+    provider: str = "disabled",
+    persist_status: bool = True,
+) -> str:
+    """Record a fail-closed local transcription status for an inbound media event.
+
+    Phase 1 never downloads media, never calls STT/cloud/LLM, never sends, and
+    never fetches provider history. It only inspects already-sanitized local
+    inbound payload metadata for an internal ``inbound_*`` event id.
+    """
+    result = request_media_transcription(
+        event_id=str(event_id or ""),
+        mode=str(mode or "on_request"),
+        language=str(language or ""),
+        provider=str(provider or "disabled"),
+        persist_status=bool(persist_status),
+    )
+    return _json(result)
+
+
+def wpp_media_transcription_status(event_id: str = "", limit: int = 20) -> str:
+    """Return sanitized local media transcription status rows only."""
+    return _json(get_media_transcription_status(event_id=str(event_id or ""), limit=limit))
 
 
 def wpp_cockpit_overview(limit: int = 10) -> str:
@@ -1087,6 +1117,48 @@ registry.register(
         mode=args.get("mode", "brief"),
         max_text_chars=args.get("max_text_chars", 160),
         include_evidence=bool(args.get("include_evidence", False)),
+    ),
+    check_fn=check_whatsapp_ops_requirements,
+    emoji="📲",
+)
+
+registry.register(
+    name="wpp_transcribe_media",
+    toolset=TOOLSET,
+    schema=_schema(
+        "wpp_transcribe_media",
+        "Fail-closed phase-1 transcription request for a sanitized inbound_* media event. Local status only: never downloads media, never calls STT/cloud/LLM, never sends, and never fetches provider history.",
+        {
+            "event_id": {"type": "string"},
+            "mode": {"type": "string", "enum": ["on_request"]},
+            "language": {"type": "string"},
+            "provider": {"type": "string", "enum": ["disabled"]},
+            "persist_status": {"type": "boolean"},
+        },
+        ["event_id"],
+    ),
+    handler=lambda args, **kw: wpp_transcribe_media(
+        event_id=args.get("event_id", ""),
+        mode=args.get("mode", "on_request"),
+        language=args.get("language", ""),
+        provider=args.get("provider", "disabled"),
+        persist_status=bool(args.get("persist_status", True)),
+    ),
+    check_fn=check_whatsapp_ops_requirements,
+    emoji="📲",
+)
+
+registry.register(
+    name="wpp_media_transcription_status",
+    toolset=TOOLSET,
+    schema=_schema(
+        "wpp_media_transcription_status",
+        "Read sanitized local fail-closed media transcription status rows. Never downloads media, never calls STT/cloud/LLM, never sends, and never fetches provider history.",
+        {"event_id": {"type": "string"}, "limit": {"type": "integer"}},
+        [],
+    ),
+    handler=lambda args, **kw: wpp_media_transcription_status(
+        event_id=args.get("event_id", ""), limit=args.get("limit", 20)
     ),
     check_fn=check_whatsapp_ops_requirements,
     emoji="📲",
