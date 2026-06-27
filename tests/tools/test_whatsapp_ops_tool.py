@@ -1011,6 +1011,47 @@ def test_wpp_cockpit_overview_tool_returns_fail_closed_admin_summary(tmp_path, m
     assert "evt-real-123" not in serialized
 
 
+def test_wpp_thread_context_tool_returns_operator_summary_without_raw_refs(tmp_path):
+    from tools.whatsapp_ops_store import init_db, record_inbound_event
+    from tools.whatsapp_ops_tool import wpp_thread_context
+
+    token = set_hermes_home_override(tmp_path)
+    try:
+        init_db()
+        record_inbound_event(
+            source_event_id="ctx-tool-001",
+            contact_ref="172185238905034@lid",
+            thread_ref="120363375521827492@g.us",
+            payload={
+                "id": "ctx-tool-001",
+                "type": "audio",
+                "text": "Áudio recebido do 551199998888",
+                "message": {"audioMessage": {"mimetype": "audio/ogg", "seconds": 3}},
+            },
+        )
+        result = _parse(
+            wpp_thread_context(
+                thread="120363375521827492@g.us",
+                mode="operator",
+                limit=5,
+            )
+        )
+    finally:
+        reset_hermes_home_override(token)
+
+    serialized = json.dumps(result, ensure_ascii=False)
+    assert result["ok"] is True
+    assert result["message_count"] == 1
+    assert result["events"][0]["message_type"] == "audio"
+    assert "wpp_transcribe_media" in result["events"][0]["suggested_actions"]
+    assert "@lid" not in serialized
+    assert "@g.us" not in serialized
+    assert "172185238905034" not in serialized
+    assert "120363375521827492" not in serialized
+    assert "551199998888" not in serialized
+    assert "ctx-tool-001" not in serialized
+
+
 def test_whatsapp_ops_toolset_is_registered():
     import tools.whatsapp_ops_tool  # noqa: F401
     from tools.registry import registry
@@ -1028,6 +1069,7 @@ def test_whatsapp_ops_toolset_is_registered():
         "wpp_cancel",
         "wpp_status",
         "wpp_inbound_lookup",
+        "wpp_thread_context",
         "wpp_ingest_inbound_event",
     }.issubset(names)
 
