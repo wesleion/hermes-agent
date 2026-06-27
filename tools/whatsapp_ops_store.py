@@ -1598,6 +1598,252 @@ def get_thread_context(
     }
 
 
+_SUMMARY_MODES = {"stats", "brief", "timeline", "evidence"}
+_SUMMARY_SECRET_ASSIGNMENT_RE = re.compile(
+    r"(?i)\b(token|api[_-]?key|authorization|password|secret|access[_-]?token)\s*[:=]\s*[^\s,;]+"
+)
+_SUMMARY_BEARER_RE = re.compile(r"(?i)\bBearer\s+[A-Za-z0-9._~+/-]{8,}")
+_SUMMARY_TOKEN_PREFIX_RE = re.compile(r"\b(?:sk|ghp|xoxb)-[A-Za-z0-9_-]{8,}\b")
+_SUMMARY_URL_RE = re.compile(r"(?i)\b(?:https?://|data:|blob:)[^\s]+")
+_SUMMARY_PHONE_RE = re.compile(r"(?<!\d)\+?\d{10,15}(?!\d)")
+_SUMMARY_WA_REF_RE = re.compile(r"@[A-Za-z0-9._-]*(?:g\.us|lid|s\.whatsapp\.net)", re.IGNORECASE)
+_SUMMARY_LONG_B64_RE = re.compile(r"\b[A-Za-z0-9+/]{32,}={0,2}\b")
+
+
+def _sanitize_summary_text(value: Any, max_chars: int = 500) -> str:
+    text = _truncate_text(str(value or ""), max_chars)
+    if not text:
+        return ""
+    text = _SUMMARY_URL_RE.sub("<redacted-url>", text)
+    text = _SUMMARY_SECRET_ASSIGNMENT_RE.sub(lambda match: f"{match.group(1)}=<redacted>", text)
+    text = _SUMMARY_BEARER_RE.sub("Bearer <redacted>", text)
+    text = _SUMMARY_TOKEN_PREFIX_RE.sub("<redacted-token>", text)
+    text = _SUMMARY_WA_REF_RE.sub("<redacted-ref>", text)
+    text = _SUMMARY_PHONE_RE.sub("<redacted-phone>", text)
+    text = _SUMMARY_LONG_B64_RE.sub("<redacted-base64>", text)
+    return _truncate_text(text, max_chars)
+
+
+def _clamp_int(value: Any, default: int, low: int, high: int) -> tuple[int, bool]:
+    try:
+        number = int(value)
+    except (TypeError, ValueError):
+        return default, True
+    clamped = max(low, min(number, high))
+    return clamped, clamped != number
+
+
+def _summary_window(events_asc: list[dict[str, Any]]) -> dict[str, Any]:
+    if not events_asc:
+        return {"first_created_at": None, "last_created_at": None}
+    return {
+        "first_created_at": events_asc[0].get("created_at") or None,
+        "last_created_at": events_asc[-1].get("created_at") or None,
+    }
+
+
+def _safe_media_for_summary(media: dict[str, Any]) -> dict[str, Any]:
+    safe: dict[str, Any] = {}
+    for key, value in media.items():
+        key_text = str(key or "")[:80]
+        key_lower = key_text.casefold()
+        if any(part in key_lower for part in ("url", "uri", "token", "secret", "key", "path", "sha")):
+            continue
+        if isinstance(value, bool):
+            safe[key_text] = value
+        elif isinstance(value, int | float):
+            safe[key_text] = value
+        elif isinstance(value, str):
+            cleaned = _sanitize_summary_text(_sanitize_payload(value), 120)
+            if not isinstance(cleaned, str):
+                continue
+            if cleaned.startswith("<redacted") or re.search(r"(?i)(?:https?://|data:|blob:)", cleaned):
+                continue
+            safe[key_text] = cleaned
+    return safe
+
+
+def _summary_event(event: dict[str, Any], max_text_chars: int) -> dict[str, Any]:
+    payload_obj = event.get("payload")
+    payload: dict[str, Any] = payload_obj if isinstance(payload_obj, dict) else {}
+    message_type = _message_type_from_payload(payload)
+    media = _safe_media_for_summary(_media_summary_from_payload(payload, message_type))
+    item: dict[str, Any] = {
+        "safe_event_id": event.get("event_id", ""),
+        "created_at": event.get("created_at", ""),
+        "status": event.get("status", ""),
+        "message_type": message_type,
+        "has_media": bool(media),
+    }
+    if media:
+        item["media"] = media
+    if max_text_chars > 0:
+        preview = _first_text_preview(payload, max_text_chars)
+        if preview:
+            item["text_preview"] = _sanitize_summary_text(preview, max_text_chars)
+    return item
+
+
+def _summary_counts(events: list[dict[str, Any]]) -> tuple[dict[str, int], dict[str, int], dict[str, int]]:
+    type_counts: dict[str, int] = {}
+    media_counts: dict[str, int] = {}
+    status_counts: dict[str, int] = {}
+    for event in events:
+        message_type = str(event.get("message_type") or "unknown")
+        status = str(event.get("status") or "unknown")
+        type_counts[message_type] = type_counts.get(message_type, 0) + 1
+        status_counts[status] = status_counts.get(status, 0) + 1
+        if event.get("has_media"):
+            media_type = str((event.get("media") or {}).get("type") or message_type or "media")
+            media_counts[media_type] = media_counts.get(media_type, 0) + 1
+    return type_counts, media_counts, status_counts
+
+
+def _conversation_headline(message_count: int, type_counts: dict[str, int], media_counts: dict[str, int]) -> str:
+    if message_count == 0:
+        return "Nenhum evento local encontrado."
+    type_bits = ", ".join(f"{key}: {value}" for key, value in sorted(type_counts.items())) or "sem tipo"
+    media_total = sum(media_counts.values())
+    media_bit = f"; {media_total} com mídia" if media_total else ""
+    return f"{message_count} evento(s) local(is); tipos: {type_bits}{media_bit}."
+
+
+def _conversation_bullets(
+    message_count: int,
+    events_desc: list[dict[str, Any]],
+    type_counts: dict[str, int],
+    status_counts: dict[str, int],
+) -> list[str]:
+    if message_count == 0:
+        return ["Sem mensagens no inbound_events local para o escopo solicitado."]
+    bullets = [
+        f"Total local analisado: {message_count} evento(s).",
+        "Tipos: " + (", ".join(f"{key}={value}" for key, value in sorted(type_counts.items())) or "nenhum"),
+        "Status: " + (", ".join(f"{key}={value}" for key, value in sorted(status_counts.items())) or "nenhum"),
+    ]
+    latest = events_desc[0] if events_desc else {}
+    if latest:
+        bullets.append(
+            "Mais recente: "
+            f"{latest.get('message_type', 'unknown')} em {latest.get('created_at') or 'data_indisponivel'}."
+        )
+    return bullets
+
+
+def get_conversation_summary(
+    thread: str = "",
+    contact: str = "",
+    limit: int = 50,
+    mode: str = "brief",
+    max_text_chars: int = 160,
+    include_evidence: bool = False,
+) -> dict[str, Any]:
+    """Return a deterministic, read-only summary from the local inbound store.
+
+    This lane uses only ``lookup_inbound_events`` / ``inbound_events`` data that
+    has already been sanitized at ingest time. It never calls an LLM, provider
+    history, send/draft/approval/outbox paths, and never persists the summary.
+    Raw thread/contact filters are intentionally not echoed back.
+    """
+    warnings: list[str] = []
+    mode_norm = str(mode or "brief").strip().lower()
+    if mode_norm not in _SUMMARY_MODES:
+        mode_norm = "brief"
+        warnings.append("invalid_mode_defaulted_to_brief")
+
+    limit_value, limit_clamped = _clamp_int(limit, 50, 1, 100)
+    if limit_clamped:
+        warnings.append("limit_clamped")
+    max_text_value, max_text_clamped = _clamp_int(max_text_chars, 160, 0, 500)
+    if max_text_clamped:
+        warnings.append("max_text_chars_clamped")
+
+    thread_value = str(thread or "").strip()
+    contact_value = str(contact or "").strip()
+    thread_filter_set = bool(thread_value)
+    contact_filter_set = bool(contact_value)
+    if not thread_filter_set and not contact_filter_set:
+        warnings.append("unscoped_local_scan")
+
+    raw_events_desc = lookup_inbound_events(thread=thread_value, contact=contact_value, limit=limit_value)
+    events_desc = [_summary_event(event, max_text_value) for event in raw_events_desc]
+    events_asc = list(reversed(events_desc))
+    if not events_desc:
+        warnings.append("no_local_events")
+
+    type_counts, media_counts, status_counts = _summary_counts(events_desc)
+    result: dict[str, Any] = {
+        "ok": True,
+        "source": "local_inbound_store",
+        "generated_by": "deterministic_local_v1",
+        "llm_used": False,
+        "provider_history_used": False,
+        "send_performed": False,
+        "summary_persisted": False,
+        "read_only": True,
+        "local_store_only": True,
+        "sends_messages": False,
+        "fetches_provider_history": False,
+        "exposes_raw_refs": False,
+        "mode": mode_norm,
+        "thread_filter_set": thread_filter_set,
+        "contact_filter_set": contact_filter_set,
+        "limit": limit_value,
+        "max_text_chars": max_text_value,
+        "message_count": len(events_desc),
+        "type_counts": type_counts,
+        "media_counts": media_counts,
+        "status_counts": status_counts,
+        "window": _summary_window(events_asc),
+        "warnings": warnings,
+    }
+
+    if mode_norm == "brief":
+        result["headline"] = _conversation_headline(len(events_desc), type_counts, media_counts)
+        result["bullets"] = _conversation_bullets(len(events_desc), events_desc, type_counts, status_counts)
+        previews = [
+            {
+                key: event[key]
+                for key in ("safe_event_id", "created_at", "message_type", "text_preview")
+                if key in event
+            }
+            for event in events_desc[:5]
+            if event.get("text_preview")
+        ]
+        if previews:
+            result["latest_previews"] = previews
+        actions: list[str] = []
+        for event in events_desc:
+            for action in _suggested_actions(str(event.get("message_type") or "unknown"), bool(event.get("has_media"))):
+                if action not in actions:
+                    actions.append(action)
+        result["suggested_actions"] = actions
+    elif mode_norm == "timeline":
+        result["timeline"] = events_asc
+    elif mode_norm == "evidence":
+        result["timeline"] = events_asc
+        result["evidence"] = [
+            {
+                key: event[key]
+                for key in ("safe_event_id", "created_at", "status", "message_type", "has_media", "media", "text_preview")
+                if key in event
+            }
+            for event in events_asc
+        ]
+
+    if include_evidence and mode_norm != "evidence":
+        result["evidence"] = [
+            {
+                key: event[key]
+                for key in ("safe_event_id", "created_at", "status", "message_type", "has_media", "media", "text_preview")
+                if key in event
+            }
+            for event in events_asc
+        ]
+
+    return result
+
+
 _COUNT_QUERIES = {
     "contacts": "SELECT count(*) FROM contacts",
     "lists": "SELECT count(*) FROM lists",
