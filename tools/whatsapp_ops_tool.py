@@ -25,6 +25,7 @@ from tools.whatsapp_ops_store import (
     create_approval,
     create_draft,
     get_cockpit_overview,
+    get_thread_context,
     registration_staging_diagnostics,
     get_draft,
     get_latest_approval,
@@ -507,6 +508,23 @@ def wpp_inbound_lookup(thread: str = "", contact: str = "", limit: int = 20) -> 
     return _json({"ok": True, "thread_filter_set": bool(thread), "contact_filter_set": bool(contact), "events": events})
 
 
+def wpp_thread_context(
+    thread: str = "",
+    contact: str = "",
+    limit: int = 20,
+    mode: str = "summary",
+    max_text_chars: int = 160,
+) -> str:
+    context = get_thread_context(
+        thread=str(thread or ""),
+        contact=str(contact or ""),
+        limit=limit,
+        mode=str(mode or "summary"),
+        max_text_chars=max_text_chars,
+    )
+    return _json(context)
+
+
 def wpp_cockpit_overview(limit: int = 10) -> str:
     cfg = _runtime_config()
     overview = get_cockpit_overview(limit=limit)
@@ -986,6 +1004,32 @@ registry.register(
     ),
     handler=lambda args, **kw: wpp_inbound_lookup(
         thread=args.get("thread", ""), contact=args.get("contact", ""), limit=args.get("limit", 20)
+    ),
+    check_fn=check_whatsapp_ops_requirements,
+    emoji="📲",
+)
+
+registry.register(
+    name="wpp_thread_context",
+    toolset=TOOLSET,
+    schema=_schema(
+        "wpp_thread_context",
+        "Return a bounded sanitized local WhatsApp thread/context summary in summary/operator/debug mode. This never sends or fetches provider history.",
+        {
+            "thread": {"type": "string"},
+            "contact": {"type": "string"},
+            "limit": {"type": "integer"},
+            "mode": {"type": "string", "enum": ["summary", "operator", "debug"]},
+            "max_text_chars": {"type": "integer"},
+        },
+        [],
+    ),
+    handler=lambda args, **kw: wpp_thread_context(
+        thread=args.get("thread", ""),
+        contact=args.get("contact", ""),
+        limit=args.get("limit", 20),
+        mode=args.get("mode", "summary"),
+        max_text_chars=args.get("max_text_chars", 160),
     ),
     check_fn=check_whatsapp_ops_requirements,
     emoji="📲",
