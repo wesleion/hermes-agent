@@ -196,3 +196,77 @@ def test_quepasa_direct_send_rejects_invalid_target_without_http(monkeypatch):
 
     assert result == {"ok": False, "error": "target_invalid"}
     urlopen.assert_not_called()
+
+
+def test_quepasa_group_create_fails_closed_without_group_flag(monkeypatch):
+    from tools.whatsapp_ops_quepasa import create_group_via_quepasa
+
+    monkeypatch.setenv("WHATSAPP_OPS_QUEPASA_API_KEY", "secret-token")
+    payload = {"group_create": {"title": "Grupo Teste", "participants": ["5511999990000@s.whatsapp.net"]}}
+
+    with patch("urllib.request.urlopen") as urlopen:
+        result = create_group_via_quepasa(
+            payload=payload,
+            config={"quepasa": {"send_enabled": True, "group_create_enabled": False, "send_url": "https://quepasa.wesleion.com"}},
+        )
+
+    assert result == {"ok": False, "error": "quepasa_group_create_disabled"}
+    urlopen.assert_not_called()
+
+
+def test_quepasa_group_create_posts_groups_create_and_sanitizes_response(monkeypatch):
+    from tools.whatsapp_ops_quepasa import create_group_via_quepasa
+
+    monkeypatch.setenv("WHATSAPP_OPS_QUEPASA_API_KEY", "secret-token")
+    captured = {}
+
+    def fake_urlopen(req, timeout):
+        captured["req"] = req
+        captured["timeout"] = timeout
+        return _FakeResponse('{"success":true,"status":"created","groupinfo":{"id":"120363999@g.us","Name":"Grupo Teste"}}')
+
+    payload = {"group_create": {"title": "Grupo Teste", "participants": ["5511999990000@s.whatsapp.net"]}}
+    with patch("urllib.request.urlopen", fake_urlopen):
+        result = create_group_via_quepasa(
+            payload=payload,
+            config={"quepasa": {"send_enabled": True, "group_create_enabled": True, "send_url": "https://quepasa.wesleion.com/swagger/doc.json"}},
+        )
+
+    req = captured["req"]
+    assert result["ok"] is True
+    assert result["transport"] == "quepasa_direct_group_create"
+    assert result["participant_count"] == 1
+    assert result["group_ref_hash"]
+    assert "120363999@g.us" not in json.dumps(result, ensure_ascii=False)
+    assert req.get_method() == "POST"
+    assert req.full_url == "https://quepasa.wesleion.com/groups/create"
+    assert req.get_header("X-quepasa-token") == "secret-token"
+    assert _request_body(req) == {"title": "Grupo Teste", "participants": ["5511999990000@s.whatsapp.net"]}
+
+
+def test_quepasa_group_create_resolves_lid_participants_to_phone(monkeypatch):
+    from tools.whatsapp_ops_quepasa import create_group_via_quepasa
+
+    monkeypatch.setenv("WHATSAPP_OPS_QUEPASA_API_KEY", "secret-token")
+    seen = []
+
+    def fake_urlopen(req, timeout):
+        seen.append(req)
+        if req.full_url.startswith("https://quepasa.wesleion.com/useridentifier?"):
+            return _FakeResponse('{"success":true,"status":"ok","phone":"5511999990000","lid":"172185238905034@lid"}')
+        return _FakeResponse('{"success":true,"status":"created","groupinfo":{"id":"120363999@g.us"}}')
+
+    payload = {"group_create": {"title": "Grupo Teste", "participants": ["172185238905034@lid"]}}
+    with patch("urllib.request.urlopen", fake_urlopen):
+        result = create_group_via_quepasa(
+            payload=payload,
+            config={"quepasa": {"send_enabled": True, "group_create_enabled": True, "send_url": "https://quepasa.wesleion.com"}},
+        )
+
+    assert result["ok"] is True
+    assert len(seen) == 2
+    assert seen[0].get_method() == "GET"
+    assert seen[0].full_url.startswith("https://quepasa.wesleion.com/useridentifier?")
+    assert seen[1].full_url == "https://quepasa.wesleion.com/groups/create"
+    assert _request_body(seen[1]) == {"title": "Grupo Teste", "participants": ["5511999990000"]}
+    assert "172185238905034" not in json.dumps(result, ensure_ascii=False)
