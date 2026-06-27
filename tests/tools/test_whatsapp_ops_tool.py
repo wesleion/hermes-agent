@@ -477,6 +477,88 @@ def test_wpp_resolve_approval_deny_blocks_send(tmp_path, monkeypatch):
     send_client.assert_not_called()
 
 
+def test_wpp_group_create_approved_routes_to_executor_with_resolved_raw_participants(tmp_path, monkeypatch):
+    from tools.whatsapp_ops_store import create_approval, create_draft, init_db, resolve_approval, upsert_contact
+    from tools.whatsapp_ops_tool import wpp_send_approved
+
+    monkeypatch.setenv(
+        "CONTACTS_JSON",
+        json.dumps([
+            {
+                "alias": "Alpha",
+                "display_name": "Alpha Lead",
+                "target_ref": "5511999990000@s.whatsapp.net",
+                "kind": "contact",
+                "allow_send": True,
+            }
+        ]),
+    )
+    send_client = Mock(return_value={"ok": True, "transport": "quepasa_direct_group_create", "group_ref_hash": "abc123"})
+    config = {
+        "send_enabled": True,
+        "kill_switch": False,
+        "approval": {"required": True, "timeout_minutes": 60},
+        "allowlists": {"contacts": ["c_1"], "groups": []},
+        "quepasa": {"send_enabled": True, "group_create_enabled": True},
+    }
+
+    token = set_hermes_home_override(tmp_path)
+    try:
+        init_db()
+        upsert_contact(contact_id="c_1", display_name="Alpha Lead", aliases=["Alpha"], whitelisted=True)
+        draft = create_draft(
+            targets=[{"type": "group_create", "name": "Grupo Teste", "member_aliases": ["Alpha"]}],
+            message="AÇÃO WHATSAPP OPS — CRIAR GRUPO",
+        )
+        approval = create_approval(draft["draft_id"], timeout_minutes=60)
+        resolve_approval(approval["approval_id"], "approved", approver_ref="test:approver")
+        result = _parse(wpp_send_approved(draft["draft_id"], config=config, send_client=send_client))
+    finally:
+        reset_hermes_home_override(token)
+
+    assert result["ok"] is True
+    payload, cfg = send_client.call_args.args
+    assert payload["group_create"] == {
+        "title": "Grupo Teste",
+        "participants": ["5511999990000@s.whatsapp.net"],
+    }
+    assert cfg["quepasa"]["group_create_enabled"] is True
+    # Raw participant refs go only to the transport client, not back to model/user output.
+    assert "5511999990000" not in json.dumps(result, ensure_ascii=False)
+
+
+def test_wpp_group_create_rejects_when_group_flag_disabled(tmp_path):
+    from tools.whatsapp_ops_store import create_approval, create_draft, init_db, resolve_approval, upsert_contact
+    from tools.whatsapp_ops_tool import wpp_send_approved
+
+    send_client = Mock(return_value={"ok": True, "transport": "mock"})
+    config = {
+        "send_enabled": True,
+        "kill_switch": False,
+        "approval": {"required": True, "timeout_minutes": 60},
+        "allowlists": {"contacts": ["c_1"], "groups": []},
+        "quepasa": {"send_enabled": True, "group_create_enabled": False},
+    }
+
+    token = set_hermes_home_override(tmp_path)
+    try:
+        init_db()
+        upsert_contact(contact_id="c_1", display_name="Alpha", aliases=["Alpha"], whitelisted=True)
+        draft = create_draft(
+            targets=[{"type": "group_create", "name": "Grupo Teste", "member_aliases": ["Alpha"]}],
+            message="AÇÃO WHATSAPP OPS — CRIAR GRUPO",
+        )
+        approval = create_approval(draft["draft_id"], timeout_minutes=60)
+        resolve_approval(approval["approval_id"], "approved", approver_ref="test:approver")
+        result = _parse(wpp_send_approved(draft["draft_id"], config=config, send_client=send_client))
+    finally:
+        reset_hermes_home_override(token)
+
+    assert result["ok"] is False
+    assert "quepasa_group_create_disabled" in result["reasons"]
+    send_client.assert_not_called()
+
+
 def test_wpp_inbound_lookup_reads_store_and_sanitizes(tmp_path):
     from tools.whatsapp_ops_store import init_db, record_inbound_event
     from tools.whatsapp_ops_tool import wpp_inbound_lookup
@@ -580,6 +662,117 @@ def test_wpp_registration_staging_status_has_diagnostics_and_profile_ttl(tmp_pat
     serialized = json.dumps({"status": status, "registered": registered, "empty": empty_status}, ensure_ascii=False)
     assert "synthetic-contact@internal.invalid" not in serialized
     assert "@internal.invalid" not in serialized
+
+
+
+def test_wpp_registration_staging_is_actionable_for_group_and_participant(tmp_path):
+    from tools.whatsapp_ops_store import init_db
+    from tools.whatsapp_ops_tool import wpp_ingest_inbound_event, wpp_register_staging_status
+
+    payload = {
+        "id": "REG_GROUP_MSG_001",
+        "chat": {"id": "120363430137938027@g.us", "subject": "Grupo Comercial Alpha"},
+        "participant": {"id": "553199998765@s.whatsapp.net", "title": "João Cliente"},
+        "text": "cadastro teste",
+        "type": "text",
+    }
+    token = set_hermes_home_override(tmp_path)
+    try:
+        init_db()
+        ingested = _parse(wpp_ingest_inbound_event(payload))
+        status = _parse(wpp_register_staging_status())
+    finally:
+        reset_hermes_home_override(token)
+
+    assert ingested["ok"] is True
+    assert status["ok"] is True
+    kinds = {item["kind"] for item in status["staged"]}
+    assert {"group", "contact"}.issubset(kinds)
+    group = next(item for item in status["staged"] if item["kind"] == "group")
+    contact = next(item for item in status["staged"] if item["kind"] == "contact")
+    assert group["display_name"] == "Grupo Comercial Alpha"
+    assert group["safe_id"].startswith("grp_")
+    assert group["last_message_type"] == "text"
+    assert contact["display_name"] == "João Cliente"
+    assert contact["safe_id"].startswith("ctt_")
+    assert contact["phone_masked"].endswith("8765")
+    assert contact["source_group_safe_id"] == group["safe_id"]
+    serialized = json.dumps(status, ensure_ascii=False)
+    assert "120363430137938027@g.us" not in serialized
+    assert "553199998765" not in serialized
+    assert "@s.whatsapp.net" not in serialized
+    assert "@g.us" not in serialized
+
+
+
+def test_wpp_registration_staging_deduplicates_and_counts_messages(tmp_path):
+    from tools.whatsapp_ops_store import init_db
+    from tools.whatsapp_ops_tool import wpp_ingest_inbound_event, wpp_register_staging_status
+
+    token = set_hermes_home_override(tmp_path)
+    try:
+        init_db()
+        for idx in range(3):
+            assert _parse(wpp_ingest_inbound_event({
+                "id": f"REG_GROUP_DUP_{idx}",
+                "chat": {"id": "120363430137938027@g.us", "subject": "Grupo Comercial Alpha"},
+                "participant": {"id": "553199998765@s.whatsapp.net", "title": "João Cliente"},
+                "type": "image" if idx == 1 else "text",
+            }))["ok"] is True
+        status = _parse(wpp_register_staging_status())
+    finally:
+        reset_hermes_home_override(token)
+
+    groups = [item for item in status["staged"] if item["kind"] == "group"]
+    contacts = [item for item in status["staged"] if item["kind"] == "contact"]
+    assert len(groups) == 1
+    assert len(contacts) == 1
+    assert groups[0]["message_count"] == 3
+    assert contacts[0]["message_count"] == 3
+    assert groups[0]["last_message_type"] == "text"
+
+
+
+def test_wpp_register_alias_can_consume_specific_staging_id(tmp_path):
+    from tools.whatsapp_ops_store import hash_text, init_db
+    from tools.whatsapp_ops_tool import (
+        wpp_ingest_inbound_event,
+        wpp_register_alias,
+        wpp_register_staging_status,
+    )
+
+    chosen_ref = "553199992222@s.whatsapp.net"
+    other_ref = "553199991111@s.whatsapp.net"
+    token = set_hermes_home_override(tmp_path)
+    try:
+        init_db()
+        assert _parse(wpp_ingest_inbound_event({
+            "id": "REG_CONTACT_OTHER",
+            "chat": {"id": other_ref},
+            "participant": {"id": other_ref, "title": "Outro Lead"},
+            "type": "text",
+        }))["ok"] is True
+        assert _parse(wpp_ingest_inbound_event({
+            "id": "REG_CONTACT_CHOSEN",
+            "chat": {"id": chosen_ref},
+            "participant": {"id": chosen_ref, "title": "Lead Escolhido"},
+            "type": "text",
+        }))["ok"] is True
+        status = _parse(wpp_register_staging_status())
+        chosen = next(item for item in status["staged"] if item.get("phone_masked", "").endswith("2222"))
+        registered = _parse(wpp_register_alias(nome="Lead Operacional", tipo="contact", staging_id=chosen["staging_id"]))
+        remaining = _parse(wpp_register_staging_status())
+    finally:
+        reset_hermes_home_override(token)
+
+    assert registered["ok"] is True
+    assert registered["contact_id"] == "contact_" + hash_text(chosen_ref)[:16]
+    assert all(item["staging_id"] != chosen["staging_id"] for item in remaining["staged"])
+    assert any(item.get("phone_masked", "").endswith("1111") for item in remaining["staged"])
+    serialized = json.dumps({"registered": registered, "remaining": remaining}, ensure_ascii=False)
+    assert chosen_ref not in serialized
+    assert other_ref not in serialized
+    assert "55319999" not in serialized
 
 
 

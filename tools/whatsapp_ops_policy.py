@@ -62,6 +62,7 @@ def evaluate_send_guardrails(
     quepasa = quepasa_raw if isinstance(quepasa_raw, dict) else {}
     if not _truthy(quepasa.get("send_enabled", False)):
         reasons.append("quepasa_send_disabled")
+    group_create_enabled = _truthy(quepasa.get("group_create_enabled", False))
 
     if draft is None:
         reasons.append("draft_missing")
@@ -90,10 +91,10 @@ def evaluate_send_guardrails(
         if not isinstance(target, dict):
             reasons.append("payload_invalid")
             continue
-        if target.get("ambiguous"):
+        target_type = target.get("type")
+        if target.get("ambiguous") and target_type != "group_create":
             reasons.append("target_ambiguous")
             continue
-        target_type = target.get("type")
         if target_type == "contact":
             if target.get("contact_id") not in allowed_contacts:
                 reasons.append("target_not_whitelisted")
@@ -101,6 +102,19 @@ def evaluate_send_guardrails(
             group_id = target.get("group_id") or target.get("list_id")
             if group_id not in allowed_groups:
                 reasons.append("target_not_whitelisted")
+        elif target_type == "group_create":
+            if not group_create_enabled:
+                reasons.append("quepasa_group_create_disabled")
+            if not str(target.get("name") or target.get("title") or "").strip():
+                reasons.append("payload_invalid")
+            participant_ids = target.get("participant_contact_ids") or []
+            if not isinstance(participant_ids, list) or not participant_ids:
+                reasons.append("payload_invalid")
+            if target.get("ambiguous") or target.get("unresolved_members"):
+                reasons.append("target_ambiguous")
+            for contact_id in participant_ids if isinstance(participant_ids, list) else []:
+                if contact_id not in allowed_contacts:
+                    reasons.append("target_not_whitelisted")
         else:
             reasons.append("payload_invalid")
 

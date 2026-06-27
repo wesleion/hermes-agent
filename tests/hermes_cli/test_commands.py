@@ -18,6 +18,7 @@ from hermes_cli.commands import (
     _TG_NAME_LIMIT,
     _clamp_command_names,
     _clamp_telegram_names,
+    _resolve_config_gates_from_config,
     _sanitize_telegram_name,
     discord_skill_commands,
     gateway_help_lines,
@@ -68,7 +69,7 @@ class TestCommandRegistry:
                         f"Alias '{alias}' of '{cmd.name}' shadows canonical '{target.name}'"
 
     def test_every_entry_has_valid_category(self):
-        valid_categories = {"Session", "Configuration", "Tools & Skills", "Info", "Exit"}
+        valid_categories = {"Session", "Configuration", "Tools & Skills", "Info", "Exit", "WhatsApp Ops"}
         for cmd in COMMAND_REGISTRY:
             assert cmd.category in valid_categories, f"{cmd.name} has invalid category '{cmd.category}'"
 
@@ -488,6 +489,21 @@ class TestGatewayConfigGate:
 
         names = {name for name, _ in telegram_bot_commands()}
         assert "verbose" in names
+
+    def test_resolve_config_gates_from_loaded_config(self):
+        enabled = _resolve_config_gates_from_config({
+            "display": {"tool_progress_command": True},
+            "whatsapp_ops": {"slash_commands_enabled": True},
+        })
+        assert "verbose" in enabled
+        assert {"wpp", "fila", "addct", "addgp", "crgp"}.issubset(enabled)
+
+        disabled = _resolve_config_gates_from_config({
+            "display": {"tool_progress_command": "false"},
+            "whatsapp_ops": {"slash_commands_enabled": "false"},
+        })
+        assert "verbose" not in disabled
+        assert not {"wpp", "fila", "addct", "addgp", "crgp"} & disabled
 
     def test_config_gate_excluded_from_slack_when_off(self, tmp_path, monkeypatch):
         config_file = tmp_path / "config.yaml"
@@ -1133,6 +1149,7 @@ class TestTelegramMenuCommands:
     def test_operational_builtins_survive_thirty_command_cap(self, tmp_path, monkeypatch):
         (tmp_path / "config.yaml").write_text(
             "display:\n  tool_progress_command: true\n"
+            "whatsapp_ops:\n  slash_commands_enabled: true\n"
         )
         monkeypatch.setenv("HERMES_HOME", str(tmp_path))
 
@@ -1151,6 +1168,11 @@ class TestTelegramMenuCommands:
             "new",
             "stop",
             "status",
+            "wpp",
+            "fila",
+            "addct",
+            "addgp",
+            "crgp",
         ):
             assert name in names
 

@@ -4100,6 +4100,55 @@ def test_commands_catalog_surfaces_quick_commands(monkeypatch):
     assert resp["result"]["canon"]["/notes"] == "/notes"
 
 
+def test_commands_catalog_hides_disabled_config_gated_hunter_commands(monkeypatch):
+    monkeypatch.setattr(server, "_load_cfg", lambda: {"quick_commands": {}})
+
+    resp = server.handle_request(
+        {"id": "1", "method": "commands.catalog", "params": {}}
+    )
+
+    pairs = dict(resp["result"]["pairs"])
+    canon = resp["result"]["canon"]
+    for cmd in ("/wpp", "/fila", "/addct", "/addgp", "/crgp"):
+        assert cmd not in pairs
+        assert cmd not in canon
+
+
+def test_commands_catalog_includes_hunter_commands_without_quick_duplicates(monkeypatch):
+    monkeypatch.setattr(
+        server,
+        "_load_cfg",
+        lambda: {
+            "whatsapp_ops": {"slash_commands_enabled": True},
+            "quick_commands": {
+                "wpp": {"type": "exec", "description": "legacy duplicate"},
+                "addct": {"type": "exec", "description": "legacy duplicate"},
+                "wpp_register_contact": {"type": "exec", "description": "legacy alias"},
+                "custom": {"type": "exec", "description": "Custom profile command"},
+            },
+        },
+    )
+
+    resp = server.handle_request(
+        {"id": "1", "method": "commands.catalog", "params": {}}
+    )
+
+    pairs = dict(resp["result"]["pairs"])
+    canon = resp["result"]["canon"]
+    for cmd in ("/wpp", "/fila", "/addct", "/addgp", "/crgp"):
+        assert cmd in pairs
+    assert pairs["/wpp"] == "WhatsApp Ops: painel rápido e ajuda"
+    assert canon["/wpp_register_contact"] == "/addct"
+    assert "/wpp_register_contact" not in pairs
+
+    wpp_cat = next(c for c in resp["result"]["categories"] if c["name"] == "WhatsApp Ops")
+    wpp_pairs = dict(wpp_cat["pairs"])
+    assert set(("/wpp", "/fila", "/addct", "/addgp", "/crgp")).issubset(wpp_pairs)
+
+    user_cat = next(c for c in resp["result"]["categories"] if c["name"] == "User commands")
+    assert dict(user_cat["pairs"]) == {"/custom": "Custom profile command"}
+
+
 def test_commands_catalog_includes_tui_mouse_command():
     resp = server.handle_request(
         {"id": "1", "method": "commands.catalog", "params": {}}

@@ -4143,11 +4143,39 @@ class TelegramAdapter(BasePlatformAdapter):
             label = "✅ WhatsApp draft approved" if decision == "approved" else "❌ WhatsApp draft denied"
             await query.answer(text=label)
             try:
+                draft_id = str(resolved.get("draft_id", ""))
+                followup = "Envio não foi disparado; use wpp_send_approved separadamente."
+                if decision == "approved" and draft_id:
+                    try:
+                        from tools.whatsapp_ops_store import get_draft as _get_wpp_draft
+
+                        draft = _get_wpp_draft(draft_id) or {}
+                        targets = json.loads(str(draft.get("targets_json") or "[]"))
+                        if any(isinstance(t, dict) and t.get("type") == "group_create" for t in targets):
+                            from tools.whatsapp_ops_tool import wpp_send_approved as _wpp_send_approved
+
+                            execution = json.loads(_wpp_send_approved(draft_id))
+                            if execution.get("ok"):
+                                send_result = execution.get("send_result") if isinstance(execution.get("send_result"), dict) else {}
+                                group_hash = str(send_result.get("group_ref_hash") or "")
+                                suffix = f" Ref hash: {group_hash}." if group_hash else ""
+                                followup = f"Grupo criado via QuePasa/direct.{suffix}"
+                            else:
+                                reasons = execution.get("reasons") or []
+                                if not reasons and isinstance(execution.get("send_result"), dict):
+                                    reasons = [execution["send_result"].get("error") or "execution_failed"]
+                                reason_text = ", ".join(str(r) for r in reasons if r) or "execution_blocked"
+                                followup = (
+                                    "Aprovação registrada, mas a criação NÃO executou. "
+                                    f"Bloqueio: {reason_text}."
+                                )
+                    except Exception:
+                        pass
                 await query.edit_message_text(
                     text=(
                         f"{label} by {_html.escape(str(user_display))}\n"
-                        f"Draft: <code>{_html.escape(str(resolved.get('draft_id', '')))}</code>\n"
-                        "Envio não foi disparado; use wpp_send_approved separadamente."
+                        f"Draft: <code>{_html.escape(draft_id)}</code>\n"
+                        f"{_html.escape(followup)}"
                     ),
                     parse_mode=ParseMode.HTML,
                     reply_markup=None,

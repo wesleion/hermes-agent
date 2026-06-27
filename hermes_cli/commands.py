@@ -226,14 +226,23 @@ COMMAND_REGISTRY: list[CommandDef] = [
                cli_only=True, aliases=("gateway",)),
     CommandDef("platform", "Pause, resume, or list a failing gateway platform", "Info",
                gateway_only=True, args_hint="<pause|resume|list> [name]"),
-    CommandDef("wpp_register_staging_status", "WhatsApp Ops: show staged inbound refs ready for alias registration",
+    CommandDef("wpp", "WhatsApp Ops: painel rápido e ajuda",
                "WhatsApp Ops", cli_only=True,
                gateway_config_gate="whatsapp_ops.slash_commands_enabled"),
-    CommandDef("wpp_register_contact", "WhatsApp Ops: register a contact alias from latest inbound or explicit ref",
-               "WhatsApp Ops", cli_only=True, args_hint="<nome> [| ref]",
+    CommandDef("fila", "WhatsApp Ops: ver fila de cadastro",
+               "WhatsApp Ops", cli_only=True,
+               aliases=("wpp_register_staging_status",),
                gateway_config_gate="whatsapp_ops.slash_commands_enabled"),
-    CommandDef("wpp_register_group", "WhatsApp Ops: register a group alias from latest inbound or explicit ref",
+    CommandDef("addct", "WhatsApp Ops: adicionar contato",
                "WhatsApp Ops", cli_only=True, args_hint="<nome> [| ref]",
+               aliases=("wpp_register_contact",),
+               gateway_config_gate="whatsapp_ops.slash_commands_enabled"),
+    CommandDef("addgp", "WhatsApp Ops: adicionar grupo existente",
+               "WhatsApp Ops", cli_only=True, args_hint="<nome> [| ref]",
+               aliases=("wpp_register_group",),
+               gateway_config_gate="whatsapp_ops.slash_commands_enabled"),
+    CommandDef("crgp", "WhatsApp Ops: preparar criação de grupo com aprovação",
+               "WhatsApp Ops", cli_only=True, args_hint="<nome> [| membros]",
                gateway_config_gate="whatsapp_ops.slash_commands_enabled"),
     CommandDef("copy", "Copy the last assistant response to clipboard", "Info",
                cli_only=True, args_hint="[number]"),
@@ -366,6 +375,7 @@ ACTIVE_SESSION_BYPASS_COMMANDS: frozenset[str] = frozenset(
         "approve",
         "background",
         "commands",
+        "crgp",
         "deny",
         "help",
         "new",
@@ -404,26 +414,23 @@ def should_bypass_active_session(command_name: str | None) -> bool:
     return resolve_command(command_name) is not None if command_name else False
 
 
-def _resolve_config_gates() -> set[str]:
-    """Return canonical names of commands whose ``gateway_config_gate`` is truthy.
+def _resolve_config_gates_from_config(cfg: Mapping[str, Any] | None) -> set[str]:
+    """Return config-gated command names enabled by an already-loaded config.
 
-    Reads ``config.yaml`` and walks the dot-separated key path for each
-    config-gated command.  Returns an empty set on any error so callers
-    degrade gracefully.
+    This keeps every command surface (gateway help, Telegram menu, Discord,
+    TUI command catalog) on the same gate semantics while allowing callers that
+    already loaded a profile config to avoid reading a possibly different
+    ``HERMES_HOME``.
     """
-    gated = [c for c in COMMAND_REGISTRY if c.gateway_config_gate]
-    if not gated:
-        return set()
-    try:
-        from hermes_cli.config import read_raw_config
-        cfg = read_raw_config()
-    except Exception:
+    if not isinstance(cfg, Mapping):
         return set()
     result: set[str] = set()
-    for cmd in gated:
+    for cmd in COMMAND_REGISTRY:
+        if not cmd.gateway_config_gate:
+            continue
         val: Any = cfg
         for key in cmd.gateway_config_gate.split("."):
-            if isinstance(val, dict):
+            if isinstance(val, Mapping):
                 val = val.get(key)
             else:
                 val = None
@@ -431,6 +438,21 @@ def _resolve_config_gates() -> set[str]:
         if is_truthy_value(val, default=False):
             result.add(cmd.name)
     return result
+
+
+def _resolve_config_gates() -> set[str]:
+    """Return canonical names of commands whose ``gateway_config_gate`` is truthy.
+
+    Reads ``config.yaml`` and walks the dot-separated key path for each
+    config-gated command.  Returns an empty set on any error so callers
+    degrade gracefully.
+    """
+    try:
+        from hermes_cli.config import read_raw_config
+        cfg = read_raw_config()
+    except Exception:
+        return set()
+    return _resolve_config_gates_from_config(cfg)
 
 
 def _is_gateway_available(cmd: CommandDef, config_overrides: set[str] | None = None) -> bool:
@@ -546,9 +568,11 @@ _TELEGRAM_MENU_PRIORITY = (
     "stop",
     "status",
     # Profile-gated WhatsApp Ops cockpit commands — only surface when enabled.
-    "wpp_register_staging_status",
-    "wpp_register_contact",
-    "wpp_register_group",
+    "wpp",
+    "fila",
+    "addct",
+    "addgp",
+    "crgp",
     "resume",
     "sessions",
     "model",
