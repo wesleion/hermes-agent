@@ -1,5 +1,6 @@
 """Tests for Telegram inline keyboard approval buttons."""
 
+import json
 import os
 import sys
 from pathlib import Path
@@ -422,7 +423,7 @@ class TestTelegramApprovalCallback:
         assert runner.last_source.chat_id == "12345"
 
     @pytest.mark.asyncio
-    async def test_whatsapp_ops_approval_callback_resolves_without_sending(self):
+    async def test_whatsapp_ops_approval_callback_resolves_and_sends_controlled(self):
         adapter = _make_adapter()
 
         query = AsyncMock()
@@ -441,21 +442,32 @@ class TestTelegramApprovalCallback:
         context = MagicMock()
 
         resolved = {"ok": True, "draft_id": "draft-9", "status": "approved"}
+        execution = {
+            "ok": True,
+            "send_result": {
+                "ok": True,
+                "transport": "quepasa_direct",
+                "provider_status": "sended with success",
+                "media_sent": False,
+            },
+        }
         with patch.dict(os.environ, {"TELEGRAM_ALLOWED_USERS": "*"}, clear=False):
             with patch("tools.whatsapp_ops_store.resolve_approval", return_value=resolved) as mock_resolve:
-                await adapter._handle_callback_query(update, context)
+                with patch("tools.whatsapp_ops_tool.wpp_send_approved", return_value=json.dumps(execution)) as mock_send:
+                    await adapter._handle_callback_query(update, context)
 
         mock_resolve.assert_called_once_with(
             "approval-123",
             decision="approved",
             approver_ref="telegram:12345",
         )
+        mock_send.assert_called_once_with("draft-9")
         query.answer.assert_called_once()
         assert "approved" in query.answer.call_args[1]["text"].lower()
         edit_kwargs = query.edit_message_text.call_args[1]
         assert "HTML" in repr(edit_kwargs["parse_mode"])
         assert "draft-9" in edit_kwargs["text"]
-        assert "Envio não foi disparado" in edit_kwargs["text"]
+        assert "Envio executado via QuePasa/direct" in edit_kwargs["text"]
 
     @pytest.mark.asyncio
     async def test_whatsapp_ops_approval_callback_rejects_unauthorized_user(self):

@@ -30,6 +30,9 @@ from tools.whatsapp_ops_store import (
     get_thread_context,
     get_transport_contact_ref,
     get_transport_group_ref,
+    import_contact_list_local,
+    list_contact_segment_members,
+    list_contact_segments,
     registration_staging_diagnostics,
     get_draft,
     get_latest_approval,
@@ -674,6 +677,28 @@ def wpp_list_contacts(filtro: str = "") -> str:
     return _json({"ok": True, "filter": str(filtro)[:80], "contacts": list_contacts(filtro)})
 
 
+def wpp_import_contact_list(
+    list_name: str,
+    contacts: list[dict[str, Any]],
+    allow_send: bool = False,
+    policy_group: str = "lead",
+) -> str:
+    return _json(import_contact_list_local(
+        list_name=str(list_name or ""),
+        contacts=contacts if isinstance(contacts, list) else [],
+        allow_send=bool(allow_send),
+        policy_group=str(policy_group or "lead")[:80],
+    ))
+
+
+def wpp_list_contact_segments(limit: int = 50) -> str:
+    return _json({"ok": True, "segments": list_contact_segments(limit=limit)})
+
+
+def wpp_list_contact_segment_members(list_ref: str, limit: int = 50) -> str:
+    return _json(list_contact_segment_members(str(list_ref or ""), limit=limit))
+
+
 def wpp_sync_allowlist() -> str:
     return _json(sync_allowlist_from_env())
 
@@ -1211,6 +1236,61 @@ registry.register(
         [],
     ),
     handler=lambda args, **kw: wpp_sync_allowlist(),
+    check_fn=check_whatsapp_ops_requirements,
+    emoji="📲",
+)
+
+registry.register(
+    name="wpp_import_contact_list",
+    toolset=TOOLSET,
+    schema=_schema(
+        "wpp_import_contact_list",
+        "Import a commercial contact segment into the local sanitized WhatsApp Ops cache. Defaults allow_send=false and never sends.",
+        {
+            "list_name": {"type": "string"},
+            "contacts": {"type": "array", "items": {"type": "object"}},
+            "allow_send": {"type": "boolean"},
+            "policy_group": {"type": "string"},
+        },
+        ["list_name", "contacts"],
+    ),
+    handler=lambda args, **kw: wpp_import_contact_list(
+        list_name=args.get("list_name", ""),
+        contacts=args.get("contacts", []),
+        allow_send=bool(args.get("allow_send", False)),
+        policy_group=args.get("policy_group", "lead"),
+    ),
+    check_fn=check_whatsapp_ops_requirements,
+    emoji="📲",
+)
+
+registry.register(
+    name="wpp_list_contact_segments",
+    toolset=TOOLSET,
+    schema=_schema(
+        "wpp_list_contact_segments",
+        "List sanitized commercial contact segments imported into WhatsApp Ops. Never sends.",
+        {"limit": {"type": "integer"}},
+        [],
+    ),
+    handler=lambda args, **kw: wpp_list_contact_segments(limit=args.get("limit", 50)),
+    check_fn=check_whatsapp_ops_requirements,
+    emoji="📲",
+)
+
+registry.register(
+    name="wpp_list_contact_segment_members",
+    toolset=TOOLSET,
+    schema=_schema(
+        "wpp_list_contact_segment_members",
+        "List sanitized members of a commercial contact segment. Never sends and never exposes raw refs.",
+        {"list_ref": {"type": "string"}, "limit": {"type": "integer"}},
+        ["list_ref"],
+    ),
+    handler=lambda args, **kw: wpp_list_contact_segment_members(
+        list_ref=args.get("list_ref", ""),
+        limit=args.get("limit", 50),
+    ),
     check_fn=check_whatsapp_ops_requirements,
     emoji="📲",
 )

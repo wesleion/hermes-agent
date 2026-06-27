@@ -4297,33 +4297,38 @@ class TelegramAdapter(BasePlatformAdapter):
             await query.answer(text=label)
             try:
                 draft_id = str(resolved.get("draft_id", ""))
-                followup = "Envio não foi disparado; use wpp_send_approved separadamente."
+                followup = "Envio não foi solicitado."
                 if decision == "approved" and draft_id:
                     try:
-                        from tools.whatsapp_ops_store import get_draft as _get_wpp_draft
+                        from tools.whatsapp_ops_tool import wpp_send_approved as _wpp_send_approved
 
-                        draft = _get_wpp_draft(draft_id) or {}
-                        targets = json.loads(str(draft.get("targets_json") or "[]"))
-                        if any(isinstance(t, dict) and t.get("type") == "group_create" for t in targets):
-                            from tools.whatsapp_ops_tool import wpp_send_approved as _wpp_send_approved
-
-                            execution = json.loads(_wpp_send_approved(draft_id))
-                            if execution.get("ok"):
-                                send_result = execution.get("send_result") if isinstance(execution.get("send_result"), dict) else {}
-                                group_hash = str(send_result.get("group_ref_hash") or "")
-                                suffix = f" Ref hash: {group_hash}." if group_hash else ""
-                                followup = f"Grupo criado via QuePasa/direct.{suffix}"
-                            else:
-                                reasons = execution.get("reasons") or []
-                                if not reasons and isinstance(execution.get("send_result"), dict):
-                                    reasons = [execution["send_result"].get("error") or "execution_failed"]
-                                reason_text = ", ".join(str(r) for r in reasons if r) or "execution_blocked"
-                                followup = (
-                                    "Aprovação registrada, mas a criação NÃO executou. "
-                                    f"Bloqueio: {reason_text}."
-                                )
-                    except Exception:
-                        pass
+                        execution = json.loads(_wpp_send_approved(draft_id))
+                        if execution.get("ok"):
+                            send_result = execution.get("send_result") if isinstance(execution.get("send_result"), dict) else {}
+                            group_hash = str(send_result.get("group_ref_hash") or "")
+                            media_sent = bool(send_result.get("media_sent"))
+                            suffix_parts = []
+                            if group_hash:
+                                suffix_parts.append(f"ref_hash={group_hash}")
+                            suffix_parts.append(f"media={'sim' if media_sent else 'não'}")
+                            provider_status = str(send_result.get("provider_status") or "")[:80]
+                            if provider_status:
+                                suffix_parts.append(f"status={provider_status}")
+                            followup = "Envio executado via QuePasa/direct. " + "; ".join(suffix_parts) + "."
+                        else:
+                            reasons = execution.get("reasons") or []
+                            if not reasons and isinstance(execution.get("send_result"), dict):
+                                reasons = [execution["send_result"].get("error") or "execution_failed"]
+                            reason_text = ", ".join(str(r) for r in reasons if r) or "execution_blocked"
+                            followup = (
+                                "Aprovação registrada, mas o envio NÃO executou. "
+                                f"Bloqueio: {reason_text}."
+                            )
+                    except Exception as exc:
+                        logger.error("[%s] WhatsApp approved send callback failed: %s", self.name, exc, exc_info=True)
+                        followup = "Aprovação registrada, mas o envio NÃO executou por erro interno."
+                elif decision != "approved":
+                    followup = "Envio negado; nada foi disparado."
                 await query.edit_message_text(
                     text=(
                         f"{label} by {_html.escape(str(user_display))}\n"
