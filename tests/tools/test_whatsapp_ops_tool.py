@@ -875,6 +875,50 @@ def test_wpp_ingest_inbound_event_redacts_media_url_tokens(tmp_path):
     assert "<redacted-url>" in serialized
 
 
+def test_wpp_ingest_inbound_event_redacts_embedded_urls_and_media_blobs(tmp_path):
+    from tools.whatsapp_ops_store import init_db
+    from tools.whatsapp_ops_tool import wpp_ingest_inbound_event, wpp_inbound_lookup
+
+    payload = {
+        "id": "MEDIA_TEXT_MSG_001",
+        "chat": {"id": "551122221111@s.whatsapp.net"},
+        "participant": {"id": "551122221111@s.whatsapp.net"},
+        "text": (
+            "Veja https://cdn.example.invalid/file.jpg?token=secret123 "
+            "e data:image/png;base64,AAAAABBBBBCCCCCDDDDDEEEEEFFFFFGGGGGHHHHH "
+            "ref 551122221111:17@s.whatsapp.net telefone 5511999999999"
+        ),
+        "attachment": {
+            "mime": "image/png",
+            "thumbnail": {
+                "urlprefix": "data:image/png;base64,",
+                "data": "AAAAABBBBBCCCCCDDDDDEEEEEFFFFFGGGGGHHHHH",
+            },
+        },
+    }
+    token = set_hermes_home_override(tmp_path)
+    try:
+        init_db()
+        ingested = _parse(wpp_ingest_inbound_event(payload))
+        result = _parse(wpp_inbound_lookup(contact="551122221111@s.whatsapp.net"))
+    finally:
+        reset_hermes_home_override(token)
+
+    serialized = json.dumps(result, ensure_ascii=False)
+    assert ingested["ok"] is True
+    assert "cdn.example.invalid" not in serialized
+    assert "secret123" not in serialized
+    assert "data:image" not in serialized
+    assert "AAAAABBBBB" not in serialized
+    assert "5511999999999" not in serialized
+    assert "551122221111" not in serialized
+    assert "@s.whatsapp.net" not in serialized
+    assert "<redacted-url>" in serialized
+    assert "<redacted-phone>" in serialized
+    assert "<redacted-wa-ref>" in serialized
+
+
+
 def test_wpp_sync_allowlist_tool_loads_infisical_env_safely(tmp_path, monkeypatch):
     from tools.whatsapp_ops_store import init_db
     from tools.whatsapp_ops_tool import wpp_list_contacts, wpp_sync_allowlist
