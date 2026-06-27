@@ -138,6 +138,55 @@ def test_wpp_send_approved_resolves_local_registered_contact_for_transport_only(
     assert "551188887777" not in json.dumps(result, ensure_ascii=False)
 
 
+def test_wpp_import_contact_list_sanitizes_and_defaults_no_send(tmp_path):
+    from tools.whatsapp_ops_store import create_approval, create_draft, init_db, resolve_approval
+    from tools.whatsapp_ops_tool import (
+        wpp_import_contact_list,
+        wpp_list_contact_segment_members,
+        wpp_list_contact_segments,
+        wpp_send_approved,
+    )
+
+    send_client = Mock(return_value={"ok": True, "transport": "mock"})
+    config = {
+        "send_enabled": True,
+        "kill_switch": False,
+        "approval": {"required": True, "timeout_minutes": 60},
+        "allowlists": {"contacts": [], "groups": []},
+        "quepasa": {"send_enabled": True},
+    }
+    token = set_hermes_home_override(tmp_path)
+    try:
+        init_db()
+        imported = _parse(wpp_import_contact_list(
+            list_name="Leads Junho",
+            contacts=[{"alias": "Lead A", "phone": "+55 11 7777-1234"}],
+        ))
+        segments = _parse(wpp_list_contact_segments())
+        members = _parse(wpp_list_contact_segment_members(imported["list_id"]))
+        contact_id = imported["contacts"][0]["contact_id"]
+        draft = create_draft(
+            targets=[{"type": "contact", "contact_id": contact_id}],
+            message="Draft para lead importado sem allow_send",
+        )
+        approval = create_approval(draft["draft_id"], timeout_minutes=60)
+        resolve_approval(approval["approval_id"], "approved", approver_ref="test:approver")
+        send_result = _parse(wpp_send_approved(draft["draft_id"], config=config, send_client=send_client))
+    finally:
+        reset_hermes_home_override(token)
+
+    public = json.dumps([imported, segments, members, send_result], ensure_ascii=False)
+    assert imported["ok"] is True
+    assert imported["imported_count"] == 1
+    assert segments["segments"][0]["member_count"] == 1
+    assert members["contacts"][0]["whitelisted"] is False
+    assert "551177771234" not in public
+    assert "@s.whatsapp.net" not in public
+    assert send_result["ok"] is False
+    assert "target_not_whitelisted" in send_result["reasons"]
+    send_client.assert_not_called()
+
+
 
 def test_wpp_create_draft_rejects_persistent_media_blobs_and_token_urls(tmp_path):
     from tools.whatsapp_ops_store import init_db
