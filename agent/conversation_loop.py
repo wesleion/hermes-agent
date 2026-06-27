@@ -103,6 +103,40 @@ def _image_error_max_dimension(error: Exception) -> Optional[int]:
     return None
 
 
+def _retry_after_seconds_from_error_text(error_text: str) -> Optional[float]:
+    """Extract provider-supplied retry windows from human error text.
+
+    Some OAuth-backed providers return 429s without a Retry-After header but
+    include text like "Your quota will reset after 50s". Generic exponential
+    backoff (2s, 4s, …) can hammer the same closed bucket and exhaust Hermes'
+    retry loop before the provider's own reset window expires. Treat those text
+    hints like Retry-After.
+    """
+    if not error_text:
+        return None
+
+    patterns = (
+        r"(?:quota|capacity|rate\s*limit)[^\n\r]{0,80}?reset\s+after\s+(\d+(?:\.\d+)?)\s*(s|sec|secs|second|seconds|m|min|mins|minute|minutes)\b",
+        r"reset\s+after\s+(\d+(?:\.\d+)?)\s*(s|sec|secs|second|seconds|m|min|mins|minute|minutes)\b",
+        r"retry\s+after\s+(\d+(?:\.\d+)?)\s*(s|sec|secs|second|seconds|m|min|mins|minute|minutes)\b",
+    )
+    text = str(error_text)
+    for pattern in patterns:
+        match = re.search(pattern, text, flags=re.IGNORECASE)
+        if not match:
+            continue
+        try:
+            value = float(match.group(1))
+        except (TypeError, ValueError):
+            continue
+        unit = (match.group(2) or "s").lower()
+        if unit.startswith("m"):
+            value *= 60.0
+        # Small cushion avoids retrying exactly on the provider's boundary.
+        return min(max(value + 1.0, 1.0), 300.0)
+    return None
+
+
 def _ollama_context_limit_error(agent: Any, request_tokens: int) -> Optional[str]:
     """Return a user-facing error when Ollama is loaded with too little context."""
     if not getattr(agent, "tools", None):
@@ -3806,7 +3840,11 @@ def run_conversation(
                         "failure_reason": classified.reason.value,
                     }
 
-                # For rate limits, respect the Retry-After header if present
+                # For rate limits, respect Retry-After. Some providers omit
+                # the header but include an equivalent "quota will reset after
+                # Ns" hint in the error text — parse that too so we wait for
+                # the real reset instead of burning all retries in a few
+                # seconds.
                 _retry_after = None
                 if is_rate_limited:
                     _resp_headers = getattr(getattr(api_error, "response", None), "headers", None)
@@ -3822,6 +3860,10 @@ def run_conversation(
                                 _retry_after = min(float(_ra_raw), 600)
                             except (TypeError, ValueError):
                                 pass
+                    if _retry_after is None:
+                        _retry_after = _retry_after_seconds_from_error_text(
+                            str(api_error) or _error_summary
+                        )
                 wait_time = _retry_after if _retry_after else jittered_backoff(retry_count, base_delay=2.0, max_delay=60.0)
                 _backoff_policy = None
                 if is_rate_limited and not _retry_after:

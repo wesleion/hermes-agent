@@ -11,6 +11,7 @@ from gateway.session import SessionSource
 def _make_adapter(
     require_mention=None,
     free_response_chats=None,
+    free_response_topics=None,
     mention_patterns=None,
     exclusive_bot_mentions=None,
     ignored_threads=None,
@@ -30,6 +31,10 @@ def _make_adapter(
         extra["require_mention"] = require_mention
     if free_response_chats is not None:
         extra["free_response_chats"] = free_response_chats
+    if free_response_topics is not None:
+        extra["free_response_topics"] = free_response_topics
+    else:
+        extra["free_response_topics"] = []
     if mention_patterns is not None:
         extra["mention_patterns"] = mention_patterns
     if exclusive_bot_mentions is not None:
@@ -543,6 +548,32 @@ def test_free_response_chats_bypass_mention_requirement():
     assert adapter._should_process_message(_group_message("hello everyone", chat_id=-201)) is False
 
 
+def test_free_response_topics_bypass_mention_requirement_only_for_matching_topic():
+    adapter = _make_adapter(
+        require_mention=True,
+        allowed_chats=["-200"],
+        free_response_topics=["-200:8", "-200:1"],
+    )
+
+    assert adapter._should_process_message(_group_message("hello", chat_id=-200, thread_id=8)) is True
+    assert adapter._should_process_message(_group_message("hello", chat_id=-200, thread_id=None)) is True
+    assert adapter._should_process_message(_group_message("hello", chat_id=-200, thread_id=9)) is False
+    assert adapter._should_process_message(_group_message("hello", chat_id=-201, thread_id=8)) is False
+
+
+def test_free_response_topics_are_not_observed_as_passive_context():
+    adapter = _make_adapter(
+        require_mention=True,
+        allowed_chats=["-200"],
+        group_allowed_chats=["-200"],
+        observe_unmentioned_group_messages=True,
+        free_response_topics=["-200:8"],
+    )
+
+    assert adapter._should_observe_unmentioned_group_message(_group_message("hello", chat_id=-200, thread_id=8)) is False
+    assert adapter._should_observe_unmentioned_group_message(_group_message("hello", chat_id=-200, thread_id=9)) is True
+
+
 def test_guest_mode_allows_only_direct_mentions_outside_allowed_chats():
     adapter = _make_adapter(
         require_mention=True,
@@ -709,6 +740,8 @@ def test_config_bridges_telegram_group_settings(monkeypatch, tmp_path):
         "    - \"^\\\\s*chompy\\\\b\"\n"
         "  free_response_chats:\n"
         "    - \"-123\"\n"
+        "  free_response_topics:\n"
+        "    - \"-100:8\"\n"
         "  allowed_chats:\n"
         "    - \"-100\"\n"
         "  group_allowed_chats:\n"
@@ -731,6 +764,7 @@ def test_config_bridges_telegram_group_settings(monkeypatch, tmp_path):
         "TELEGRAM_GUEST_MODE",
         "TELEGRAM_OBSERVE_UNMENTIONED_GROUP_MESSAGES",
         "TELEGRAM_FREE_RESPONSE_CHATS",
+        "TELEGRAM_FREE_RESPONSE_TOPICS",
         "TELEGRAM_ALLOWED_CHATS",
         "TELEGRAM_GROUP_ALLOWED_CHATS",
         "TELEGRAM_ALLOWED_TOPICS",
@@ -740,12 +774,10 @@ def test_config_bridges_telegram_group_settings(monkeypatch, tmp_path):
     config = load_gateway_config()
 
     # Assert against the returned config object — the authoritative result of the
-    # bridge. We deliberately do NOT assert on os.environ here: a third-party
-    # import (microsoft_teams/apps/app.py) runs load_dotenv(find_dotenv(usecwd=True))
-    # at import time, which walks up from cwd and can repopulate TELEGRAM_* vars
-    # from a developer's real ~/.hermes/.env, defeating the env-over-YAML bridge
-    # for any key present there. The PlatformConfig.extra values below are parsed
-    # straight from the test's config.yaml and are immune to that ambient leak.
+    # bridge. We deliberately do NOT assert on most os.environ values here: a
+    # third-party import can load a developer's real ~/.hermes/.env and defeat
+    # env-over-YAML assertions. PlatformConfig.extra is parsed from this test's
+    # config.yaml and is immune to that ambient leak.
     assert config is not None
     tg_cfg = config.platforms.get(Platform.TELEGRAM)
     assert tg_cfg is not None
@@ -757,10 +789,12 @@ def test_config_bridges_telegram_group_settings(monkeypatch, tmp_path):
     assert tg_cfg.extra.get("allowed_chats") == ["-100"]
     assert tg_cfg.extra.get("group_allowed_chats") == ["-100"]
     assert tg_cfg.extra.get("allowed_topics") == [8]
-    # free_response_chats is bridged to the env var only (not PlatformConfig.extra).
-    # TELEGRAM_FREE_RESPONSE_CHATS is not a key that appears in developer .env
-    # files, so asserting it via os.environ stays deterministic.
+    assert tg_cfg.extra.get("free_response_topics") == ["-100:8"]
+    # free_response_chats/free_response_topics are also bridged to env vars.
+    # These keys are not expected in developer .env files, so asserting them via
+    # os.environ stays deterministic.
     assert __import__("os").environ["TELEGRAM_FREE_RESPONSE_CHATS"] == "-123"
+    assert __import__("os").environ["TELEGRAM_FREE_RESPONSE_TOPICS"] == "-100:8"
 
 
 def test_config_bridges_telegram_user_allowlists(monkeypatch, tmp_path):

@@ -294,6 +294,21 @@ def _build_gemini_contents(messages: List[Dict[str, Any]]) -> tuple[List[Dict[st
     system_text_parts: List[str] = []
     contents: List[Dict[str, Any]] = []
     tool_name_by_call_id: Dict[str, str] = {}
+    pending_tool_response_parts: List[Dict[str, Any]] = []
+
+    def flush_pending_tool_responses() -> None:
+        """Emit consecutive OpenAI tool messages as one Gemini user turn.
+
+        Gemini requires the functionResponse parts that answer a model
+        functionCall turn to be grouped in a single immediately following user
+        turn. OpenAI represents each tool result as a separate message, so
+        append-one-turn-per-tool creates a shape Gemini rejects when the model
+        made parallel tool calls.
+        """
+        if not pending_tool_response_parts:
+            return
+        contents.append({"role": "user", "parts": list(pending_tool_response_parts)})
+        pending_tool_response_parts.clear()
 
     for msg in messages:
         if not isinstance(msg, dict):
@@ -301,22 +316,20 @@ def _build_gemini_contents(messages: List[Dict[str, Any]]) -> tuple[List[Dict[st
         role = str(msg.get("role") or "user")
 
         if role == "system":
+            flush_pending_tool_responses()
             system_text_parts.append(_coerce_content_to_text(msg.get("content")))
             continue
 
         if role in {"tool", "function"}:
-            contents.append(
-                {
-                    "role": "user",
-                    "parts": [
-                        _translate_tool_result_to_gemini(
-                            msg,
-                            tool_name_by_call_id=tool_name_by_call_id,
-                        )
-                    ],
-                }
+            pending_tool_response_parts.append(
+                _translate_tool_result_to_gemini(
+                    msg,
+                    tool_name_by_call_id=tool_name_by_call_id,
+                )
             )
             continue
+
+        flush_pending_tool_responses()
 
         gemini_role = "model" if role == "assistant" else "user"
         parts: List[Dict[str, Any]] = []
@@ -337,14 +350,16 @@ def _build_gemini_contents(messages: List[Dict[str, Any]]) -> tuple[List[Dict[st
         if parts:
             contents.append({"role": gemini_role, "parts": parts})
 
+    flush_pending_tool_responses()
+
     # Gemini's generateContent requires strict user/model alternation;
     # consecutive same-role contents are rejected with HTTP 400 "Please ensure
     # that multiturn requests alternate between user and model". The loop above
-    # emits one content per source message, so parallel tool calls (N tool
-    # results become N user functionResponse contents), back-to-back user turns,
-    # or merged assistant turns would each violate that. Merge adjacent
-    # same-role contents by concatenating their parts. For parallel calls this
-    # also produces the grouped multi-functionResponse turn Gemini expects.
+    # emits one content per source message, so back-to-back user turns or merged
+    # assistant turns would each violate that. Merge adjacent same-role contents
+    # by concatenating their parts. The pending tool-response flush above also
+    # preserves the grouped multi-functionResponse turn Gemini expects for
+    # parallel tool calls.
     merged_contents: List[Dict[str, Any]] = []
     for content in contents:
         if merged_contents and merged_contents[-1]["role"] == content["role"]:
