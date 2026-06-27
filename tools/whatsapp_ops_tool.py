@@ -9,6 +9,7 @@ from __future__ import annotations
 import json
 import os
 import urllib.error
+import urllib.parse
 import urllib.request
 from typing import Any, Callable
 
@@ -27,11 +28,14 @@ from tools.whatsapp_ops_store import (
     get_conversation_summary,
     get_media_transcription_status,
     get_thread_context,
+    get_transport_contact_ref,
+    get_transport_group_ref,
     registration_staging_diagnostics,
     get_draft,
     get_latest_approval,
     get_send_allowlist_ids,
     get_valid_approval,
+    hash_text,
     idempotency_used,
     init_db,
     list_contacts,
@@ -100,6 +104,7 @@ def _draft_for_policy(draft: dict[str, Any] | None) -> dict[str, Any] | None:
     except (KeyError, TypeError, json.JSONDecodeError):
         raw_targets = []
     targets = [_normalize_target_for_policy(target) for target in (raw_targets or [])]
+    media = _load_draft_media(draft)
     return {
         "id": draft.get("id"),
         "status": draft.get("status"),
@@ -107,7 +112,7 @@ def _draft_for_policy(draft: dict[str, Any] | None) -> dict[str, Any] | None:
         "message": draft.get("message", ""),
         "message_hash": draft.get("message_hash", ""),
         "idempotency_key": draft.get("idempotency_key", ""),
-        "has_untrusted_media": False,
+        "has_untrusted_media": bool(media.get("_invalid")),
     }
 
 
@@ -178,6 +183,73 @@ def _approval_for_policy(approval: dict[str, Any] | None) -> dict[str, Any] | No
     }
 
 
+_ALLOWED_MEDIA_TYPES = {"image", "audio", "video", "document"}
+_FORBIDDEN_URL_HINTS = {"token", "secret", "sig", "signature", "key", "apikey", "api_key", "auth", "expires"}
+
+
+def _normalize_media_for_draft(media: dict[str, Any] | None) -> tuple[dict[str, Any] | None, str | None]:
+    if media in (None, {}, ""):
+        return None, None
+    if not isinstance(media, dict):
+        return None, "media_invalid"
+    media_type = str(media.get("type") or media.get("kind") or "document").strip().lower()
+    if media_type not in _ALLOWED_MEDIA_TYPES:
+        return None, "media_type_invalid"
+    url = str(media.get("url") or "").strip()
+    content = str(media.get("content") or "").strip()
+    if bool(url) == bool(content):
+        return None, "media_requires_exactly_one_source"
+    if content:
+        # Persistent drafts must not store raw media/base64 blobs. Use a URL to a
+        # trusted/static asset instead, then approve/send through normal gates.
+        return None, "media_content_not_allowed_in_draft"
+    parsed = urllib.parse.urlsplit(url)
+    if parsed.scheme not in {"http", "https"} or not parsed.netloc:
+        return None, "media_url_invalid"
+    if parsed.query or parsed.fragment:
+        return None, "media_url_must_be_token_free"
+    lower_url = url.casefold()
+    if any(hint in lower_url for hint in _FORBIDDEN_URL_HINTS):
+        return None, "media_url_must_be_token_free"
+    filename = str(media.get("filename") or media.get("fileName") or "").strip()[:120]
+    mime = str(media.get("mime") or media.get("mimetype") or "").strip()[:120]
+    normalized: dict[str, Any] = {
+        "type": media_type,
+        "url": url,
+        "as_document": bool(media.get("as_document") or media_type == "document"),
+    }
+    if filename:
+        normalized["filename"] = filename
+    if mime:
+        normalized["mime"] = mime
+    return normalized, None
+
+
+def _load_draft_media(draft: dict[str, Any] | None) -> dict[str, Any]:
+    if not draft:
+        return {}
+    raw = draft.get("media_json")
+    if not raw:
+        return {}
+    try:
+        parsed = json.loads(str(raw))
+    except json.JSONDecodeError:
+        return {"_invalid": True}
+    return parsed if isinstance(parsed, dict) else {"_invalid": True}
+
+
+def _safe_media_summary(media: dict[str, Any] | None) -> dict[str, Any] | None:
+    if not media:
+        return None
+    return {
+        "type": str(media.get("type") or "")[:40],
+        "filename": str(media.get("filename") or "")[:120],
+        "mime": str(media.get("mime") or "")[:120],
+        "as_document": bool(media.get("as_document")),
+        "url_present": bool(media.get("url")),
+    }
+
+
 def _load_json_env(env_name: str, default: Any, *fallback_env_names: str) -> Any:
     for name in (env_name, *fallback_env_names):
         raw = os.environ.get(name)
@@ -206,6 +278,11 @@ def _raw_contact_entries() -> list[dict[str, Any]]:
     return entries
 
 
+def _raw_group_entries() -> list[dict[str, Any]]:
+    groups = _load_json_env("GROUPS_JSON", [], "WHATSAPP_OPS_ALLOWLIST_GROUPS_JSON")
+    return [item for item in groups if isinstance(item, dict)] if isinstance(groups, list) else []
+
+
 def _digits(value: str) -> str:
     return "".join(ch for ch in str(value or "") if ch.isdigit())
 
@@ -232,6 +309,8 @@ def _resolve_raw_contact_ref(query: str) -> str:
         candidates = {
             str(item.get("alias") or "").strip().casefold(),
             str(item.get("display_name") or "").strip().casefold(),
+            str(item.get("contact_id") or "").strip().casefold(),
+            ("contact_" + hash_text(raw_ref)[:16]).casefold(),
             raw_ref.casefold(),
         }
         raw_digits = _digits(raw_ref)
@@ -239,7 +318,63 @@ def _resolve_raw_contact_ref(query: str) -> str:
             if bool(item.get("allow_send", False)):
                 matches.append(raw_ref)
     unique = list(dict.fromkeys(matches))
-    return unique[0] if len(unique) == 1 else ""
+    if len(unique) == 1:
+        return unique[0]
+    return get_transport_contact_ref(needle)
+
+
+def _resolve_raw_group_ref(query: str) -> str:
+    """Resolve a group/list alias or sanitized list id to a raw provider ref for transport only."""
+    needle = str(query or "").strip()
+    if not needle:
+        return ""
+    needle_norm = needle.casefold()
+    matches: list[str] = []
+    for item in _raw_group_entries():
+        kind = str(item.get("kind") or "group").strip().lower()
+        if kind not in {"group", "list"}:
+            continue
+        raw_ref = str(item.get("target_ref") or item.get("ref") or item.get("group_ref") or "").strip()
+        if not raw_ref:
+            continue
+        candidates = {
+            str(item.get("alias") or item.get("name") or "").strip().casefold(),
+            str(item.get("display_name") or "").strip().casefold(),
+            str(item.get("group_id") or item.get("list_id") or "").strip().casefold(),
+            ("list_" + hash_text(raw_ref)[:16]).casefold(),
+            raw_ref.casefold(),
+        }
+        if needle_norm in candidates and bool(item.get("allow_send", False)):
+            matches.append(raw_ref)
+    unique = list(dict.fromkeys(matches))
+    if len(unique) == 1:
+        return unique[0]
+    return get_transport_group_ref(needle)
+
+
+def _provider_targets_for_transport(targets: list[dict[str, Any]]) -> tuple[list[dict[str, Any]], str | None]:
+    provider_targets: list[dict[str, Any]] = []
+    for target in targets:
+        if not isinstance(target, dict):
+            return [], "payload_invalid"
+        target_type = str(target.get("type") or "").strip().lower()
+        if target_type == "contact":
+            raw_ref = _resolve_raw_contact_ref(
+                str(target.get("contact_id") or target.get("alias") or target.get("name") or target.get("ref") or "")
+            )
+            if not raw_ref:
+                return [], "target_ref_unresolved"
+            provider_targets.append({"type": "contact", "contact_id": raw_ref})
+        elif target_type in {"group", "list"}:
+            raw_ref = _resolve_raw_group_ref(
+                str(target.get("group_id") or target.get("list_id") or target.get("alias") or target.get("name") or "")
+            )
+            if not raw_ref:
+                return [], "target_ref_unresolved"
+            provider_targets.append({"type": "group", "group_id": raw_ref})
+        else:
+            return [], "payload_invalid"
+    return provider_targets, None
 
 
 def _extract_group_create_target(draft: dict[str, Any] | None) -> dict[str, Any] | None:
@@ -312,6 +447,15 @@ def _send_telegram_approval_card(approval: dict[str, Any], draft: dict[str, Any]
     approval_id = approval.get("approval_id", "")
     draft_id = approval.get("draft_id") or (draft or {}).get("id", "")
     text_preview = str((draft or {}).get("message", ""))[:700]
+    media_summary = _safe_media_summary(_load_draft_media(draft))
+    media_line = ""
+    if media_summary:
+        media_line = (
+            "\nMídia: "
+            f"{media_summary.get('type') or 'arquivo'}"
+            f" · arquivo={bool(media_summary.get('filename'))}"
+            f" · url_presente={bool(media_summary.get('url_present'))}\n"
+        )
     is_group_create = False
     try:
         targets = json.loads(str((draft or {}).get("targets_json") or "[]"))
@@ -326,7 +470,8 @@ def _send_telegram_approval_card(approval: dict[str, Any], draft: dict[str, Any]
     text = (
         "📲 <b>WhatsApp Ops approval</b>\n\n"
         f"Draft: <code>{draft_id}</code>\n"
-        f"Approval: <code>{approval_id}</code>\n\n"
+        f"Approval: <code>{approval_id}</code>\n"
+        f"{media_line}\n"
         f"<pre>{text_preview}</pre>\n\n"
         f"{approval_note}"
     )
@@ -371,15 +516,23 @@ def wpp_create_draft(
     targets: list[dict[str, Any]],
     message: str,
     send_at: str | None = None,
+    media: dict[str, Any] | None = None,
     send_client: Callable[[dict[str, Any], dict[str, Any]], dict[str, Any]] | None = None,
 ) -> str:
     """Create a local WhatsApp draft. Never sends."""
+    normalized_media, media_error = _normalize_media_for_draft(media)
+    if media_error:
+        return _json({"ok": False, "error": media_error})
     try:
         init_db()
-        draft = create_draft(targets=targets, message=message, send_at=send_at)
+        draft = create_draft(targets=targets, message=message, send_at=send_at, media=normalized_media)
     except Exception as exc:
         return _json({"ok": False, "error": str(exc)[:200]})
-    return _json({"ok": True, **draft})
+    response = {"ok": True, **draft}
+    media_summary = _safe_media_summary(normalized_media)
+    if media_summary:
+        response["media"] = media_summary
+    return _json(response)
 
 
 def wpp_send_approved(
@@ -422,12 +575,18 @@ def wpp_send_approved(
             client = send_via_quepasa
         else:
             client = send_client
+        media = _load_draft_media(draft)
+        provider_targets, target_error = _provider_targets_for_transport(policy_draft["targets"] if policy_draft else [])
+        if target_error:
+            return _json({"ok": False, "draft_id": draft_id, "reasons": [target_error]})
         payload = {
             "draft_id": draft_id,
-            "targets": policy_draft["targets"] if policy_draft else [],
+            "targets": provider_targets,
             "message": draft["message"] if draft else "",
             "idempotency_key": idempotency_key,
         }
+        if media:
+            payload["media"] = media
 
     if idempotency_key and not reserve_outbox_send(draft_id, idempotency_key):
         return _json({"ok": False, "draft_id": draft_id, "reasons": ["idempotency_duplicate"]})
@@ -493,14 +652,18 @@ def wpp_status(draft_id: str) -> str:
             "created_at": approval.get("created_at"),
             "resolved_at": approval.get("resolved_at"),
         }
-    return _json({
+    response = {
         "ok": True,
         "draft_id": draft_id,
         "status": draft.get("status"),
         "send_at": draft.get("send_at"),
         "created_at": draft.get("created_at"),
         "approval": approval_safe,
-    })
+    }
+    media_summary = _safe_media_summary(_load_draft_media(draft))
+    if media_summary:
+        response["media"] = media_summary
+    return _json(response)
 
 
 def wpp_resolve_contact(nome_ou_numero: str) -> str:
