@@ -866,6 +866,168 @@ def get_transport_group_ref(query: str) -> str:
     return str(dict(rows[0]).get("target_ref_enc") or "").strip()
 
 
+def _segment_id_from_name(name: str) -> str:
+    return "segment_" + hash_text(_normalize(name))[:16]
+
+
+def _normalize_contact_ref_for_import(value: str) -> str:
+    raw = str(value or "").strip()
+    if not raw:
+        return ""
+    if "@" in raw:
+        return raw
+    digits = _phone_digits(raw)
+    if len(digits) >= 8:
+        return f"{digits}@s.whatsapp.net"
+    return raw
+
+
+def import_contact_list_local(
+    *,
+    list_name: str,
+    contacts: list[dict[str, Any]],
+    allow_send: bool = False,
+    policy_group: str = "lead",
+    source: str = "manual_import",
+) -> dict[str, Any]:
+    """Import a commercial contact segment into local SQLite.
+
+    Raw refs are retained only for operational transport; the returned summary is
+    sanitized. ``allow_send`` defaults false, so imported prospect lists cannot
+    be sent to until the operator explicitly opts into send allowlisting.
+    """
+    init_db()
+    name = str(list_name or "").strip()
+    if not name:
+        return {"ok": False, "error": "list_name_required"}
+    if not isinstance(contacts, list) or not contacts:
+        return {"ok": False, "error": "contacts_required"}
+    now = utc_now()
+    list_id = _segment_id_from_name(name)
+    imported: list[dict[str, Any]] = []
+    skipped = 0
+    with _connect() as conn:
+        conn.execute(
+            """
+            INSERT INTO lists (id, name, name_norm, allowed, target_ref_enc, metadata_json, created_at, updated_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+            ON CONFLICT(name_norm) DO UPDATE SET
+                name=excluded.name,
+                metadata_json=excluded.metadata_json,
+                updated_at=excluded.updated_at
+            """,
+            (
+                list_id,
+                name,
+                _normalize(name),
+                0,
+                None,
+                json.dumps({"source": source, "kind": "contact_segment"}, ensure_ascii=False, sort_keys=True),
+                now,
+                now,
+            ),
+        )
+    for item in contacts[:500]:
+        if not isinstance(item, dict):
+            skipped += 1
+            continue
+        alias = str(item.get("alias") or item.get("name") or item.get("display_name") or "").strip()
+        raw_ref = _normalize_contact_ref_for_import(str(item.get("target_ref") or item.get("phone") or item.get("phone_e164") or ""))
+        if not alias or not raw_ref:
+            skipped += 1
+            continue
+        contact_id = _contact_id_from_target(raw_ref)
+        display = str(item.get("display_name") or item.get("name") or alias).strip() or alias
+        metadata = {
+            "source": source,
+            "target_ref_hash": hash_text(raw_ref),
+            "segment_id": list_id,
+        }
+        upsert_contact(
+            contact_id=contact_id,
+            display_name=display,
+            phone_e164=raw_ref,
+            aliases=[alias],
+            whitelisted=bool(allow_send),
+            policy_group=policy_group,
+            metadata=metadata,
+        )
+        with _connect() as conn:
+            conn.execute(
+                "INSERT OR IGNORE INTO list_members (list_id, contact_id, created_at) VALUES (?, ?, ?)",
+                (list_id, contact_id, now),
+            )
+        imported.append({"contact_id": contact_id, "display_name": display, "whitelisted": bool(allow_send)})
+    return {
+        "ok": True,
+        "list_id": list_id,
+        "name": name,
+        "imported_count": len(imported),
+        "skipped_count": skipped,
+        "allow_send": bool(allow_send),
+        "contacts": [_safe_contact({"id": c["contact_id"], "display_name": c["display_name"], "phone_e164_enc": "", "whitelisted": c["whitelisted"], "policy_group": policy_group}) for c in imported[:50]],
+    }
+
+
+def list_contact_segments(limit: int = 50) -> list[dict[str, Any]]:
+    init_db()
+    limit = max(1, min(int(limit or 50), 100))
+    with _connect() as conn:
+        rows = conn.execute(
+            """
+            SELECT l.id, l.name, l.allowed, l.metadata_json,
+                   count(m.contact_id) AS member_count,
+                   sum(CASE WHEN c.whitelisted = 1 THEN 1 ELSE 0 END) AS whitelisted_count
+            FROM lists l
+            LEFT JOIN list_members m ON m.list_id = l.id
+            LEFT JOIN contacts c ON c.id = m.contact_id
+            WHERE l.id LIKE 'segment_%' OR json_extract(COALESCE(l.metadata_json, '{}'), '$.kind') = 'contact_segment'
+            GROUP BY l.id
+            ORDER BY l.updated_at DESC
+            LIMIT ?
+            """,
+            (limit,),
+        ).fetchall()
+    return [
+        {
+            "list_id": row["id"],
+            "name": row["name"],
+            "member_count": int(row["member_count"] or 0),
+            "whitelisted_count": int(row["whitelisted_count"] or 0),
+            "bulk_send_allowed": bool(row["allowed"]),
+        }
+        for row in rows
+    ]
+
+
+def list_contact_segment_members(list_ref: str, limit: int = 50) -> dict[str, Any]:
+    init_db()
+    ref = str(list_ref or "").strip()
+    if not ref:
+        return {"ok": False, "error": "list_ref_required"}
+    limit = max(1, min(int(limit or 50), 100))
+    ref_norm = _normalize(ref)
+    with _connect() as conn:
+        segment = conn.execute(
+            "SELECT * FROM lists WHERE id=? OR name_norm=? LIMIT 1",
+            (ref, ref_norm),
+        ).fetchone()
+        if segment is None:
+            return {"ok": False, "error": "list_not_found"}
+        rows = conn.execute(
+            """
+            SELECT c.*
+            FROM list_members m
+            JOIN contacts c ON c.id = m.contact_id
+            WHERE m.list_id=?
+            ORDER BY c.display_name ASC
+            LIMIT ?
+            """,
+            (segment["id"], limit),
+        ).fetchall()
+    return {"ok": True, "list_id": segment["id"], "name": segment["name"], "contacts": [_safe_contact(dict(row)) for row in rows]}
+
+
 # ---------------------------------------------------------------------------
 # Local registration (writes to SQLite directly, not via env/Infisical)
 # ---------------------------------------------------------------------------
