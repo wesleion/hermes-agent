@@ -1354,8 +1354,13 @@ def _sanitize_payload(value: Any) -> Any:
         # Long bare base64 strings (>=32 chars of base64 alphabet with optional padding)
         if re.match(r"^[A-Za-z0-9+/=]{32,}$", cleaned):
             return "<redacted-base64>"
-        cleaned = re.sub(r"(?i)\b[\w.-]+@(?:lid|g\.us|s\.whatsapp\.net)\b", "<redacted-wa-ref>", cleaned)
+        # Text bodies may contain pasted links/data URIs even when the key is not URL-like.
+        # Keep the surrounding text for operator context, but remove fetchable media/link targets.
+        cleaned = re.sub(r"(?i)\bhttps?://[^\s<>\]\)\"']+", "<redacted-url>", cleaned)
+        cleaned = re.sub(r"(?i)\b(?:data|blob):[^\s<>\]\)\"']+", "<redacted-url>", cleaned)
+        cleaned = re.sub(r"(?i)\b[\w.+:-]+@(?:lid|g\.us|s\.whatsapp\.net)\b", "<redacted-wa-ref>", cleaned)
         cleaned = re.sub(r"\+?\d[\d\s().-]{6,}\d", "<redacted-phone>", cleaned)
+        cleaned = re.sub(r"(?i)<redacted-phone>[:\w.+-]*@(?:lid|g\.us|s\.whatsapp\.net)\b", "<redacted-wa-ref>", cleaned)
         return cleaned
     return value
 
