@@ -7,6 +7,7 @@ transport flag and deterministic send guardrails have allowed the send.
 
 from __future__ import annotations
 
+import hashlib
 import json
 import os
 import urllib.error
@@ -28,24 +29,31 @@ def _redact_error(text: str) -> str:
     return redacted[:240]
 
 
-def _normalize_send_url(raw_url: str) -> str:
+def _normalize_endpoint_url(raw_url: str, endpoint: str) -> str:
     raw_url = str(raw_url or "").strip()
-    if not raw_url:
+    endpoint = "/" + str(endpoint or "").strip("/")
+    if not raw_url or endpoint == "/":
         return ""
     parsed = urllib.parse.urlsplit(raw_url)
     if parsed.scheme not in {"http", "https"} or not parsed.netloc:
         return ""
 
     path = parsed.path.rstrip("/")
-    if path in {"", "/send"}:
-        normalized_path = "/send"
-    elif path in {"/swagger/index.html", "/swagger/doc.json", "/swagger"}:
-        normalized_path = "/send"
+    if path in {"", "/swagger/index.html", "/swagger/doc.json", "/swagger"}:
+        normalized_path = endpoint
+    elif path == endpoint or path.endswith(endpoint):
+        normalized_path = path
     else:
-        # Treat unknown non-/send paths as a base path only when they end with a
-        # slash-like directory. This keeps QuePasa direct strict enough for Gate B.
-        normalized_path = path if path.endswith("/send") else f"{path}/send"
+        normalized_path = f"{path}{endpoint}"
     return urllib.parse.urlunsplit((parsed.scheme, parsed.netloc, normalized_path, "", ""))
+
+
+def _normalize_send_url(raw_url: str) -> str:
+    return _normalize_endpoint_url(raw_url, "/send")
+
+
+def _normalize_group_create_url(raw_url: str) -> str:
+    return _normalize_endpoint_url(raw_url, "/groups/create")
 
 
 def _target_chat_id(target: dict[str, Any]) -> str:
@@ -69,6 +77,30 @@ def _safe_success_message(message: Any) -> dict[str, Any]:
         value = message.get(source)
         if value:
             safe[dest] = str(value)[:160]
+    return safe
+
+
+def _hash_ref(value: Any) -> str:
+    raw = str(value or "").strip()
+    return hashlib.sha256(raw.encode("utf-8")).hexdigest()[:16] if raw else ""
+
+
+def _safe_groupinfo(value: Any) -> dict[str, Any]:
+    if not isinstance(value, dict):
+        return {}
+    raw_ref = (
+        value.get("id")
+        or value.get("jid")
+        or value.get("JID")
+        or value.get("group_jid")
+        or value.get("chatId")
+    )
+    safe: dict[str, Any] = {}
+    hashed = _hash_ref(raw_ref)
+    if hashed:
+        safe["group_ref_hash"] = hashed
+    if value.get("Name") or value.get("name") or value.get("title"):
+        safe["name_present"] = True
     return safe
 
 
@@ -122,22 +154,108 @@ def _post_text(send_url: str, api_key: str, chat_id: str, text: str) -> dict[str
     }
 
 
+def _resolve_lid_participant(raw_url: str, api_key: str, participant: str) -> str:
+    """Resolve a QuePasa LID JID to the phone string accepted by /groups/create.
+
+    The returned phone is used only in the provider payload and is never exposed
+    in tool output. Empty string means fail closed.
+    """
+    value = str(participant or "").strip()
+    if not value.endswith("@lid"):
+        return value
+    useridentifier_url = _normalize_endpoint_url(raw_url, "/useridentifier")
+    if not useridentifier_url:
+        return ""
+    url = useridentifier_url + "?" + urllib.parse.urlencode({"lid": value})
+    req = urllib.request.Request(url, headers={"X-QUEPASA-TOKEN": api_key}, method="GET")
+    try:
+        with urllib.request.urlopen(req, timeout=15) as resp:
+            parsed = _parse_json_body(resp.read(4096))
+    except Exception:
+        return ""
+    if parsed.get("success") is not True:
+        return ""
+    phone = str(parsed.get("phone") or "").strip()
+    return phone
+
+
+def _normalize_group_participants(raw_url: str, api_key: str, participants: list[str]) -> list[str] | None:
+    normalized: list[str] = []
+    for participant in participants:
+        resolved = _resolve_lid_participant(raw_url, api_key, str(participant).strip())
+        if not resolved:
+            return None
+        normalized.append(resolved)
+    return normalized
+
+
+def _post_group_create(group_url: str, api_key: str, title: str, participants: list[str]) -> dict[str, Any]:
+    body = json.dumps({"title": title, "participants": participants}, ensure_ascii=False).encode("utf-8")
+    headers = {
+        "Content-Type": "application/json",
+        "X-QUEPASA-TOKEN": api_key,
+    }
+    req = urllib.request.Request(group_url, data=body, headers=headers, method="POST")
+    try:
+        with urllib.request.urlopen(req, timeout=20) as resp:
+            parsed = _parse_json_body(resp.read(8192))
+            status = int(getattr(resp, "status", 200) or 200)
+    except urllib.error.HTTPError as exc:
+        return {
+            "ok": False,
+            "transport": "quepasa_direct_group_create",
+            "error": "http_error",
+            "status": int(exc.code),
+        }
+    except Exception as exc:  # pragma: no cover - defensive against transport stack
+        return {"ok": False, "transport": "quepasa_direct_group_create", "error": _redact_error(str(exc))}
+
+    if parsed.get("success") is not True:
+        return {
+            "ok": False,
+            "transport": "quepasa_direct_group_create",
+            "error": "quepasa_success_false",
+            "status": status,
+            "provider_status": str(parsed.get("status") or "")[:120],
+        }
+
+    return {
+        "ok": True,
+        "transport": "quepasa_direct_group_create",
+        "status": status,
+        "provider_status": str(parsed.get("status") or "")[:120],
+        "participant_count": len(participants),
+        **_safe_groupinfo(parsed.get("groupinfo")),
+    }
+
+
+def _quepasa_base_url(config: dict[str, Any]) -> str:
+    quepasa_raw = (config or {}).get("quepasa")
+    quepasa = quepasa_raw if isinstance(quepasa_raw, dict) else {}
+    return str(
+        quepasa.get("send_url")
+        or quepasa.get("base_url")
+        or os.getenv("WHATSAPP_OPS_QUEPASA_SEND_URL", "")
+        or ""
+    )
+
+
+def _quepasa_api_key() -> str:
+    return os.getenv("WHATSAPP_OPS_QUEPASA_API_KEY", "")
+
+
 def send_via_quepasa(payload: dict[str, Any], config: dict[str, Any]) -> dict[str, Any]:
     quepasa_raw = (config or {}).get("quepasa")
     quepasa = quepasa_raw if isinstance(quepasa_raw, dict) else {}
     if not _truthy(quepasa.get("send_enabled", False)):
         return {"ok": False, "error": "quepasa_send_disabled"}
 
-    raw_url = (
-        quepasa.get("send_url")
-        or quepasa.get("base_url")
-        or os.getenv("WHATSAPP_OPS_QUEPASA_SEND_URL", "")
-    )
+    raw_url = _quepasa_base_url(config)
     send_url = _normalize_send_url(str(raw_url or ""))
     if not send_url:
         return {"ok": False, "error": "quepasa_send_url_missing"}
 
-    api_key = os.getenv("WHATSAPP_OPS_QUEPASA_API_KEY", "")
+    api_key = _quepasa_api_key()
     if not api_key:
         return {"ok": False, "error": "quepasa_api_key_missing"}
 
@@ -159,3 +277,41 @@ def send_via_quepasa(payload: dict[str, Any], config: dict[str, Any]) -> dict[st
     if len(results) == 1:
         return results[0]
     return {"ok": True, "transport": "quepasa_direct", "messages": results}
+
+
+def create_group_via_quepasa(payload: dict[str, Any], config: dict[str, Any]) -> dict[str, Any]:
+    """Create a WhatsApp group via QuePasa POST /groups/create.
+
+    Fail-closed: requires both normal QuePasa sends and an explicit group-create
+    flag. Never returns raw participant refs or raw group JIDs.
+    """
+    quepasa_raw = (config or {}).get("quepasa")
+    quepasa = quepasa_raw if isinstance(quepasa_raw, dict) else {}
+    if not _truthy(quepasa.get("send_enabled", False)):
+        return {"ok": False, "error": "quepasa_send_disabled"}
+    if not _truthy(quepasa.get("group_create_enabled", False)):
+        return {"ok": False, "error": "quepasa_group_create_disabled"}
+
+    raw_url = _quepasa_base_url(config)
+    group_url = _normalize_group_create_url(str(raw_url or ""))
+    if not group_url:
+        return {"ok": False, "error": "quepasa_group_create_url_missing"}
+
+    api_key = _quepasa_api_key()
+    if not api_key:
+        return {"ok": False, "error": "quepasa_api_key_missing"}
+
+    group = (payload or {}).get("group_create") if isinstance(payload, dict) else None
+    group = group if isinstance(group, dict) else {}
+    title = str(group.get("title") or "").strip()
+    participants = group.get("participants") or []
+    if not title or not isinstance(participants, list) or not participants:
+        return {"ok": False, "error": "payload_invalid"}
+    clean_participants = [str(p).strip() for p in participants if str(p).strip()]
+    if len(clean_participants) != len(participants) or not clean_participants:
+        return {"ok": False, "error": "payload_invalid"}
+    provider_participants = _normalize_group_participants(str(raw_url or ""), api_key, clean_participants)
+    if not provider_participants:
+        return {"ok": False, "error": "participant_lid_resolution_failed"}
+
+    return _post_group_create(group_url, api_key, title, provider_participants)
