@@ -116,6 +116,7 @@ def init_db() -> Path:
                 name TEXT NOT NULL,
                 name_norm TEXT NOT NULL UNIQUE,
                 allowed INTEGER NOT NULL DEFAULT 0,
+                target_ref_enc TEXT,
                 metadata_json TEXT,
                 created_at TEXT NOT NULL,
                 updated_at TEXT NOT NULL
@@ -131,6 +132,7 @@ def init_db() -> Path:
                 targets_json TEXT NOT NULL,
                 message TEXT NOT NULL,
                 message_hash TEXT NOT NULL,
+                media_json TEXT,
                 send_at TEXT,
                 status TEXT NOT NULL,
                 idempotency_key TEXT NOT NULL UNIQUE,
@@ -205,6 +207,8 @@ def init_db() -> Path:
             );
             """
         )
+        _ensure_draft_columns(conn)
+        _ensure_list_columns(conn)
         _ensure_registration_staging_columns(conn)
         _backfill_registration_staging_metadata(conn)
     return db_path
@@ -222,6 +226,18 @@ def _ensure_registration_staging_columns(conn: sqlite3.Connection) -> None:
     for name, ddl in additions.items():
         if name not in columns:
             conn.execute(f"ALTER TABLE registration_staging ADD COLUMN {ddl}")
+
+
+def _ensure_draft_columns(conn: sqlite3.Connection) -> None:
+    columns = {row["name"] for row in conn.execute("PRAGMA table_info(drafts)")}
+    if "media_json" not in columns:
+        conn.execute("ALTER TABLE drafts ADD COLUMN media_json TEXT")
+
+
+def _ensure_list_columns(conn: sqlite3.Connection) -> None:
+    columns = {row["name"] for row in conn.execute("PRAGMA table_info(lists)")}
+    if "target_ref_enc" not in columns:
+        conn.execute("ALTER TABLE lists ADD COLUMN target_ref_enc TEXT")
 
 
 
@@ -251,6 +267,8 @@ def mask_phone(value: str | None) -> str:
 
 def _safe_contact_id(contact_id: str) -> str:
     raw = str(contact_id or "")
+    if raw.startswith(("contact_", "synthetic_")):
+        return raw
     if "@" in raw or _phone_digits(raw):
         return "contact_" + hash_text(raw)[:16]
     return raw
@@ -795,6 +813,59 @@ def list_contacts(filter_text: str = "", limit: int = 50) -> list[dict[str, Any]
     return [_safe_contact(dict(row)) for row in rows]
 
 
+def get_transport_contact_ref(query: str) -> str:
+    """Return raw provider ref for an allowlisted contact, for transport only."""
+    init_db()
+    needle = str(query or "").strip()
+    if not needle:
+        return ""
+    needle_norm = _normalize(needle)
+    needle_digits = _phone_digits(needle)
+    with _connect() as conn:
+        rows = conn.execute(
+            """
+            SELECT DISTINCT c.*
+            FROM contacts c
+            LEFT JOIN contact_aliases a ON a.contact_id = c.id
+            WHERE c.whitelisted = 1
+              AND (
+                c.id = ?
+                OR a.alias_norm = ?
+                OR lower(c.display_name) = ?
+                OR (? != '' AND c.phone_e164_hash = ?)
+              )
+            LIMIT 2
+            """,
+            (needle, needle_norm, needle_norm, needle_digits, hash_text(needle_digits) if needle_digits else ""),
+        ).fetchall()
+    if len(rows) != 1:
+        return ""
+    return str(dict(rows[0]).get("phone_e164_enc") or "").strip()
+
+
+def get_transport_group_ref(query: str) -> str:
+    """Return raw provider ref for an allowlisted group/list, for transport only."""
+    init_db()
+    needle = str(query or "").strip()
+    if not needle:
+        return ""
+    needle_norm = _normalize(needle)
+    with _connect() as conn:
+        rows = conn.execute(
+            """
+            SELECT *
+            FROM lists
+            WHERE allowed = 1
+              AND (id = ? OR name_norm = ? OR lower(name) = ?)
+            LIMIT 2
+            """,
+            (needle, needle_norm, needle_norm),
+        ).fetchall()
+    if len(rows) != 1:
+        return ""
+    return str(dict(rows[0]).get("target_ref_enc") or "").strip()
+
+
 # ---------------------------------------------------------------------------
 # Local registration (writes to SQLite directly, not via env/Infisical)
 # ---------------------------------------------------------------------------
@@ -831,6 +902,7 @@ def register_contact_local(
         result = upsert_contact(
             contact_id=contact_id,
             display_name=display,
+            phone_e164=raw_ref,
             aliases=[alias],
             whitelisted=allow_send,
             policy_group=policy_group,
@@ -868,11 +940,12 @@ def register_group_local(
     with _connect() as conn:
         conn.execute(
             """
-            INSERT INTO lists (id, name, name_norm, allowed, metadata_json, created_at, updated_at)
-            VALUES (?, ?, ?, ?, ?, ?, ?)
+            INSERT INTO lists (id, name, name_norm, allowed, target_ref_enc, metadata_json, created_at, updated_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?)
             ON CONFLICT(name_norm) DO UPDATE SET
                 name=excluded.name,
                 allowed=excluded.allowed,
+                target_ref_enc=excluded.target_ref_enc,
                 metadata_json=excluded.metadata_json,
                 updated_at=excluded.updated_at
             """,
@@ -881,6 +954,7 @@ def register_group_local(
                 name,
                 _normalize(name),
                 1 if allow_send else 0,
+                raw_ref,
                 json.dumps(metadata, ensure_ascii=False, sort_keys=True),
                 now,
                 now,
@@ -950,6 +1024,7 @@ def _sync_contact_item(item: dict[str, Any]) -> bool:
     upsert_contact(
         contact_id=_contact_id_from_target(target_ref),
         display_name=display_name,
+        phone_e164=target_ref,
         aliases=[alias],
         whitelisted=bool(item.get("allow_send", False)),
         policy_group=item.get("policy_group"),
@@ -977,11 +1052,12 @@ def _sync_group_item(item: dict[str, Any]) -> bool:
     with _connect() as conn:
         conn.execute(
             """
-            INSERT INTO lists (id, name, name_norm, allowed, metadata_json, created_at, updated_at)
-            VALUES (?, ?, ?, ?, ?, ?, ?)
+            INSERT INTO lists (id, name, name_norm, allowed, target_ref_enc, metadata_json, created_at, updated_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?)
             ON CONFLICT(name_norm) DO UPDATE SET
                 name=excluded.name,
                 allowed=excluded.allowed,
+                target_ref_enc=excluded.target_ref_enc,
                 metadata_json=excluded.metadata_json,
                 updated_at=excluded.updated_at
             """,
@@ -990,6 +1066,7 @@ def _sync_group_item(item: dict[str, Any]) -> bool:
                 alias,
                 _normalize(alias),
                 1 if bool(item.get("allow_send", False)) else 0,
+                target_ref,
                 json.dumps(metadata, ensure_ascii=False, sort_keys=True),
                 now,
                 now,
@@ -1051,6 +1128,7 @@ def create_draft(
     message: str,
     send_at: str | None = None,
     created_by: str | None = None,
+    media: dict[str, Any] | None = None,
 ) -> dict[str, str]:
     init_db()
     if not isinstance(targets, list) or not targets:
@@ -1060,23 +1138,31 @@ def create_draft(
 
     now = utc_now()
     draft_id = "draft_" + uuid.uuid4().hex[:12]
+    media_json = json.dumps(media or {}, ensure_ascii=False, sort_keys=True) if media else None
     message_hash = hash_text(message)
     idempotency_key = hash_text(
-        json.dumps(targets, sort_keys=True, ensure_ascii=False) + "\n" + message + "\n" + str(send_at or "")
+        json.dumps(targets, sort_keys=True, ensure_ascii=False)
+        + "\n"
+        + message
+        + "\n"
+        + str(send_at or "")
+        + "\n"
+        + str(media_json or "")
     )
     with _connect() as conn:
         conn.execute(
             """
             INSERT INTO drafts (
-                id, targets_json, message, message_hash, send_at, status,
+                id, targets_json, message, message_hash, media_json, send_at, status,
                 idempotency_key, created_by, created_at, updated_at
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             (
                 draft_id,
                 json.dumps(targets, ensure_ascii=False, sort_keys=True),
                 message,
                 message_hash,
+                media_json,
                 send_at,
                 "draft",
                 idempotency_key,

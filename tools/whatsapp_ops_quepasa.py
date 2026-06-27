@@ -56,6 +56,10 @@ def _normalize_group_create_url(raw_url: str) -> str:
     return _normalize_endpoint_url(raw_url, "/groups/create")
 
 
+def _normalize_document_send_url(raw_url: str) -> str:
+    return _normalize_endpoint_url(raw_url, "/senddocument")
+
+
 def _target_chat_id(target: dict[str, Any]) -> str:
     if not isinstance(target, dict):
         return ""
@@ -73,10 +77,16 @@ def _safe_success_message(message: Any) -> dict[str, Any]:
     if not isinstance(message, dict):
         return {}
     safe: dict[str, Any] = {}
-    for source, dest in (("id", "message_id"), ("chatId", "chatId"), ("wid", "wid"), ("trackId", "trackId")):
+    for source, dest in (
+        ("id", "message_id_hash"),
+        ("chatId", "chat_ref_hash"),
+        ("wid", "wid_hash"),
+        ("trackId", "track_id_hash"),
+    ):
         value = message.get(source)
-        if value:
-            safe[dest] = str(value)[:160]
+        hashed = _hash_ref(value)
+        if hashed:
+            safe[dest] = hashed
     return safe
 
 
@@ -114,8 +124,43 @@ def _parse_json_body(body: bytes) -> dict[str, Any]:
     return parsed if isinstance(parsed, dict) else {}
 
 
-def _post_text(send_url: str, api_key: str, chat_id: str, text: str) -> dict[str, Any]:
-    body = json.dumps({"chatId": chat_id, "text": text}, ensure_ascii=False).encode("utf-8")
+def _media_payload_fields(media: Any) -> tuple[dict[str, Any] | None, str | None]:
+    if not media:
+        return None, None
+    if not isinstance(media, dict):
+        return None, "media_invalid"
+    url = str(media.get("url") or "").strip()
+    content = str(media.get("content") or "").strip()
+    if bool(url) == bool(content):
+        return None, "media_requires_exactly_one_source"
+    fields: dict[str, Any] = {}
+    if url:
+        parsed = urllib.parse.urlsplit(url)
+        if parsed.scheme not in {"http", "https"} or not parsed.netloc:
+            return None, "media_url_invalid"
+        fields["url"] = url
+    if content:
+        if not content.lower().startswith("data:") or ";base64," not in content[:120].lower():
+            return None, "media_content_invalid"
+        fields["content"] = content
+    filename = str(media.get("filename") or media.get("fileName") or "").strip()
+    if filename:
+        fields["fileName"] = filename[:160]
+    return fields, None
+
+
+def _post_message(send_url: str, api_key: str, chat_id: str, text: str, media: Any = None) -> dict[str, Any]:
+    body_data: dict[str, Any] = {"chatId": chat_id}
+    if text:
+        body_data["text"] = text
+    media_fields, media_error = _media_payload_fields(media)
+    if media_error:
+        return {"ok": False, "transport": "quepasa_direct", "error": media_error}
+    if media_fields:
+        body_data.update(media_fields)
+    if not body_data.get("text") and not media_fields:
+        return {"ok": False, "transport": "quepasa_direct", "error": "payload_invalid"}
+    body = json.dumps(body_data, ensure_ascii=False).encode("utf-8")
     headers = {
         "Content-Type": "application/json",
         "X-QUEPASA-TOKEN": api_key,
@@ -150,8 +195,13 @@ def _post_text(send_url: str, api_key: str, chat_id: str, text: str) -> dict[str
         "transport": "quepasa_direct",
         "status": status,
         "provider_status": str(parsed.get("status") or "")[:120],
+        "media_sent": bool(media_fields),
         **safe_message,
     }
+
+
+def _post_text(send_url: str, api_key: str, chat_id: str, text: str) -> dict[str, Any]:
+    return _post_message(send_url, api_key, chat_id, text)
 
 
 def _resolve_lid_participant(raw_url: str, api_key: str, participant: str) -> str:
@@ -251,7 +301,13 @@ def send_via_quepasa(payload: dict[str, Any], config: dict[str, Any]) -> dict[st
         return {"ok": False, "error": "quepasa_send_disabled"}
 
     raw_url = _quepasa_base_url(config)
-    send_url = _normalize_send_url(str(raw_url or ""))
+    media = (payload or {}).get("media") if isinstance(payload, dict) else None
+    as_document = bool(isinstance(media, dict) and media.get("as_document"))
+    send_url = (
+        _normalize_document_send_url(str(raw_url or ""))
+        if as_document
+        else _normalize_send_url(str(raw_url or ""))
+    )
     if not send_url:
         return {"ok": False, "error": "quepasa_send_url_missing"}
 
@@ -261,7 +317,9 @@ def send_via_quepasa(payload: dict[str, Any], config: dict[str, Any]) -> dict[st
 
     message = str((payload or {}).get("message") or "").strip()
     targets = (payload or {}).get("targets") or []
-    if not message or not isinstance(targets, list) or not targets:
+    if not isinstance(targets, list) or not targets:
+        return {"ok": False, "error": "payload_invalid"}
+    if not message and not media:
         return {"ok": False, "error": "payload_invalid"}
 
     results: list[dict[str, Any]] = []
@@ -269,7 +327,7 @@ def send_via_quepasa(payload: dict[str, Any], config: dict[str, Any]) -> dict[st
         chat_id = _target_chat_id(target)
         if not chat_id:
             return {"ok": False, "error": "target_invalid"}
-        result = _post_text(send_url, api_key, chat_id, message)
+        result = _post_message(send_url, api_key, chat_id, message, media=media)
         results.append(result)
         if not result.get("ok"):
             return result

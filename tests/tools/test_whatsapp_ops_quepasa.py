@@ -112,6 +112,65 @@ def test_quepasa_direct_send_uses_post_send_endpoint_and_token_header(monkeypatc
     assert _request_body(req) == {"chatId": "120363375521827492@g.us", "text": "Mensagem teste"}
 
 
+def test_quepasa_direct_send_media_url_posts_send_without_leaking_response_body(monkeypatch):
+    from tools.whatsapp_ops_quepasa import send_via_quepasa
+
+    monkeypatch.setenv("WHATSAPP_OPS_QUEPASA_API_KEY", "secret-token")
+    captured = {}
+
+    def fake_urlopen(req, timeout):
+        captured["req"] = req
+        captured["timeout"] = timeout
+        return _FakeResponse('{"success":true,"status":"sent","message":{"id":"m1"}}')
+
+    payload = _base_payload(message="Segue imagem")
+    payload["media"] = {"type": "image", "url": "https://static.example.invalid/img.jpg", "filename": "img.jpg"}
+    with patch("urllib.request.urlopen", fake_urlopen):
+        result = send_via_quepasa(
+            payload=payload,
+            config={"quepasa": {"send_enabled": True, "send_url": "https://quepasa.wesleion.com"}},
+        )
+
+    assert result["ok"] is True
+    assert result["media_sent"] is True
+    assert captured["req"].full_url == "https://quepasa.wesleion.com/send"
+    assert _request_body(captured["req"]) == {
+        "chatId": "120363375521827492@g.us",
+        "text": "Segue imagem",
+        "url": "https://static.example.invalid/img.jpg",
+        "fileName": "img.jpg",
+    }
+
+
+def test_quepasa_direct_send_document_uses_senddocument_endpoint(monkeypatch):
+    from tools.whatsapp_ops_quepasa import send_via_quepasa
+
+    monkeypatch.setenv("WHATSAPP_OPS_QUEPASA_API_KEY", "secret-token")
+    captured = {}
+
+    def fake_urlopen(req, timeout):
+        captured["req"] = req
+        return _FakeResponse('{"success":true,"status":"sent","message":{"id":"m1"}}')
+
+    payload = _base_payload(message="Segue documento")
+    payload["media"] = {
+        "type": "document",
+        "url": "https://static.example.invalid/material.pdf",
+        "filename": "material.pdf",
+        "as_document": True,
+    }
+    with patch("urllib.request.urlopen", fake_urlopen):
+        result = send_via_quepasa(
+            payload=payload,
+            config={"quepasa": {"send_enabled": True, "send_url": "https://quepasa.wesleion.com/swagger/doc.json"}},
+        )
+
+    assert result["ok"] is True
+    assert captured["req"].full_url == "https://quepasa.wesleion.com/senddocument"
+    assert _request_body(captured["req"])["fileName"] == "material.pdf"
+
+
+
 def test_quepasa_direct_send_normalizes_swagger_urls_to_send(monkeypatch):
     from tools.whatsapp_ops_quepasa import send_via_quepasa
 

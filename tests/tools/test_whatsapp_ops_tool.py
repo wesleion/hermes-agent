@@ -8,6 +8,22 @@ def _parse(result):
     return json.loads(result)
 
 
+def _allow_raw_contact(monkeypatch, contact_id="c_1", alias="c_1", raw_ref="5511999990000@s.whatsapp.net"):
+    monkeypatch.setenv(
+        "CONTACTS_JSON",
+        json.dumps([
+            {
+                "alias": alias,
+                "contact_id": contact_id,
+                "display_name": alias,
+                "target_ref": raw_ref,
+                "kind": "contact",
+                "allow_send": True,
+            }
+        ]),
+    )
+
+
 def test_wpp_create_draft_tool_creates_draft_without_send(tmp_path):
     from tools.whatsapp_ops_store import init_db
     from tools.whatsapp_ops_tool import wpp_create_draft
@@ -30,6 +46,126 @@ def test_wpp_create_draft_tool_creates_draft_without_send(tmp_path):
     assert result["status"] == "draft"
     assert result["draft_id"]
     send_client.assert_not_called()
+
+
+def test_wpp_create_draft_accepts_token_free_media_url_without_exposing_url(tmp_path, monkeypatch):
+    from tools.whatsapp_ops_store import init_db
+    from tools.whatsapp_ops_tool import wpp_create_draft, wpp_request_approval, wpp_send_approved, wpp_status
+    from tools.whatsapp_ops_store import resolve_approval
+
+    _allow_raw_contact(monkeypatch)
+    config = {
+        "send_enabled": True,
+        "kill_switch": False,
+        "approval": {"required": True, "timeout_minutes": 60},
+        "allowlists": {"contacts": ["c_1"], "groups": []},
+        "quepasa": {"send_enabled": True},
+    }
+    send_client = Mock(return_value={"ok": True, "transport": "mock", "media_sent": True})
+    token = set_hermes_home_override(tmp_path)
+    try:
+        init_db()
+        created = _parse(
+            wpp_create_draft(
+                targets=[{"type": "contact", "contact_id": "c_1"}],
+                message="Segue o material combinado.",
+                media={
+                    "type": "document",
+                    "url": "https://static.example.invalid/material.pdf",
+                    "filename": "material.pdf",
+                    "mime": "application/pdf",
+                },
+            )
+        )
+        approval = _parse(wpp_request_approval(created["draft_id"]))
+        resolve_approval(approval["approval_id"], "approved", approver_ref="test:approver")
+        sent = _parse(wpp_send_approved(created["draft_id"], config=config, send_client=send_client))
+        status = _parse(wpp_status(created["draft_id"]))
+    finally:
+        reset_hermes_home_override(token)
+
+    serialized_public = json.dumps([created, approval, sent, status], ensure_ascii=False)
+    assert created["ok"] is True
+    assert created["media"] == {
+        "type": "document",
+        "filename": "material.pdf",
+        "mime": "application/pdf",
+        "as_document": True,
+        "url_present": True,
+    }
+    assert "https://static.example.invalid/material.pdf" not in serialized_public
+    assert sent["ok"] is True
+    payload = send_client.call_args.args[0]
+    assert payload["media"]["url"] == "https://static.example.invalid/material.pdf"
+    assert payload["media"]["as_document"] is True
+    assert status["media"]["url_present"] is True
+
+
+def test_wpp_send_approved_resolves_local_registered_contact_for_transport_only(tmp_path):
+    from tools.whatsapp_ops_store import create_approval, create_draft, init_db, register_contact_local, resolve_approval
+    from tools.whatsapp_ops_tool import wpp_send_approved
+
+    send_client = Mock(return_value={"ok": True, "transport": "mock"})
+    config = {
+        "send_enabled": True,
+        "kill_switch": False,
+        "approval": {"required": True, "timeout_minutes": 60},
+        "allowlists": {"contacts": [], "groups": []},
+        "quepasa": {"send_enabled": True},
+    }
+    token = set_hermes_home_override(tmp_path)
+    try:
+        init_db()
+        contact = register_contact_local(
+            alias="Lead Local",
+            raw_ref="551188887777@s.whatsapp.net",
+            allow_send=True,
+        )
+        draft = create_draft(
+            targets=[{"type": "contact", "contact_id": contact["contact_id"]}],
+            message="Mensagem controlada para contato local",
+        )
+        approval = create_approval(draft["draft_id"], timeout_minutes=60)
+        resolve_approval(approval["approval_id"], "approved", approver_ref="test:approver")
+        result = _parse(wpp_send_approved(draft["draft_id"], config=config, send_client=send_client))
+    finally:
+        reset_hermes_home_override(token)
+
+    assert result["ok"] is True
+    assert send_client.call_args.args[0]["targets"] == [
+        {"type": "contact", "contact_id": "551188887777@s.whatsapp.net"}
+    ]
+    assert "551188887777" not in json.dumps(result, ensure_ascii=False)
+
+
+
+def test_wpp_create_draft_rejects_persistent_media_blobs_and_token_urls(tmp_path):
+    from tools.whatsapp_ops_store import init_db
+    from tools.whatsapp_ops_tool import wpp_create_draft
+
+    token = set_hermes_home_override(tmp_path)
+    try:
+        init_db()
+        data_url = _parse(
+            wpp_create_draft(
+                targets=[{"type": "contact", "contact_id": "c_1"}],
+                message="blob não pode persistir",
+                media={"type": "image", "content": "data:image/png;base64,AAAA"},
+            )
+        )
+        token_url = _parse(
+            wpp_create_draft(
+                targets=[{"type": "contact", "contact_id": "c_1"}],
+                message="url com token não pode persistir",
+                media={"type": "document", "url": "https://static.example.invalid/a.pdf?token=secret"},
+            )
+        )
+    finally:
+        reset_hermes_home_override(token)
+
+    assert data_url == {"ok": False, "error": "media_content_not_allowed_in_draft"}
+    assert token_url == {"ok": False, "error": "media_url_must_be_token_free"}
+
 
 
 def test_wpp_send_approved_rejects_with_send_enabled_false_and_does_not_call_http(tmp_path):
@@ -105,10 +241,11 @@ def test_wpp_send_approved_rejects_without_approval_token(tmp_path):
     send_client.assert_not_called()
 
 
-def test_wpp_send_approved_uses_profile_config_when_no_explicit_config(tmp_path):
+def test_wpp_send_approved_uses_profile_config_when_no_explicit_config(tmp_path, monkeypatch):
     from tools.whatsapp_ops_store import create_approval, create_draft, init_db, resolve_approval
     from tools.whatsapp_ops_tool import wpp_request_approval, wpp_resolve_approval, wpp_send_approved, wpp_status
 
+    _allow_raw_contact(monkeypatch)
     send_client = Mock(return_value={"ok": True, "transport": "mock"})
     (tmp_path / "config.yaml").write_text(
         "whatsapp_ops:\n"
@@ -144,10 +281,11 @@ def test_wpp_send_approved_uses_profile_config_when_no_explicit_config(tmp_path)
     send_client.assert_called_once()
 
 
-def test_wpp_send_approved_records_success_for_idempotency(tmp_path):
+def test_wpp_send_approved_records_success_for_idempotency(tmp_path, monkeypatch):
     from tools.whatsapp_ops_store import create_approval, create_draft, init_db, resolve_approval
     from tools.whatsapp_ops_tool import wpp_request_approval, wpp_resolve_approval, wpp_send_approved, wpp_status
 
+    _allow_raw_contact(monkeypatch)
     send_client = Mock(return_value={"ok": True, "transport": "mock"})
     config = {
         "send_enabled": True,
@@ -189,10 +327,11 @@ def test_wpp_send_approved_records_success_for_idempotency(tmp_path):
     send_client.assert_called_once()
 
 
-def test_wpp_send_approved_wrong_token_does_not_consume_idempotency(tmp_path):
+def test_wpp_send_approved_wrong_token_does_not_consume_idempotency(tmp_path, monkeypatch):
     from tools.whatsapp_ops_store import create_approval, create_draft, init_db, resolve_approval
     from tools.whatsapp_ops_tool import wpp_request_approval, wpp_resolve_approval, wpp_send_approved, wpp_status
 
+    _allow_raw_contact(monkeypatch)
     send_client = Mock(return_value={"ok": True, "transport": "mock"})
     config = {
         "send_enabled": True,
@@ -235,10 +374,11 @@ def test_wpp_send_approved_wrong_token_does_not_consume_idempotency(tmp_path):
     send_client.assert_called_once()
 
 
-def test_wpp_send_approved_marks_draft_failed_when_transport_fails(tmp_path):
+def test_wpp_send_approved_marks_draft_failed_when_transport_fails(tmp_path, monkeypatch):
     from tools.whatsapp_ops_store import create_approval, create_draft, init_db, resolve_approval
     from tools.whatsapp_ops_tool import wpp_request_approval, wpp_resolve_approval, wpp_send_approved, wpp_status
 
+    _allow_raw_contact(monkeypatch)
     send_client = Mock(return_value={"ok": False, "error": "http_error", "status": 400})
     config = {
         "send_enabled": True,
@@ -379,6 +519,7 @@ def test_wpp_resolve_approval_approve_then_send_separately(tmp_path, monkeypatch
     from tools.whatsapp_ops_store import create_approval, create_draft, init_db, resolve_approval
     from tools.whatsapp_ops_tool import wpp_request_approval, wpp_resolve_approval, wpp_send_approved, wpp_status
 
+    _allow_raw_contact(monkeypatch)
     send_client = Mock(return_value={"ok": True, "transport": "mock"})
     config = {
         "send_enabled": True,
