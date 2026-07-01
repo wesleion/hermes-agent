@@ -1506,6 +1506,28 @@ class CLICommandsMixin:
         else:  # pragma: no cover - defensive (no live input loop)
             print("  /learn needs an active chat session to run.")
 
+    def _handle_missao_command(self, cmd: str):
+        """Handle /missao — start a Mission Intake Loop.
+
+        Transforms a raw request into a self-contained mission-intake prompt
+        that the agent processes as a normal turn.
+        """
+        from agent.mission_intake_prompt import build_mission_intake_prompt
+
+        parts = cmd.strip().split(None, 1)
+        user_request = parts[1].strip() if len(parts) > 1 else ""
+        ack = (
+            "🎯 Starting Mission Intake from what you described..."
+            if user_request
+            else "🎯 Starting open-ended Mission Intake..."
+        )
+        print(f"\n{ack}")
+        msg = build_mission_intake_prompt(user_request)
+        if hasattr(self, "_pending_input"):
+            self._pending_input.put(msg)
+        else:
+            print("  /missao needs an active chat session to run.")
+
     def _handle_memory_command(self, cmd: str):
         """Handle /memory slash command — pending review + approval-gate toggle."""
         from hermes_cli.write_approval_commands import handle_pending_subcommand

@@ -2419,9 +2419,9 @@ class TelegramAdapter(BasePlatformAdapter):
                 )
                 from hermes_cli.commands import telegram_menu_commands, telegram_menu_max_commands
                 # Telegram allows up to 100 commands but has an undocumented
-                # payload size limit (~4KB total).  Hermes defaults to 60 to
-                # keep built-ins plus common skill commands visible while
-                # staying under the threshold; users can tune the cap via
+                # payload size limit (~4KB total). Hermes defaults to the Bot
+                # API cap so user-installed skill commands remain visible as
+                # the built-in command surface grows; users can tune the cap via
                 # platforms.telegram.extra.command_menu.
                 max_commands = telegram_menu_max_commands()
                 menu_commands, hidden_count = telegram_menu_commands(max_commands=max_commands)
