@@ -62,6 +62,8 @@ def test_api_key_providers_route_to_keys_oauth_to_accounts():
     # api_key → keys
     assert by["kilocode"].tab == "keys"
     assert by["openai-api"].tab == "keys"
+    # account / sign-in flows → accounts
+    assert by["google-gemini-cli"].tab == "accounts"
     assert by["copilot-acp"].tab == "accounts"
 
 
