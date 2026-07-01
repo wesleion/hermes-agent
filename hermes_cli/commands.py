@@ -191,6 +191,8 @@ COMMAND_REGISTRY: list[CommandDef] = [
                "Tools & Skills", cli_only=True, aliases=("generate-pet",), args_hint="[description]"),
     CommandDef("learn", "Learn a reusable skill from anything you describe (dirs, URLs, this chat, notes)",
                "Tools & Skills", args_hint="<what to learn from>"),
+    CommandDef("missao", "Transform a request into an executable Mission Contract with clarify and gates",
+               "Tools & Skills", args_hint="[what to accomplish]"),
     CommandDef("cron", "Manage scheduled tasks", "Tools & Skills",
                cli_only=True, args_hint="[subcommand]",
                subcommands=("list", "add", "create", "edit", "pause", "resume", "run", "remove")),
@@ -543,11 +545,11 @@ def telegram_bot_commands() -> list[tuple[str, str]]:
     return result
 
 
-# Telegram allows up to 100 BotCommands. Hermes ships ~50 built-in commands;
-# a 60-slot default keeps every built-in plus common skill commands visible in
-# the `/` menu while staying comfortably under Telegram's ~4KB payload limit.
-# Users can tune this via platforms.telegram.extra.command_menu.max_commands.
-_DEFAULT_TELEGRAM_MENU_MAX_COMMANDS = 60
+# Telegram allows up to 100 BotCommands. Use the full Bot API cap by default
+# so user-installed skill commands remain visible as Hermes' built-in command
+# surface grows. Users can tune this via
+# platforms.telegram.extra.command_menu.max_commands.
+_DEFAULT_TELEGRAM_MENU_MAX_COMMANDS = 100
 _TELEGRAM_BOT_API_MAX_COMMANDS = 100
 _TELEGRAM_PRIORITY_MODES = {"prepend", "append", "replace"}
 
@@ -895,11 +897,13 @@ def telegram_menu_commands(max_commands: int = 100) -> tuple[list[tuple[str, str
     """Return Telegram menu commands capped to the Bot API limit.
 
     Priority order (higher priority = never bumped by overflow):
-      1. Core CommandDef commands (always included)
-      2. Plugin slash commands (take precedence over skills)
-      3. Built-in skill commands (fill remaining slots, alphabetical)
+      1. Commands named in ``platforms.telegram.extra.command_menu.priority``
+      2. Default high-value built-in commands
+      3. Remaining core/plugin/skill commands in discovery order
 
-    Skills are the only tier that gets trimmed when the cap is hit.
+    Skills are collected before the final cap is applied so a configured
+    priority such as ``prompt_up`` can keep an installed skill visible even on
+    profiles whose built-in command list already exceeds the menu cap.
     User-installed hub skills are excluded — accessible via /skills.
     Skills disabled for the ``"telegram"`` platform (via ``hermes skills
     config``) are excluded from the menu entirely.
@@ -908,22 +912,22 @@ def telegram_menu_commands(max_commands: int = 100) -> tuple[list[tuple[str, str
         (menu_commands, hidden_count) where hidden_count is the number of
         commands omitted due to the cap.
     """
-    core_commands = _prioritize_telegram_menu_commands(list(telegram_bot_commands()))
+    core_commands = list(telegram_bot_commands())
     reserved_names = {n for n, _ in core_commands}
-    all_commands = list(core_commands)
-    hidden_core_count = max(0, len(all_commands) - max_commands)
-
-    remaining_slots = max(0, max_commands - len(all_commands))
-    entries, hidden_count = _collect_gateway_skill_entries(
+    entries, collected_hidden_count = _collect_gateway_skill_entries(
         platform="telegram",
-        max_slots=remaining_slots,
+        max_slots=max_commands,
         reserved_names=reserved_names,
         desc_limit=40,
         sanitize_name=_sanitize_telegram_name,
     )
+
     # Drop the cmd_key — Telegram only needs (name, desc) pairs.
+    all_commands = list(core_commands)
     all_commands.extend((n, d) for n, d, _k in entries)
-    return all_commands[:max_commands], hidden_count + hidden_core_count
+    prioritized = _prioritize_telegram_menu_commands(all_commands)
+    hidden_count = collected_hidden_count + max(0, len(prioritized) - max_commands)
+    return prioritized[:max_commands], hidden_count
 
 
 def discord_skill_commands(

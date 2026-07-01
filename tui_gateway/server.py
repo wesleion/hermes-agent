@@ -11115,6 +11115,7 @@ _PENDING_INPUT_COMMANDS: frozenset[str] = frozenset(
         "moa",
         "undo",
         "learn",
+        "missao",
     }
 )
 
@@ -11387,6 +11388,24 @@ def _(rid, params: dict) -> dict:
         from agent.learn_prompt import build_learn_prompt
 
         return _ok(rid, {"type": "send", "message": build_learn_prompt(arg)})
+    if name == "missao":
+        # Mission Intake mirrors the CLI/gateway fall-through pattern: turn the
+        # user's raw request into a normal agent message so the live agent can
+        # clarify, draft a contract, execute after gates, and validate.
+        from agent.mission_intake_prompt import build_mission_intake_prompt
+
+        return _ok(
+            rid,
+            {
+                "type": "send",
+                "notice": (
+                    "🎯 Starting Mission Intake from what you described..."
+                    if arg.strip()
+                    else "🎯 Starting open-ended Mission Intake..."
+                ),
+                "message": build_mission_intake_prompt(arg, source="tui"),
+            },
+        )
     if name == "moa":
         # /moa is one-shot sugar only: run a single prompt through the default
         # MoA preset, then restore the prior model. To *switch* to a MoA preset

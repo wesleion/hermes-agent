@@ -1155,6 +1155,43 @@ class TestTelegramMenuCommands:
         ):
             assert name in names
 
+    def test_configured_priority_prepends_skill_commands(self, tmp_path, monkeypatch):
+        """Configured Telegram priorities can keep installed skill commands visible."""
+        from unittest.mock import patch
+
+        fake_skills_dir = tmp_path / "skills"
+        skill_dir = fake_skills_dir / "agents" / "prompt-up"
+        skill_dir.mkdir(parents=True, exist_ok=True)
+        skill_md = skill_dir / "SKILL.md"
+        skill_md.write_text("---\nname: prompt-up\ndescription: Improve prompts\n---\n")
+        (tmp_path / "config.yaml").write_text(
+            "platforms:\n"
+            "  telegram:\n"
+            "    extra:\n"
+            "      command_menu:\n"
+            "        priority_mode: prepend\n"
+            "        priority:\n"
+            "          - prompt_up\n"
+        )
+        monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+
+        fake_cmds = {
+            "/prompt-up": {
+                "name": "prompt-up",
+                "description": "Improve prompts",
+                "skill_md_path": str(skill_md),
+                "skill_dir": str(skill_dir),
+            }
+        }
+        with patch("agent.skill_commands.get_skill_commands", return_value=fake_cmds), \
+             patch("tools.skills_tool.SKILLS_DIR", fake_skills_dir), \
+             patch("agent.skill_utils.get_external_skills_dirs", return_value=[]):
+            menu, _hidden = telegram_menu_commands(max_commands=30)
+
+        names = [name for name, _desc in menu]
+        assert names[0] == "prompt_up"
+        assert "help" in names[1:]
+
     def test_configured_priority_prepends_plugin_commands(self, tmp_path, monkeypatch):
         """Configured Telegram priorities keep local/plugin commands visible."""
         from unittest.mock import patch
@@ -1245,7 +1282,7 @@ class TestTelegramMenuCommands:
     def test_telegram_menu_max_commands_uses_config_with_safe_bounds(self, tmp_path, monkeypatch):
         monkeypatch.setenv("HERMES_HOME", str(tmp_path))
 
-        assert telegram_menu_max_commands() == 60
+        assert telegram_menu_max_commands() == 100
 
         (tmp_path / "config.yaml").write_text(
             "platforms:\n"
@@ -1281,7 +1318,7 @@ class TestTelegramMenuCommands:
             "      command_menu:\n"
             "        max_commands: nope\n"
         )
-        assert telegram_menu_max_commands() == 60
+        assert telegram_menu_max_commands() == 100
 
     def test_telegram_menu_ignores_undocumented_command_menu_paths(self, tmp_path, monkeypatch):
         monkeypatch.setenv("HERMES_HOME", str(tmp_path))
@@ -1296,7 +1333,7 @@ class TestTelegramMenuCommands:
             "        max_commands: 9\n"
         )
 
-        assert telegram_menu_max_commands() == 60
+        assert telegram_menu_max_commands() == 100
 
     def test_includes_plugin_commands_via_lazy_discovery(self, tmp_path, monkeypatch):
         """Telegram menu generation should discover plugin slash commands on first access."""

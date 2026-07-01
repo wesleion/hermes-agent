@@ -2067,6 +2067,32 @@ def _skill_slug_from_frontmatter(skill_md: Path) -> tuple[str | None, str | None
     return slug, declared_name
 
 
+def _resolve_skill_command_after_optional_rescan(command_name: str) -> tuple[str | None, dict]:
+    """Resolve a skill slash command, rescanning once if the live cache is stale.
+
+    Gateway processes are long-lived and ``agent.skill_commands`` caches the
+    scanned ``~/.hermes/skills`` command map. If an operator installs a skill
+    while the gateway is already running, a freshly typed ``/skill-name`` should
+    work without requiring a restart or manual ``/reload-skills`` first.
+    """
+    from agent.skill_commands import (
+        get_skill_commands,
+        resolve_skill_command_key,
+        scan_skill_commands,
+    )
+
+    skill_cmds = get_skill_commands()
+    cmd_key = resolve_skill_command_key(command_name)
+    if cmd_key is not None:
+        return cmd_key, skill_cmds
+
+    # The first lookup can miss if the process cached the skill list before a
+    # new SKILL.md was copied in. Force one rescan before declaring it unknown.
+    skill_cmds = scan_skill_commands()
+    cmd_key = resolve_skill_command_key(command_name)
+    return cmd_key, skill_cmds
+
+
 def _check_unavailable_skill(command_name: str) -> str | None:
     """Check if a command matches a known-but-inactive skill.
 
@@ -8959,6 +8985,34 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             except Exception:
                 return "Could not start /learn — please try again."
 
+        if canonical == "missao":
+            # Mission Intake: rewrite the turn to a self-contained mission-intake
+            # prompt and fall through to normal agent processing. The live agent
+            # classifies the request, uses clarify for missing fields, builds a
+            # Mission Contract, routes to execution mode, validates, and reports
+            # evidence. Mirrors the /learn fall-through pattern.
+            from agent.mission_intake_prompt import build_mission_intake_prompt
+
+            _missao_req = event.get_command_args().strip()
+            _source_name = source.platform.value if source.platform else ""
+            _ack = (
+                "🎯 Starting Mission Intake from what you described…"
+                if _missao_req
+                else "🎯 Starting open-ended Mission Intake…"
+            )
+            try:
+                adapter = self.adapters.get(source.platform)
+                if adapter:
+                    _ack_meta = self._thread_metadata_for_source(source)
+                    await adapter.send(str(source.chat_id), _ack, metadata=_ack_meta)
+            except Exception:
+                logger.debug("missao ack send failed", exc_info=True)
+            try:
+                event.text = build_mission_intake_prompt(_missao_req, source=_source_name)
+                # fall through to agent processing
+            except Exception:
+                return "Could not start /missao — please try again."
+
         if canonical == "fast":
             return await self._handle_fast_command(event)
 
@@ -9272,13 +9326,8 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
 
         if command and not locals().get("_bundle_handled", False):
             try:
-                from agent.skill_commands import (
-                    get_skill_commands,
-                    build_skill_invocation_message,
-                    resolve_skill_command_key,
-                )
-                skill_cmds = get_skill_commands()
-                cmd_key = resolve_skill_command_key(command)
+                from agent.skill_commands import build_skill_invocation_message
+                cmd_key, skill_cmds = _resolve_skill_command_after_optional_rescan(command)
                 if cmd_key is not None:
                     # Check per-platform disabled status before executing.
                     # get_skill_commands() only applies the *global* disabled
