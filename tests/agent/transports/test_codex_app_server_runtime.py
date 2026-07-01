@@ -85,6 +85,7 @@ class TestMaybeApplyCodexAppServerRuntime:
             "openrouter",
             "xai",
             "qwen-oauth",
+            "google-gemini-cli",
             "opencode-zen",
             "bedrock",
             "",
