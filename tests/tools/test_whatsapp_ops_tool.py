@@ -1940,6 +1940,37 @@ def test_wpp_thread_context_tool_returns_operator_summary_without_raw_refs(tmp_p
     assert "ctx-tool-001" not in serialized
 
 
+def test_wpp_resolve_conversation_target_tool_is_read_only_and_sanitized(tmp_path):
+    from tools.whatsapp_ops_store import init_db, record_inbound_event, register_group_local
+    from tools.whatsapp_ops_tool import wpp_resolve_conversation_target
+
+    token = set_hermes_home_override(tmp_path)
+    try:
+        init_db()
+        raw_group = "120363375521827492@g.us"
+        register_group_local(alias="H-Ops", raw_ref=raw_group, allow_send=False)
+        record_inbound_event(
+            source_event_id="resolve-tool-001",
+            contact_ref="172185238905034@lid",
+            thread_ref=raw_group,
+            payload={"id": "resolve-tool-001", "type": "text", "text": "Olá H-Ops"},
+        )
+        result = _parse(wpp_resolve_conversation_target(query="H-Ops"))
+    finally:
+        reset_hermes_home_override(token)
+
+    serialized = json.dumps(result, ensure_ascii=False)
+    assert result["ok"] is True
+    assert result["target_kind"] == "group"
+    assert result["target_label"] == "H-Ops"
+    assert result["thread_filter_set"] is True
+    assert "_thread_ref" not in result
+    assert "@g.us" not in serialized
+    assert "@lid" not in serialized
+    assert "120363375521827492" not in serialized
+    assert "172185238905034" not in serialized
+
+
 def test_whatsapp_ops_toolset_is_registered():
     import tools.whatsapp_ops_tool  # noqa: F401
     from tools.registry import registry
@@ -1957,6 +1988,7 @@ def test_whatsapp_ops_toolset_is_registered():
         "wpp_cancel",
         "wpp_status",
         "wpp_inbound_lookup",
+        "wpp_resolve_conversation_target",
         "wpp_thread_context",
         "wpp_actionable_queue",
         "wpp_ingest_inbound_event",
