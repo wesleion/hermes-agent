@@ -1,5 +1,6 @@
 import json
 import sqlite3
+from datetime import datetime, timedelta, timezone
 
 from hermes_constants import set_hermes_home_override, reset_hermes_home_override
 
@@ -203,7 +204,7 @@ def test_record_and_lookup_inbound_event_returns_sanitized_payload(tmp_path):
     assert "Olá inbound real" in serialized
     assert "evt-real-123" not in serialized
     assert "172185238905034@lid" not in serialized
-    assert "+551****0000" not in serialized
+    assert "+551****0000" in serialized
     assert "secret-token" not in serialized
     assert "secret-key" not in serialized
 
@@ -390,6 +391,275 @@ def test_cockpit_overview_returns_sanitized_admin_queue(tmp_path):
     assert "172185238905034" not in serialized
     assert "120363375521827492" not in serialized
     assert "evt-real-123" not in serialized
+
+
+def test_staging_lid_and_group_refs_never_generate_fake_phone_mask(tmp_path):
+    from tools.whatsapp_ops_store import init_db, peek_staging, stage_raw_ref
+
+    token = set_hermes_home_override(tmp_path)
+    try:
+        init_db()
+        stage_raw_ref(
+            contact_ref="172185238905034@lid",
+            thread_ref="120363375521827492@g.us",
+            display_name="Weslei W.",
+            kind="contact",
+            safe_hint={
+                "participant_name": "Weslei W.",
+                "source_group_name": "H-Ops",
+                "last_message_type": "text",
+                # Legacy unsafe fields from old rows must be ignored when no
+                # trusted phone-bearing source accompanies them.
+                "phone_masked": "+17***5034",
+                "last4": "5034",
+            },
+        )
+        stage_raw_ref(
+            contact_ref="172185238905034@lid",
+            thread_ref="120363375521827492@g.us",
+            display_name="H-Ops",
+            kind="group",
+            safe_hint={"group_name": "H-Ops", "last_message_type": "text"},
+        )
+        staged = peek_staging()
+    finally:
+        reset_hermes_home_override(token)
+
+    serialized = json.dumps(staged, ensure_ascii=False)
+    contact = next(item for item in staged if item["kind"] == "contact")
+    group = next(item for item in staged if item["kind"] == "group")
+    assert contact["display_name"] == "Weslei W."
+    assert contact["phone_status"] == "unresolved"
+    assert contact["identity_note"] == "número não resolvido"
+    assert "phone_masked" not in contact
+    assert "last4" not in contact
+    assert "phone_masked" not in group
+    assert "last4" not in group
+    assert "+17***5034" not in serialized
+    assert "172185238905034" not in serialized
+    assert "120363375521827492" not in serialized
+    assert "@lid" not in serialized
+    assert "@g.us" not in serialized
+
+
+def test_staging_lid_contact_can_show_safe_mask_from_matching_local_context(tmp_path):
+    from tools.whatsapp_ops_store import init_db, peek_staging, record_inbound_event, stage_raw_ref
+
+    token = set_hermes_home_override(tmp_path)
+    try:
+        init_db()
+        record_inbound_event(
+            source_event_id="ctx-phone-001",
+            contact_ref="172185238905034@lid",
+            thread_ref="120363375521827492@g.us",
+            payload={
+                "id": "ctx-phone-001",
+                "chat": {"id": "120363375521827492@g.us", "title": "H-Ops"},
+                "participant": {"id": "172185238905034@lid", "phone": "553199993111", "title": "Weslei W."},
+                "text": "Teste",
+                "type": "text",
+            },
+        )
+        stage_raw_ref(
+            contact_ref="172185238905034@lid",
+            thread_ref="120363375521827492@g.us",
+            display_name="Weslei W.",
+            kind="contact",
+            safe_hint={"participant_name": "Weslei W.", "source_group_name": "H-Ops", "last_message_type": "text"},
+        )
+        staged = peek_staging()
+    finally:
+        reset_hermes_home_override(token)
+
+    contact = next(item for item in staged if item["kind"] == "contact")
+    serialized = json.dumps(staged, ensure_ascii=False)
+    assert contact["phone_masked"] == "+55***3111"
+    assert contact["last4"] == "3111"
+    assert "phone_status" not in contact
+    assert "553199993111" not in serialized
+    assert "172185238905034" not in serialized
+    assert "120363375521827492" not in serialized
+    assert "@lid" not in serialized
+    assert "@g.us" not in serialized
+
+
+def test_staging_phone_bearing_refs_still_mask_contacts(tmp_path):
+    from tools.whatsapp_ops_store import init_db, peek_staging, stage_raw_ref
+
+    token = set_hermes_home_override(tmp_path)
+    try:
+        init_db()
+        stage_raw_ref(
+            contact_ref="553199998765@s.whatsapp.net",
+            thread_ref="120363375521827492@g.us",
+            display_name="João Cliente",
+            kind="contact",
+            safe_hint={"participant_name": "João Cliente", "last_message_type": "text"},
+        )
+        staged = peek_staging()
+    finally:
+        reset_hermes_home_override(token)
+
+    contact = next(item for item in staged if item["kind"] == "contact")
+    serialized = json.dumps(staged, ensure_ascii=False)
+    assert contact["phone_masked"] == "+55***8765"
+    assert contact["last4"] == "8765"
+    assert "phone_status" not in contact
+    assert "553199998765" not in serialized
+    assert "@s.whatsapp.net" not in serialized
+
+
+def test_actionable_queue_combines_staging_approvals_and_context_without_raw_refs(tmp_path):
+    from tools.whatsapp_ops_store import (
+        create_approval,
+        create_draft,
+        get_actionable_queue,
+        ignore_staging_item,
+        init_db,
+        peek_staging,
+        record_inbound_event,
+        registration_staging_diagnostics,
+        stage_raw_ref,
+    )
+
+    token = set_hermes_home_override(tmp_path)
+    try:
+        init_db()
+        draft = create_draft(
+            targets=[{"type": "contact", "contact_id": "contact_safe", "display_name": "Safe"}],
+            message="Mensagem que não deve aparecer na fila",
+        )
+        approval = create_approval(draft["draft_id"])
+        inbound = record_inbound_event(
+            source_event_id="queue-real-001",
+            contact_ref="551199998888@s.whatsapp.net",
+            thread_ref="120363375521827492@g.us",
+            payload={
+                "id": "queue-real-001",
+                "type": "audio",
+                "text": "Contato mandou áudio com telefone 551199998888 e https://cdn.example.invalid/a.ogg?token=secret",
+                "message": {"audioMessage": {"mimetype": "audio/ogg", "seconds": 6}},
+            },
+        )
+        stage_raw_ref(
+            contact_ref="551199998888@s.whatsapp.net",
+            thread_ref="120363375521827492@g.us",
+            display_name="Lead Teste",
+            kind="contact",
+            safe_hint={"display_name": "Lead Teste", "last_message_type": "audio"},
+        )
+        system_event = record_inbound_event(
+            source_event_id="queue-system-001",
+            contact_ref="system@s.whatsapp.net",
+            thread_ref="system@g.us",
+            payload={"type": "system", "text": "Internal System Message"},
+        )
+        stage_raw_ref(
+            contact_ref="system@s.whatsapp.net",
+            thread_ref="system@g.us",
+            display_name="Internal System Message",
+            kind="contact",
+            safe_hint={"display_name": "Internal System Message", "last_message_type": "system"},
+        )
+        visible_staging = peek_staging()
+        diagnostics = registration_staging_diagnostics()
+        queue = get_actionable_queue(limit=5)
+        ignored = ignore_staging_item(item_index=1)
+        queue_after_ignore = get_actionable_queue(limit=5)
+    finally:
+        reset_hermes_home_override(token)
+
+    serialized = json.dumps(queue, ensure_ascii=False)
+    kinds = {item["kind"] for item in queue["items"]}
+    assert queue["ok"] is True
+    assert queue["read_only"] is True
+    assert queue["send_performed"] is False
+    assert queue["source"] == "local_inbound_store"
+    assert "approval" in kinds
+    assert "registration" in kinds
+    assert "context" in kinds
+    assert [item["kind"] for item in visible_staging] == ["contact"]
+    assert visible_staging[0]["display_name"] == "Lead Teste"
+    assert diagnostics["staged_count"] == 1
+    assert diagnostics["latest_inbound_created_at"] != system_event.get("created_at")
+    assert ignored["ok"] is True
+    assert ignored["display_name"] == "Lead Teste"
+    assert queue["counts"]["total"] == len(queue["items"])
+    assert queue["counts"]["active_staging"] == 1
+    assert queue_after_ignore["counts"]["active_staging"] == 0
+    assert queue["operator_summary"]["latest_inbound_created_at"]
+    assert queue["operator_summary"]["latest_inbound_created_at"] != system_event.get("created_at")
+    assert any(item.get("approval_id") == approval["approval_id"] for item in queue["items"])
+    assert any(item.get("safe_event_id") == inbound["event_id"] for item in queue["items"])
+    assert not any(item.get("message_type") == "system" for item in queue["items"])
+    assert any("/addct" in " ".join(item.get("actions", [])) for item in queue["items"])
+    assert queue.get("operator_summary", {}).get("headline")
+    assert queue.get("operator_summary", {}).get("best_next_action")
+    actionable = [item for item in queue["items"] if item.get("kind") in {"approval", "registration", "context"}]
+    assert all(item.get("operator_state") for item in actionable)
+    assert all(item.get("operator_title") for item in actionable)
+    assert all(item.get("primary_action") for item in actionable)
+    registration = next(item for item in queue["items"] if item.get("kind") == "registration")
+    assert registration["operator_state"] == "ACTION_REQUIRED"
+    assert registration["primary_action"].startswith("/addct Lead Teste --item")
+    assert registration["safe_origin"]
+    assert "follow-up comercial" in registration["why_it_matters"]
+    context = next(item for item in queue["items"] if item.get("kind") == "context")
+    assert context["safe_preview"]
+    assert context["primary_action"] == "/ctxwpp"
+    assert "@s.whatsapp.net" not in serialized
+    assert "@g.us" not in serialized
+    assert "551199998888" not in serialized
+    assert "120363375521827492" not in serialized
+    assert "queue-real-001" not in serialized
+    assert "queue-system-001" not in serialized
+    assert "Internal System Message" not in serialized
+    assert "cdn.example.invalid" not in serialized
+    assert "secret" not in serialized
+    assert "Mensagem que não deve aparecer" not in serialized
+
+
+def test_actionable_queue_hides_stale_context_and_expired_approvals(tmp_path):
+    from tools.whatsapp_ops_store import (
+        create_approval,
+        create_draft,
+        get_actionable_queue,
+        get_db_path,
+        init_db,
+        record_inbound_event,
+    )
+
+    token = set_hermes_home_override(tmp_path)
+    try:
+        init_db()
+        draft = create_draft(
+            targets=[{"type": "contact", "contact_id": "contact_safe", "display_name": "Safe"}],
+            message="Mensagem antiga",
+        )
+        create_approval(draft["draft_id"], timeout_minutes=1)
+        record_inbound_event(
+            source_event_id="stale-personal-001",
+            contact_ref="551199998888@s.whatsapp.net",
+            thread_ref="551199998888@s.whatsapp.net",
+            payload={"id": "stale-personal-001", "type": "text", "text": "conversa pessoal antiga"},
+        )
+        old = (datetime.now(timezone.utc) - timedelta(days=3)).isoformat()
+        with sqlite3.connect(get_db_path()) as conn:
+            conn.execute("UPDATE inbound_events SET created_at=?", (old,))
+            conn.execute("UPDATE approvals SET expires_at=?", (old,))
+        queue = get_actionable_queue(limit=5)
+    finally:
+        reset_hermes_home_override(token)
+
+    serialized = json.dumps(queue, ensure_ascii=False)
+    assert queue["ok"] is True
+    assert queue["counts"]["pending_approvals"] == 0
+    assert queue["counts"]["expired_pending_approvals"] == 1
+    assert queue["counts"]["context_items"] == 0
+    assert "stale_local_inbound_store" in queue["warnings"]
+    assert "expired_pending_approvals_hidden" in queue["warnings"]
+    assert "conversa pessoal antiga" not in serialized
+    assert "stale-personal-001" not in serialized
 
 
 def test_thread_context_operator_mode_summarizes_local_store_without_raw_refs(tmp_path):

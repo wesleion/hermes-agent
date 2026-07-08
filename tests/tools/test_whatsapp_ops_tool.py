@@ -138,6 +138,56 @@ def test_wpp_send_approved_resolves_local_registered_contact_for_transport_only(
     assert "551188887777" not in json.dumps(result, ensure_ascii=False)
 
 
+def test_wpp_send_approved_resolves_config_allowlist_ref_when_db_cache_has_only_safe_id(tmp_path):
+    from tools.whatsapp_ops_store import (
+        create_approval,
+        create_draft,
+        hash_text,
+        init_db,
+        resolve_approval,
+        upsert_contact,
+    )
+    from tools.whatsapp_ops_tool import wpp_send_approved
+
+    raw_ref = "551188887700@s.whatsapp.net"
+    contact_id = "contact_" + hash_text(raw_ref)[:16]
+    send_client = Mock(return_value={"ok": True, "transport": "mock"})
+    config = {
+        "send_enabled": True,
+        "kill_switch": False,
+        "approval": {"required": True, "timeout_minutes": 60},
+        # Runtime config may still carry provider refs while SQLite has only the
+        # safe contact id/hash. Transport must be able to bridge the two.
+        "allowlists": {"contacts": [raw_ref], "groups": []},
+        "quepasa": {"send_enabled": True},
+    }
+    token = set_hermes_home_override(tmp_path)
+    try:
+        init_db()
+        upsert_contact(
+            contact_id=contact_id,
+            display_name="Lead Cache",
+            phone_e164="",
+            aliases=["lead_cache"],
+            whitelisted=True,
+            policy_group="pilot",
+            metadata={"source": "test", "target_ref_hash": hash_text(raw_ref)},
+        )
+        draft = create_draft(
+            targets=[{"type": "contact", "contact_id": contact_id}],
+            message="Mensagem controlada para contato com cache incompleto",
+        )
+        approval = create_approval(draft["draft_id"], timeout_minutes=60)
+        resolve_approval(approval["approval_id"], "approved", approver_ref="test:approver")
+        result = _parse(wpp_send_approved(draft["draft_id"], config=config, send_client=send_client))
+    finally:
+        reset_hermes_home_override(token)
+
+    assert result["ok"] is True
+    assert send_client.call_args.args[0]["targets"] == [{"type": "contact", "contact_id": raw_ref}]
+    assert "551188887700" not in json.dumps(result, ensure_ascii=False)
+
+
 def test_wpp_import_contact_list_sanitizes_and_defaults_no_send(tmp_path):
     from tools.whatsapp_ops_store import create_approval, create_draft, init_db, resolve_approval
     from tools.whatsapp_ops_tool import (
@@ -376,6 +426,344 @@ def test_wpp_send_approved_records_success_for_idempotency(tmp_path, monkeypatch
     send_client.assert_called_once()
 
 
+def test_wpp_send_approved_humanized_sequence_splits_text_and_preserves_idempotency(tmp_path, monkeypatch):
+    from tools.whatsapp_ops_store import create_approval, create_draft, init_db, resolve_approval
+    from tools.whatsapp_ops_tool import wpp_send_approved
+
+    _allow_raw_contact(monkeypatch)
+    send_client = Mock(return_value={"ok": True, "transport": "mock"})
+    sleep_fn = Mock()
+    config = {
+        "send_enabled": True,
+        "kill_switch": False,
+        "approval": {"required": True, "timeout_minutes": 60},
+        "allowlists": {"contacts": ["c_1"], "groups": []},
+        "quepasa": {"send_enabled": True},
+        "humanized_send": {"enabled": True, "delay_seconds": 1.25, "max_blocks": 4, "max_block_chars": 360},
+    }
+
+    token = set_hermes_home_override(tmp_path)
+    try:
+        init_db()
+        draft = create_draft(
+            targets=[{"type": "contact", "contact_id": "c_1"}],
+            message=(
+                "Oi, João. Vi aqui o contexto do projeto e acho que faz sentido conversarmos.\n\n"
+                "A ideia é entender onde estão os gargalos hoje e ver se conseguimos simplificar a operação sem aumentar o time.\n\n"
+                "Se fizer sentido, posso te mandar uma proposta de diagnóstico rápido."
+            ),
+        )
+        approval = create_approval(draft["draft_id"], timeout_minutes=60)
+        resolve_approval(approval["approval_id"], "approved", approver_ref="test:approver")
+        first = _parse(
+            wpp_send_approved(
+                draft_id=draft["draft_id"],
+                config=config,
+                send_client=send_client,
+                sleep_fn=sleep_fn,
+            )
+        )
+        second = _parse(wpp_send_approved(draft_id=draft["draft_id"], config=config, send_client=send_client, sleep_fn=sleep_fn))
+    finally:
+        reset_hermes_home_override(token)
+
+    assert first["ok"] is True
+    assert first["send_result"]["transport"] == "humanized_sequence"
+    assert first["send_result"]["blocks_sent"] == 3
+    assert [call.args[0]["message"] for call in send_client.call_args_list] == [
+        "Oi, João. Vi aqui o contexto do projeto e acho que faz sentido conversarmos.",
+        "A ideia é entender onde estão os gargalos hoje e ver se conseguimos simplificar a operação sem aumentar o time.",
+        "Se fizer sentido, posso te mandar uma proposta de diagnóstico rápido.",
+    ]
+    assert sleep_fn.call_count == 2
+    sleep_fn.assert_any_call(1.25)
+    assert second["ok"] is False
+    assert "idempotency_duplicate" in second["reasons"]
+
+
+def test_wpp_send_approved_humanized_sequence_uses_adaptive_delay_by_block_size(tmp_path, monkeypatch):
+    from tools.whatsapp_ops_store import create_approval, create_draft, init_db, resolve_approval
+    from tools.whatsapp_ops_tool import wpp_send_approved
+
+    _allow_raw_contact(monkeypatch)
+    send_client = Mock(return_value={"ok": True, "transport": "mock"})
+    sleep_fn = Mock()
+    config = {
+        "send_enabled": True,
+        "kill_switch": False,
+        "approval": {"required": True, "timeout_minutes": 60},
+        "allowlists": {"contacts": ["c_1"], "groups": []},
+        "quepasa": {"send_enabled": True},
+        "humanized_send": {
+            "enabled": True,
+            "delay_mode": "adaptive",
+            "min_delay_seconds": 0.5,
+            "max_delay_seconds": 4.0,
+            "chars_per_second": 20,
+            "max_blocks": 4,
+            "max_block_chars": 360,
+        },
+    }
+
+    token = set_hermes_home_override(tmp_path)
+    try:
+        init_db()
+        draft = create_draft(
+            targets=[{"type": "contact", "contact_id": "c_1"}],
+            message=(
+                "Curto.\n\n"
+                "Segundo bloco tem tamanho intermediário para simular digitação.\n\n"
+                "Terceiro bloco é propositalmente maior, com mais contexto, vírgulas e detalhes para saturar o teto adaptativo."
+            ),
+        )
+        approval = create_approval(draft["draft_id"], timeout_minutes=60)
+        resolve_approval(approval["approval_id"], "approved", approver_ref="test:approver")
+        result = _parse(wpp_send_approved(draft["draft_id"], config=config, send_client=send_client, sleep_fn=sleep_fn))
+    finally:
+        reset_hermes_home_override(token)
+
+    assert result["ok"] is True
+    assert result["send_result"]["delay_mode"] == "adaptive"
+    sleeps = [call.args[0] for call in sleep_fn.call_args_list]
+    assert len(sleeps) == 2
+    assert sleeps[0] < sleeps[1]
+    assert sleeps[0] >= 0.5
+    assert sleeps[1] <= 4.0
+
+
+def test_wpp_send_approved_humanized_sequence_auto_blocks_can_use_five_blocks(tmp_path, monkeypatch):
+    from tools.whatsapp_ops_store import create_approval, create_draft, init_db, resolve_approval
+    from tools.whatsapp_ops_tool import wpp_send_approved
+
+    _allow_raw_contact(monkeypatch)
+    send_client = Mock(return_value={"ok": True, "transport": "mock"})
+    sleep_fn = Mock()
+    config = {
+        "send_enabled": True,
+        "kill_switch": False,
+        "approval": {"required": True, "timeout_minutes": 60},
+        "allowlists": {"contacts": ["c_1"], "groups": []},
+        "quepasa": {"send_enabled": True},
+        "humanized_send": {
+            "enabled": True,
+            "delay_mode": "adaptive",
+            "min_delay_seconds": 0.1,
+            "max_delay_seconds": 1.0,
+            "chars_per_second": 80,
+            "max_blocks": "auto",
+            "max_blocks_max": 5,
+            "target_block_chars": 180,
+            "max_block_chars": 360,
+        },
+    }
+
+    token = set_hermes_home_override(tmp_path)
+    try:
+        init_db()
+        draft = create_draft(
+            targets=[{"type": "contact", "contact_id": "c_1"}],
+            message=(
+                "Bloco um contextual.\n\n"
+                "Bloco dois com uma ideia própria.\n\n"
+                "Bloco três avança a conversa.\n\n"
+                "Bloco quatro mantém naturalidade.\n\n"
+                "Bloco cinco fecha com call to action."
+            ),
+        )
+        approval = create_approval(draft["draft_id"], timeout_minutes=60)
+        resolve_approval(approval["approval_id"], "approved", approver_ref="test:approver")
+        result = _parse(wpp_send_approved(draft["draft_id"], config=config, send_client=send_client, sleep_fn=sleep_fn))
+    finally:
+        reset_hermes_home_override(token)
+
+    assert result["ok"] is True
+    assert result["send_result"]["max_blocks_mode"] == "dynamic"
+    assert result["send_result"]["blocks_sent"] == 5
+    assert result["send_result"]["max_blocks_cap"] == 5
+    assert send_client.call_count == 5
+    assert sleep_fn.call_count == 4
+
+
+def test_wpp_send_approved_humanized_sequence_auto_blocks_caps_tail_at_five(tmp_path, monkeypatch):
+    from tools.whatsapp_ops_store import create_approval, create_draft, init_db, resolve_approval
+    from tools.whatsapp_ops_tool import wpp_send_approved
+
+    _allow_raw_contact(monkeypatch)
+    send_client = Mock(return_value={"ok": True, "transport": "mock"})
+    config = {
+        "send_enabled": True,
+        "kill_switch": False,
+        "approval": {"required": True, "timeout_minutes": 60},
+        "allowlists": {"contacts": ["c_1"], "groups": []},
+        "quepasa": {"send_enabled": True},
+        "humanized_send": {
+            "enabled": True,
+            "delay_seconds": 0,
+            "max_blocks": "auto",
+            "max_blocks_max": 5,
+            "target_block_chars": 120,
+            "max_block_chars": 360,
+        },
+    }
+    message = "\n\n".join(f"Bloco {idx} com texto natural." for idx in range(1, 8))
+
+    token = set_hermes_home_override(tmp_path)
+    try:
+        init_db()
+        draft = create_draft(targets=[{"type": "contact", "contact_id": "c_1"}], message=message)
+        approval = create_approval(draft["draft_id"], timeout_minutes=60)
+        resolve_approval(approval["approval_id"], "approved", approver_ref="test:approver")
+        result = _parse(wpp_send_approved(draft["draft_id"], config=config, send_client=send_client))
+    finally:
+        reset_hermes_home_override(token)
+
+    assert result["ok"] is True
+    assert result["send_result"]["blocks_sent"] == 5
+    assert send_client.call_count == 5
+    assert "Bloco 6" in send_client.call_args_list[-1].args[0]["message"]
+    assert "Bloco 7" in send_client.call_args_list[-1].args[0]["message"]
+
+
+def test_wpp_send_approved_humanized_sequence_sends_typing_presence_before_blocks(tmp_path, monkeypatch):
+    from tools.whatsapp_ops_store import create_approval, create_draft, init_db, resolve_approval
+    from tools.whatsapp_ops_tool import wpp_send_approved
+
+    _allow_raw_contact(monkeypatch)
+    events = []
+
+    def send_client(payload, _cfg):
+        events.append(("send", payload["humanized"]["block_index"], payload["message"]))
+        return {"ok": True, "transport": "mock"}
+
+    def presence_client(payload, _cfg):
+        events.append(("presence", payload["humanized"]["block_index"], payload["presence_type"], payload["duration_ms"]))
+        return {"ok": True, "transport": "presence_mock"}
+
+    def sleep_fn(seconds):
+        events.append(("sleep", seconds))
+
+    config = {
+        "send_enabled": True,
+        "kill_switch": False,
+        "approval": {"required": True, "timeout_minutes": 60},
+        "allowlists": {"contacts": ["c_1"], "groups": []},
+        "quepasa": {"send_enabled": True},
+        "humanized_send": {
+            "enabled": True,
+            "delay_mode": "adaptive",
+            "min_delay_seconds": 0.25,
+            "max_delay_seconds": 1.0,
+            "chars_per_second": 80,
+            "max_blocks": 4,
+            "max_block_chars": 360,
+            "typing": {"enabled": True, "presence_type": "text"},
+        },
+    }
+
+    token = set_hermes_home_override(tmp_path)
+    try:
+        init_db()
+        draft = create_draft(
+            targets=[{"type": "contact", "contact_id": "c_1"}],
+            message="Primeiro bloco.\n\nSegundo bloco com mais conteúdo.",
+        )
+        approval = create_approval(draft["draft_id"], timeout_minutes=60)
+        resolve_approval(approval["approval_id"], "approved", approver_ref="test:approver")
+        result = _parse(
+            wpp_send_approved(
+                draft["draft_id"],
+                config=config,
+                send_client=send_client,
+                sleep_fn=sleep_fn,
+                presence_client=presence_client,
+            )
+        )
+    finally:
+        reset_hermes_home_override(token)
+
+    assert result["ok"] is True
+    assert result["send_result"]["typing_attempted"] is True
+    assert [event[0] for event in events] == ["presence", "sleep", "send", "presence", "sleep", "send"]
+    assert events[0][1:3] == (1, "text")
+    assert events[3][1:3] == (2, "text")
+
+
+def test_wpp_send_approved_humanized_sequence_does_not_split_media_payload(tmp_path, monkeypatch):
+    from tools.whatsapp_ops_store import create_approval, create_draft, init_db, resolve_approval
+    from tools.whatsapp_ops_tool import wpp_send_approved
+
+    _allow_raw_contact(monkeypatch)
+    send_client = Mock(return_value={"ok": True, "transport": "mock", "media_sent": True})
+    sleep_fn = Mock()
+    config = {
+        "send_enabled": True,
+        "kill_switch": False,
+        "approval": {"required": True, "timeout_minutes": 60},
+        "allowlists": {"contacts": ["c_1"], "groups": []},
+        "quepasa": {"send_enabled": True},
+        "humanized_send": {"enabled": True, "delay_seconds": 1, "max_blocks": 4, "max_block_chars": 80},
+    }
+    token = set_hermes_home_override(tmp_path)
+    try:
+        init_db()
+        draft = create_draft(
+            targets=[{"type": "contact", "contact_id": "c_1"}],
+            message="Legenda curta.\n\nOutra frase que seria dividida se fosse texto puro.",
+            media={"type": "document", "url": "https://static.example.invalid/a.pdf", "filename": "a.pdf", "as_document": True},
+        )
+        approval = create_approval(draft["draft_id"], timeout_minutes=60)
+        resolve_approval(approval["approval_id"], "approved", approver_ref="test:approver")
+        result = _parse(wpp_send_approved(draft["draft_id"], config=config, send_client=send_client, sleep_fn=sleep_fn))
+    finally:
+        reset_hermes_home_override(token)
+
+    assert result["ok"] is True
+    send_client.assert_called_once()
+    sleep_fn.assert_not_called()
+    assert send_client.call_args.args[0]["media"]["url"] == "https://static.example.invalid/a.pdf"
+
+
+def test_wpp_send_approved_humanized_sequence_stops_on_failed_block(tmp_path, monkeypatch):
+    from tools.whatsapp_ops_store import create_approval, create_draft, init_db, resolve_approval
+    from tools.whatsapp_ops_tool import wpp_send_approved, wpp_status
+
+    _allow_raw_contact(monkeypatch)
+    send_client = Mock(side_effect=[{"ok": True, "transport": "mock"}, {"ok": False, "error": "http_error"}])
+    sleep_fn = Mock()
+    config = {
+        "send_enabled": True,
+        "kill_switch": False,
+        "approval": {"required": True, "timeout_minutes": 60},
+        "allowlists": {"contacts": ["c_1"], "groups": []},
+        "quepasa": {"send_enabled": True},
+        "humanized_send": {"enabled": True, "delay_seconds": 0.5, "max_blocks": 4, "max_block_chars": 160},
+    }
+    token = set_hermes_home_override(tmp_path)
+    try:
+        init_db()
+        draft = create_draft(
+            targets=[{"type": "contact", "contact_id": "c_1"}],
+            message=(
+                "Primeiro bloco controlado com contexto suficiente para passar do limite mínimo e sair sozinho.\n\n"
+                "Segundo bloco falha de propósito, também longo o bastante para não ser agrupado ao anterior.\n\n"
+                "Terceiro bloco não deve sair porque a sequência precisa parar na falha do segundo."
+            ),
+        )
+        approval = create_approval(draft["draft_id"], timeout_minutes=60)
+        resolve_approval(approval["approval_id"], "approved", approver_ref="test:approver")
+        result = _parse(wpp_send_approved(draft["draft_id"], config=config, send_client=send_client, sleep_fn=sleep_fn))
+        status = _parse(wpp_status(draft["draft_id"]))
+    finally:
+        reset_hermes_home_override(token)
+
+    assert result["ok"] is False
+    assert result["send_result"]["transport"] == "humanized_sequence"
+    assert result["send_result"]["failed_block_index"] == 2
+    assert send_client.call_count == 2
+    sleep_fn.assert_called_once_with(0.5)
+    assert status["status"] == "failed"
+
+
 def test_wpp_send_approved_wrong_token_does_not_consume_idempotency(tmp_path, monkeypatch):
     from tools.whatsapp_ops_store import create_approval, create_draft, init_db, resolve_approval
     from tools.whatsapp_ops_tool import wpp_request_approval, wpp_resolve_approval, wpp_send_approved, wpp_status
@@ -530,8 +918,13 @@ def test_wpp_request_approval_sends_telegram_inline_card_without_plaintext_token
     assert approval["notification"] == {"ok": True, "message_id": "123"}
     assert payload["chat_id"] == "-100123"
     assert payload["message_thread_id"] == 456
-    assert payload["reply_markup"]["inline_keyboard"][0][0]["callback_data"] == f"wpp:a:{approval['approval_id']}"
-    assert payload["reply_markup"]["inline_keyboard"][0][1]["callback_data"] == f"wpp:d:{approval['approval_id']}"
+    keyboard = payload["reply_markup"]["inline_keyboard"][0]
+    assert keyboard[0]["text"] == "✅ Aprovar e Enviar"
+    assert keyboard[0]["callback_data"] == f"wpp:a:{approval['approval_id']}"
+    assert keyboard[1]["text"] == "✏️ Editar"
+    assert keyboard[1]["callback_data"] == f"wpp:e:{approval['approval_id']}"
+    assert keyboard[2]["text"] == "❌ Negar"
+    assert keyboard[2]["callback_data"] == f"wpp:d:{approval['approval_id']}"
     assert "approval_token" not in approval
     assert "telegram-secret-token" not in serialized
 
@@ -804,7 +1197,8 @@ def test_wpp_ingest_inbound_event_records_quepasa_payload_safely(tmp_path):
     assert "3A994860A1E5E17C49C6" not in serialized
     assert "157475059830806@lid" not in serialized
     assert "120363430137938027@g.us" not in serialized
-    assert "+352****6457" not in serialized
+    assert "+352****6457" in serialized
+    assert "2026-06-06T12:37:34-03:00" in serialized
 
 
 def test_wpp_registration_staging_status_has_diagnostics_and_profile_ttl(tmp_path):
@@ -895,6 +1289,141 @@ def test_wpp_registration_staging_is_actionable_for_group_and_participant(tmp_pa
 
 
 
+def test_wpp_ingest_lid_participant_without_explicit_phone_is_unresolved(tmp_path):
+    from tools.whatsapp_ops_store import init_db
+    from tools.whatsapp_ops_tool import wpp_ingest_inbound_event, wpp_register_staging_status
+
+    payload = {
+        "id": "REG_GROUP_LID_NO_PHONE_001",
+        "chat": {"id": "120363430137938027@g.us", "title": "Grupo Comercial Alpha"},
+        "participant": {"id": "172185238905034@lid", "title": "Weslei W."},
+        "text": "cadastro teste lid",
+        "type": "text",
+    }
+    token = set_hermes_home_override(tmp_path)
+    try:
+        init_db()
+        ingested = _parse(wpp_ingest_inbound_event(payload))
+        status = _parse(wpp_register_staging_status())
+    finally:
+        reset_hermes_home_override(token)
+
+    contact = next(item for item in status["staged"] if item["kind"] == "contact")
+    serialized = json.dumps(status, ensure_ascii=False)
+    assert ingested["ok"] is True
+    assert contact["display_name"] == "Weslei W."
+    assert contact["phone_status"] == "unresolved"
+    assert contact["identity_note"] == "número não resolvido"
+    assert "phone_masked" not in contact
+    assert "last4" not in contact
+    assert "+17***5034" not in serialized
+    assert "172185238905034" not in serialized
+    assert "120363430137938027" not in serialized
+    assert "@lid" not in serialized
+    assert "@g.us" not in serialized
+
+
+def test_wpp_ingest_lid_participant_uses_explicit_phone_field_when_present(tmp_path):
+    from tools.whatsapp_ops_store import init_db
+    from tools.whatsapp_ops_tool import wpp_ingest_inbound_event, wpp_register_staging_status
+
+    payload = {
+        "id": "REG_GROUP_LID_PHONE_001",
+        "chat": {"id": "120363430137938027@g.us", "title": "Grupo Comercial Alpha"},
+        "participant": {"id": "172185238905034@lid", "phone": "553199998765", "title": "João Cliente"},
+        "text": "cadastro teste phone",
+        "type": "text",
+    }
+    token = set_hermes_home_override(tmp_path)
+    try:
+        init_db()
+        ingested = _parse(wpp_ingest_inbound_event(payload))
+        status = _parse(wpp_register_staging_status())
+    finally:
+        reset_hermes_home_override(token)
+
+    contact = next(item for item in status["staged"] if item["kind"] == "contact")
+    serialized = json.dumps(status, ensure_ascii=False)
+    assert ingested["ok"] is True
+    assert contact["display_name"] == "João Cliente"
+    assert contact["phone_masked"] == "+55***8765"
+    assert contact["last4"] == "8765"
+    assert "phone_status" not in contact
+    assert "553199998765" not in serialized
+    assert "172185238905034" not in serialized
+    assert "@lid" not in serialized
+
+
+def test_wpp_ingest_system_events_do_not_create_registration_staging(tmp_path):
+    from tools.whatsapp_ops_store import init_db
+    from tools.whatsapp_ops_tool import wpp_actionable_queue, wpp_ingest_inbound_event, wpp_register_staging_status
+
+    token = set_hermes_home_override(tmp_path)
+    try:
+        init_db()
+        ingested = _parse(wpp_ingest_inbound_event({
+            "id": "REG_SYSTEM_EVENT_001",
+            "chat": {"id": "system@g.us", "title": "Internal System Message"},
+            "text": '{"event":"connected","phone":"+5511999990000","timestamp":"2026-07-08T19:20:33Z"}',
+            "type": "system",
+            "fromme": False,
+        }))
+        status = _parse(wpp_register_staging_status())
+        queue = _parse(wpp_actionable_queue(limit=5))
+    finally:
+        reset_hermes_home_override(token)
+
+    serialized = json.dumps({"status": status, "queue": queue}, ensure_ascii=False)
+    assert ingested["ok"] is True
+    assert status["staged_count"] == 0
+    assert queue["counts"]["active_staging"] == 0
+    assert queue["counts"]["registration_items"] == 0
+    assert queue["operator_summary"]["latest_inbound_created_at"] is None
+    assert "Internal System Message" not in serialized
+    assert "+5511999990000" not in serialized
+
+
+def test_wpp_registration_staging_ignores_self_contact_from_group(tmp_path):
+    from tools.whatsapp_ops_store import init_db
+    from tools.whatsapp_ops_tool import wpp_actionable_queue, wpp_ingest_inbound_event, wpp_register_staging_status
+
+    payload = {
+        "id": "REG_GROUP_SELF_MSG_001",
+        "chat": {"id": "120363430137938027@g.us", "title": "Grupo Comercial Alpha"},
+        "participant": {"id": "553199998765@s.whatsapp.net", "title": "Weslei ON"},
+        "text": "Mensagem enviada pelo próprio número conectado",
+        "type": "text",
+        "fromme": True,
+    }
+    token = set_hermes_home_override(tmp_path)
+    try:
+        init_db()
+        ingested = _parse(wpp_ingest_inbound_event(payload))
+        status = _parse(wpp_register_staging_status())
+        queue = _parse(wpp_actionable_queue(limit=5))
+    finally:
+        reset_hermes_home_override(token)
+
+    assert ingested["ok"] is True
+    assert status["ok"] is True
+    staged = status["staged"]
+    assert [item["kind"] for item in staged] == ["group"]
+    assert staged[0]["display_name"] == "Grupo Comercial Alpha"
+    assert all(item["kind"] != "contact" for item in queue["items"])
+    assert all(item["kind"] != "context" for item in queue["items"])
+    group_item = next(item for item in queue["items"] if item.get("subtype") == "group")
+    assert group_item["recent_messages"][-1]["from_self"] is True
+    assert group_item["recent_messages"][-1]["direction"] == "eu"
+    assert group_item["recent_messages"][-1]["sender_label"] == "Eu"
+    assert "Mensagem enviada" in group_item["recent_messages"][-1]["text_preview"]
+    assert group_item["ignore_action"] == "/ignorar 1"
+    serialized = json.dumps({"status": status, "queue": queue}, ensure_ascii=False)
+    assert "Weslei ON" not in serialized
+    assert "553199998765" not in serialized
+    assert "@s.whatsapp.net" not in serialized
+    assert "@g.us" not in serialized
+
+
 def test_wpp_registration_staging_deduplicates_and_counts_messages(tmp_path):
     from tools.whatsapp_ops_store import init_db
     from tools.whatsapp_ops_tool import wpp_ingest_inbound_event, wpp_register_staging_status
@@ -921,6 +1450,78 @@ def test_wpp_registration_staging_deduplicates_and_counts_messages(tmp_path):
     assert contacts[0]["message_count"] == 3
     assert groups[0]["last_message_type"] == "text"
 
+
+
+def test_wpp_queue_recent_messages_show_sender_name_and_masked_phone(tmp_path):
+    from tools.whatsapp_ops_store import init_db
+    from tools.whatsapp_ops_tool import wpp_actionable_queue, wpp_ingest_inbound_event
+
+    token = set_hermes_home_override(tmp_path)
+    try:
+        init_db()
+        assert _parse(wpp_ingest_inbound_event({
+            "id": "REG_GROUP_SENDER_LABEL_001",
+            "chat": {"id": "120363430137938027@g.us", "title": "Grupo Comercial Alpha"},
+            "participant": {
+                "id": "553199998765@s.whatsapp.net",
+                "phone": "553199998765",
+                "title": "Studio Wanda Wanderlei",
+            },
+            "text": "@553199991111 (Weslei ON), como faz pra acessar a conta de anúncios?",
+            "type": "text",
+        }))["ok"] is True
+        queue = _parse(wpp_actionable_queue(limit=5))
+    finally:
+        reset_hermes_home_override(token)
+
+    group_item = next(item for item in queue["items"] if item.get("subtype") == "group")
+    message = group_item["recent_messages"][-1]
+    assert message["sender_label"] == "Studio Wanda Wanderlei (+55***8765)"
+    assert message["sender_display_name"] == "Studio Wanda Wanderlei"
+    assert message["sender_phone_masked"] == "+55***8765"
+    assert "@Weslei ON" in message["text_preview"]
+    assert "<redacted-phone>" not in message["text_preview"]
+    serialized = json.dumps(queue, ensure_ascii=False)
+    assert "553199998765" not in serialized
+    assert "553199991111" not in serialized
+    assert "@s.whatsapp.net" not in serialized
+    assert "@g.us" not in serialized
+
+
+def test_wpp_ignore_staging_item_removes_and_suppresses_future_rows(tmp_path):
+    from tools.whatsapp_ops_store import init_db
+    from tools.whatsapp_ops_tool import wpp_actionable_queue, wpp_ignore_staging_item, wpp_ingest_inbound_event
+
+    token = set_hermes_home_override(tmp_path)
+    try:
+        init_db()
+        first_payload = {
+            "id": "REG_GROUP_IGNORE_001",
+            "chat": {"id": "120363430137938027@g.us", "subject": "Grupo Comercial Alpha"},
+            "participant": {"id": "553199998765@s.whatsapp.net", "title": "João Cliente"},
+            "text": "primeira mensagem",
+            "type": "text",
+        }
+        assert _parse(wpp_ingest_inbound_event(first_payload))["ok"] is True
+        before = _parse(wpp_actionable_queue(limit=5))
+        ignored = _parse(wpp_ignore_staging_item(item=1))
+        after = _parse(wpp_actionable_queue(limit=5))
+        second_payload = dict(first_payload, id="REG_GROUP_IGNORE_002", text="segunda mensagem")
+        assert _parse(wpp_ingest_inbound_event(second_payload))["ok"] is True
+        after_reingest = _parse(wpp_actionable_queue(limit=5))
+    finally:
+        reset_hermes_home_override(token)
+
+    assert any(item.get("kind") == "registration" for item in before["items"])
+    assert ignored["ok"] is True
+    assert ignored["ignored"] is True
+    assert ignored["send_performed"] is False
+    assert not any(item.get("staging_id") == ignored["staging_id"] for item in after["items"])
+    assert not any(item.get("staging_id") == ignored["staging_id"] for item in after_reingest["items"])
+    serialized = json.dumps({"ignored": ignored, "after": after_reingest}, ensure_ascii=False)
+    assert "@g.us" not in serialized
+    assert "@s.whatsapp.net" not in serialized
+    assert "553199998765" not in serialized
 
 
 def test_wpp_register_alias_can_consume_specific_staging_id(tmp_path):
@@ -1104,7 +1705,7 @@ def test_wpp_ingest_inbound_event_redacts_embedded_urls_and_media_blobs(tmp_path
     assert "551122221111" not in serialized
     assert "@s.whatsapp.net" not in serialized
     assert "<redacted-url>" in serialized
-    assert "<redacted-phone>" in serialized
+    assert "+55***9999" in serialized
     assert "<redacted-wa-ref>" in serialized
 
 
@@ -1245,6 +1846,59 @@ def test_wpp_cockpit_overview_tool_returns_fail_closed_admin_summary(tmp_path, m
     assert "evt-real-123" not in serialized
 
 
+def test_wpp_actionable_queue_tool_returns_contextual_queue_without_raw_refs(tmp_path, monkeypatch):
+    from tools.whatsapp_ops_store import create_approval, create_draft, init_db, record_inbound_event, stage_raw_ref
+    from tools.whatsapp_ops_tool import wpp_actionable_queue
+
+    monkeypatch.delenv("CONTACTS_JSON", raising=False)
+    token = set_hermes_home_override(tmp_path)
+    try:
+        init_db()
+        draft = create_draft(
+            targets=[{"type": "contact", "contact_id": "contact_safe", "display_name": "Safe"}],
+            message="Texto sensível do draft não deve entrar na fila",
+        )
+        create_approval(draft["draft_id"])
+        record_inbound_event(
+            source_event_id="queue-tool-001",
+            contact_ref="551199998888@s.whatsapp.net",
+            thread_ref="120363375521827492@g.us",
+            payload={
+                "id": "queue-tool-001",
+                "type": "image",
+                "caption": "Imagem com telefone 551199998888 e https://cdn.example.invalid/i.jpg?token=secret",
+                "message": {"imageMessage": {"mimetype": "image/jpeg", "url": "https://cdn.example.invalid/i.jpg"}},
+            },
+        )
+        stage_raw_ref(
+            contact_ref="551199998888@s.whatsapp.net",
+            thread_ref="120363375521827492@g.us",
+            display_name="Lead Foto",
+            kind="contact",
+            safe_hint={"display_name": "Lead Foto", "last_message_type": "image", "has_media": True},
+        )
+        result = _parse(wpp_actionable_queue(limit=5))
+    finally:
+        reset_hermes_home_override(token)
+
+    serialized = json.dumps(result, ensure_ascii=False)
+    assert result["ok"] is True
+    assert result["send_flags"]["send_enabled"] is False
+    assert result["read_only"] is True
+    assert any(item["kind"] == "approval" for item in result["items"])
+    assert any(item["kind"] == "registration" for item in result["items"])
+    assert any(item["kind"] == "context" for item in result["items"])
+    assert "wpp_send_approved" in result["operator_actions"]
+    assert "@s.whatsapp.net" not in serialized
+    assert "@g.us" not in serialized
+    assert "551199998888" not in serialized
+    assert "120363375521827492" not in serialized
+    assert "queue-tool-001" not in serialized
+    assert "cdn.example.invalid" not in serialized
+    assert "secret" not in serialized
+    assert "Texto sensível" not in serialized
+
+
 def test_wpp_thread_context_tool_returns_operator_summary_without_raw_refs(tmp_path):
     from tools.whatsapp_ops_store import init_db, record_inbound_event
     from tools.whatsapp_ops_tool import wpp_thread_context
@@ -1304,6 +1958,7 @@ def test_whatsapp_ops_toolset_is_registered():
         "wpp_status",
         "wpp_inbound_lookup",
         "wpp_thread_context",
+        "wpp_actionable_queue",
         "wpp_ingest_inbound_event",
     }.issubset(names)
 
