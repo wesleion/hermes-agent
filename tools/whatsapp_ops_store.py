@@ -3044,7 +3044,18 @@ def get_conversation_summary(
     if not thread_filter_set and not contact_filter_set:
         warnings.append("unscoped_local_scan")
 
-    raw_events_desc = lookup_inbound_events(thread=thread_value, contact=contact_value, limit=limit_value)
+    raw_events_desc_all = lookup_inbound_events(thread=thread_value, contact=contact_value, limit=limit_value)
+    raw_events_desc = []
+    hidden_system_events = 0
+    for event in raw_events_desc_all:
+        payload_obj = event.get("payload") if isinstance(event, dict) else {}
+        payload = payload_obj if isinstance(payload_obj, dict) else {}
+        if _payload_message_type(payload) == "system":
+            hidden_system_events += 1
+            continue
+        raw_events_desc.append(event)
+    if hidden_system_events:
+        warnings.append("system_events_hidden")
     events_desc = [_summary_event(event, max_text_value) for event in raw_events_desc]
     events_asc = list(reversed(events_desc))
     if not events_desc:
@@ -3075,6 +3086,7 @@ def get_conversation_summary(
         "status_counts": status_counts,
         "window": _summary_window(events_asc),
         "warnings": warnings,
+        "hidden_system_events": hidden_system_events,
     }
 
     if mode_norm == "brief":
