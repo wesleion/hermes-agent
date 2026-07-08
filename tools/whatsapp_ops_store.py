@@ -36,6 +36,66 @@ def utc_now() -> str:
     return datetime.now(timezone.utc).isoformat()
 
 
+def _parse_iso_datetime(value: Any) -> datetime | None:
+    text = str(value or "").strip()
+    if not text:
+        return None
+    try:
+        parsed = datetime.fromisoformat(text.replace("Z", "+00:00"))
+    except ValueError:
+        return None
+    if parsed.tzinfo is None:
+        parsed = parsed.replace(tzinfo=timezone.utc)
+    return parsed.astimezone(timezone.utc)
+
+
+def _is_recent_iso(value: Any, *, max_age: timedelta) -> bool:
+    parsed = _parse_iso_datetime(value)
+    if parsed is None:
+        return False
+    return datetime.now(timezone.utc) - parsed <= max_age
+
+
+def _truthy_provider_bool(value: Any) -> bool:
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, (int, float)):
+        return bool(value)
+    if isinstance(value, str):
+        return value.strip().lower() in {"1", "true", "yes", "y", "on"}
+    return False
+
+
+def _payload_from_self(payload: dict[str, Any] | Any) -> bool:
+    """Return True when a provider payload is an outbound echo from our own number.
+
+    QuePasa/Baileys-style webhooks can echo messages sent by the connected
+    account with fields such as ``fromme`` or ``key.fromMe``. Those are useful
+    as conversation context, but they must not become actionable contact
+    registration items: the participant is the operator's own connected number.
+    """
+    if not isinstance(payload, dict):
+        return False
+    body = payload.get("body") if isinstance(payload.get("body"), dict) else {}
+    data = body.get("data") if isinstance(body.get("data"), dict) else payload.get("data")
+    if not isinstance(data, dict):
+        data = {}
+    key = data.get("key") if isinstance(data.get("key"), dict) else {}
+    candidates = (
+        payload.get("fromme"),
+        payload.get("fromMe"),
+        payload.get("from_me"),
+        payload.get("isFromMe"),
+        data.get("fromme"),
+        data.get("fromMe"),
+        data.get("from_me"),
+        key.get("fromme"),
+        key.get("fromMe"),
+        key.get("from_me"),
+    )
+    return any(_truthy_provider_bool(value) for value in candidates)
+
+
 def _registration_staging_ttl() -> timedelta:
     """Return the profile-configured registration staging TTL.
 
@@ -195,6 +255,15 @@ def init_db() -> Path:
                 expires_at TEXT NOT NULL,
                 created_at TEXT NOT NULL
             );
+            CREATE TABLE IF NOT EXISTS registration_ignored (
+                id TEXT PRIMARY KEY,
+                kind TEXT NOT NULL,
+                ref_hash TEXT NOT NULL,
+                safe_hint_json TEXT,
+                created_at TEXT NOT NULL,
+                source_staging_id TEXT,
+                UNIQUE(kind, ref_hash)
+            );
             CREATE TABLE IF NOT EXISTS audit_log (
                 id TEXT PRIMARY KEY,
                 event_type TEXT NOT NULL,
@@ -265,6 +334,83 @@ def mask_phone(value: str | None) -> str:
     return f"{prefix}***{digits[-4:]}"
 
 
+_PHONE_REF_DOMAINS = ("@s.whatsapp.net", "@c.us", "@whatsapp.net")
+_NON_PHONE_REF_DOMAINS = ("@lid", "@g.us")
+
+
+def _trusted_phone_digits(value: Any) -> str:
+    """Return digits only when *value* is a real phone-bearing value.
+
+    WhatsApp provider identifiers such as ``@lid`` and group JIDs contain long
+    digit strings that are not phone numbers. They must never become
+    ``phone_masked``/``last4`` hints in the operator cockpit.
+    """
+    text = str(value or "").strip()
+    if not text:
+        return ""
+    lowered = text.casefold()
+    if any(domain in lowered for domain in _NON_PHONE_REF_DOMAINS):
+        return ""
+    if re.search(r"\b\d{4}-\d{2}-\d{2}\b", text):
+        return ""
+    digits = _phone_digits(text)
+    if not (8 <= len(digits) <= 15):
+        return ""
+    if any(domain in lowered for domain in _PHONE_REF_DOMAINS):
+        return digits
+    if "@" in lowered:
+        return ""
+    return digits
+
+
+def _mask_trusted_phone(value: Any) -> str:
+    digits = _trusted_phone_digits(value)
+    return mask_phone(digits) if digits else ""
+
+
+def _safe_existing_phone_mask(value: Any) -> str:
+    text = str(value or "").strip()
+    if not text:
+        return ""
+    lowered = text.casefold()
+    if any(domain in lowered for domain in _NON_PHONE_REF_DOMAINS):
+        return ""
+    if "*" in text and re.fullmatch(r"\+?\d{1,3}\*+\d{2,4}", text):
+        return text
+    return _mask_trusted_phone(text)
+
+
+def _safe_person_name(value: Any, limit: int = 60) -> str:
+    return _clean_registration_text(value, limit=limit)
+
+
+def _mask_phone_fragment(value: str) -> str:
+    text = str(value or "")
+    # Do not treat ISO/date fragments as phones (e.g. 2026-06-06 timestamps).
+    if re.search(r"\b\d{4}-\d{2}-\d{2}\b", text):
+        return text
+    return mask_phone(text) or "<redacted-phone>"
+
+
+def _replace_phone_mentions_with_names(text: str) -> str:
+    """Prefer a provider/contact name over an opaque phone placeholder.
+
+    Examples:
+    - @5511999987655 (Maria) -> @Maria
+    - @<redacted-phone> (Maria) -> @Maria
+    If there is no adjacent name, the caller still masks the phone digits.
+    """
+    def repl(match: re.Match[str]) -> str:
+        name = _safe_person_name(match.group(1), limit=50)
+        if not name:
+            return match.group(0)
+        return f"@{name}"
+
+    text = re.sub(r"@?\+?\d[\d\s().-]{6,}\d\s*\(([^)]+)\)", repl, text)
+    text = re.sub(r"@?<redacted-phone>\s*\(([^)]+)\)", repl, text, flags=re.IGNORECASE)
+    return text
+
+
 def _safe_contact_id(contact_id: str) -> str:
     raw = str(contact_id or "")
     if raw.startswith(("contact_", "synthetic_")):
@@ -278,7 +424,7 @@ def _safe_contact(row: dict[str, Any]) -> dict[str, Any]:
     return {
         "contact_id": _safe_contact_id(row["id"]),
         "display_name": row["display_name"],
-        "phone_masked": mask_phone(row.get("phone_e164_enc")),
+        "phone_masked": _safe_existing_phone_mask(row.get("phone_e164_enc")),
         "whitelisted": bool(row.get("whitelisted")),
         "policy_group": row.get("policy_group"),
     }
@@ -325,6 +471,32 @@ def _coerce_safe_hint(value: dict[str, Any] | None) -> dict[str, Any]:
         hint["last_message_type"] = msg_type
     if "has_media" in value:
         hint["has_media"] = bool(value.get("has_media"))
+
+    explicit_phone = ""
+    for key in (
+        "phone",
+        "phone_e164",
+        "phone_number",
+        "phoneNumber",
+        "senderPhone",
+        "participantPhone",
+    ):
+        explicit_phone = _safe_existing_phone_mask(value.get(key))
+        if explicit_phone:
+            hint["phone_masked"] = explicit_phone
+            digits = _trusted_phone_digits(value.get(key))
+            if digits:
+                hint["last4"] = digits[-4:]
+            hint["phone_source"] = "explicit"
+            break
+    if not explicit_phone and str(value.get("phone_source") or "").strip() in {"explicit", "raw_ref", "resolved"}:
+        existing_mask = _safe_existing_phone_mask(value.get("phone_masked"))
+        if existing_mask:
+            hint["phone_masked"] = existing_mask
+            last4 = re.sub(r"\D+", "", str(value.get("last4") or ""))[-4:]
+            if last4:
+                hint["last4"] = last4
+            hint["phone_source"] = str(value.get("phone_source"))
     return hint
 
 
@@ -347,11 +519,12 @@ def _build_staging_hint(
 ) -> dict[str, Any]:
     hint = _coerce_safe_hint(safe_hint)
     hint["safe_id"] = _safe_registration_id(kind, raw_ref)
-    digits = _phone_digits(raw_ref)
+    digits = _trusted_phone_digits(raw_ref)
     if kind == "contact" and digits:
         masked = mask_phone(raw_ref)
         if masked:
             hint["phone_masked"] = masked
+            hint["phone_source"] = "raw_ref"
         hint["last4"] = digits[-4:]
     if kind == "contact" and thread_ref and thread_ref != contact_ref:
         hint["source_group_safe_id"] = _safe_registration_id("group", thread_ref)
@@ -382,6 +555,10 @@ def _load_staging_hint(raw: Any) -> dict[str, Any]:
 
 def _merge_staging_hints(old: dict[str, Any], new: dict[str, Any]) -> dict[str, Any]:
     merged = dict(old)
+    if "phone_masked" not in new:
+        merged.pop("phone_masked", None)
+        merged.pop("last4", None)
+        merged.pop("phone_source", None)
     for key, value in new.items():
         if value not in (None, "", [], {}):
             merged[key] = value
@@ -443,6 +620,16 @@ def _staging_cleanup() -> None:
         conn.execute("DELETE FROM registration_staging WHERE expires_at <= ?", (now,))
 
 
+def _registration_ref_is_ignored(conn: sqlite3.Connection, kind: str, ref_hash: str) -> bool:
+    if not ref_hash:
+        return False
+    row = conn.execute(
+        "SELECT 1 FROM registration_ignored WHERE kind=? AND ref_hash=? LIMIT 1",
+        (kind, ref_hash),
+    ).fetchone()
+    return row is not None
+
+
 def stage_raw_ref(
     *,
     contact_ref: str = "",
@@ -483,6 +670,13 @@ def stage_raw_ref(
     display = hint.get("display_name", "")[:80]
 
     with _connect() as conn:
+        if _registration_ref_is_ignored(conn, kind_norm, ref_hash):
+            return {
+                "ok": True,
+                "ignored": True,
+                "kind": kind_norm,
+                "safe_id": hint.get("safe_id", ""),
+            }
         existing = conn.execute(
             """
             SELECT * FROM registration_staging
@@ -609,15 +803,97 @@ def consume_latest_raw_ref(kind: str = "contact", staging_id: str = "") -> str |
 
 
 
+def _recent_messages_for_staging_row(row: dict[str, Any], *, limit: int = 5, max_text_chars: int = 140) -> list[dict[str, Any]]:
+    """Return bounded safe local context for a staging row.
+
+    This is intentionally local-store only. It can include self-echo messages as
+    context ("Eu"), but it never uses those messages as contact-registration
+    targets and it never fetches provider history.
+    """
+    thread_ref = str(row.get("thread_ref_raw") or "").strip()
+    contact_ref = str(row.get("contact_ref_raw") or "").strip()
+    lookup_ref = thread_ref or contact_ref
+    if not lookup_ref:
+        return []
+    events = lookup_inbound_events(thread=lookup_ref, limit=max(limit * 4, limit))
+    recent: list[dict[str, Any]] = []
+    for event in events:
+        payload = event.get("payload") if isinstance(event.get("payload"), dict) else {}
+        if _message_type_from_payload(payload) == "system":
+            continue
+        summary = _summary_event(event, max_text_chars)
+        from_self = _payload_from_self(payload)
+        summary["from_self"] = from_self
+        summary["direction"] = "eu" if from_self else "contato"
+        if from_self:
+            summary["sender_label"] = "Eu"
+            summary.pop("sender_display_name", None)
+            summary.pop("sender_phone_masked", None)
+        else:
+            summary["sender_label"] = str(summary.get("sender_label") or "Contato")
+        recent.append(summary)
+        if len(recent) >= max(1, min(limit, 5)):
+            break
+    return list(reversed(recent))
+
+
+def _registration_context_summary(messages: list[dict[str, Any]]) -> str:
+    if not messages:
+        return ""
+    parts: list[str] = []
+    for msg in messages[-3:]:
+        who = str(msg.get("sender_label") or ("Eu" if msg.get("from_self") else "Contato"))
+        preview = str(msg.get("text_preview") or "").strip()
+        if not preview:
+            preview = "mídia" if msg.get("has_media") else str(msg.get("message_type") or "mensagem")
+        parts.append(f"{who}: {preview}")
+    return _truncate_text(" | ".join(parts), 260)
+
+
+def _recent_contact_phone_mask(messages: list[dict[str, Any]], display_name: str) -> str:
+    """Return a sanitized sender phone mask from local context for this contact.
+
+    This is a display-only fallback for pre-patch staging rows. It only accepts
+    already-masked sender phones from sanitized local inbound payloads and only
+    when the sender display name matches the staging contact name.
+    """
+    display_norm = _normalize(display_name)
+    if not display_norm:
+        return ""
+    for msg in reversed(messages):
+        if msg.get("from_self"):
+            continue
+        sender_name = _normalize(str(msg.get("sender_display_name") or ""))
+        if sender_name != display_norm:
+            continue
+        masked = _safe_existing_phone_mask(msg.get("sender_phone_masked"))
+        if masked:
+            return masked
+    return ""
+
+
+def _is_system_staging_row(row: dict[str, Any]) -> bool:
+    hint = _load_staging_hint(row.get("safe_hint_json"))
+    return str(hint.get("last_message_type") or "").strip().lower() == "system"
+
+
+def _payload_message_type(payload: dict[str, Any]) -> str:
+    return str(_message_type_from_payload(payload) or "").strip().lower()
+
+
 def _public_staging_item(row: dict[str, Any]) -> dict[str, Any]:
     kind = str(row.get("kind") or "contact")
     hint = _load_staging_hint(row.get("safe_hint_json"))
     raw_ref = _raw_ref_for_kind(kind, str(row.get("contact_ref_raw") or ""), str(row.get("thread_ref_raw") or ""))
     if raw_ref and not hint.get("safe_id"):
         hint["safe_id"] = _safe_registration_id(kind, raw_ref)
+    if kind == "contact" and hint.get("phone_masked") and not hint.get("phone_source") and not _trusted_phone_digits(raw_ref):
+        hint.pop("phone_masked", None)
+        hint.pop("last4", None)
     display_name = row.get("display_name") or hint.get("display_name") or ""
     if not display_name:
         display_name = hint.get("group_name") or hint.get("participant_name") or ""
+    recent_messages = _recent_messages_for_staging_row(row, limit=5, max_text_chars=140)
     item = {
         "staging_id": row["id"],
         "display_name": display_name,
@@ -628,6 +904,20 @@ def _public_staging_item(row: dict[str, Any]) -> dict[str, Any]:
         "message_count": int(row.get("message_count") or 1),
         "safe_id": hint.get("safe_id") or "",
     }
+    if recent_messages:
+        item["recent_messages"] = recent_messages
+        item["context_summary"] = _registration_context_summary(recent_messages)
+        latest_text = next((str(msg.get("text_preview") or "").strip() for msg in reversed(recent_messages) if msg.get("text_preview")), "")
+        if latest_text:
+            item["last_text_preview"] = latest_text
+        if kind == "contact" and not hint.get("phone_masked"):
+            context_mask = _recent_contact_phone_mask(recent_messages, str(display_name or ""))
+            if context_mask:
+                hint["phone_masked"] = context_mask
+                digits = _phone_digits(context_mask)
+                if digits:
+                    hint["last4"] = digits[-4:]
+                hint["phone_source"] = "local_context"
     for key in (
         "phone_masked",
         "last4",
@@ -638,6 +928,9 @@ def _public_staging_item(row: dict[str, Any]) -> dict[str, Any]:
     ):
         if key in hint and hint[key] not in (None, ""):
             item[key] = hint[key]
+    if kind == "contact" and not item.get("phone_masked"):
+        item["phone_status"] = "unresolved"
+        item["identity_note"] = "número não resolvido"
     return item
 
 
@@ -658,6 +951,8 @@ def peek_staging() -> list[dict[str, Any]]:
         ).fetchall()]
     grouped: dict[tuple[str, str], dict[str, Any]] = {}
     for row in rows:
+        if _is_system_staging_row(row):
+            continue
         key = (str(row.get("kind") or "contact"), str(row.get("ref_hash") or row.get("id")))
         if key not in grouped:
             grouped[key] = dict(row)
@@ -667,21 +962,102 @@ def peek_staging() -> list[dict[str, Any]]:
     return [_public_staging_item(row) for row in grouped.values()]
 
 
+def ignore_staging_item(staging_id: str = "", item_index: Any = 0) -> dict[str, Any]:
+    """Ignore a current registration-staging target without exposing raw refs.
+
+    The ignore is keyed by kind + raw-ref hash, so the same group/contact will
+    not be re-staged by the next provider echo. This is still a local store
+    decision; no WhatsApp send, provider call, or secret-manager write occurs.
+    """
+    init_db()
+    _staging_cleanup()
+    selected_id = str(staging_id or "").strip()
+    if not selected_id and item_index not in (None, "", 0, "0"):
+        try:
+            idx = int(str(item_index).strip())
+        except Exception:
+            return {"ok": False, "error": "item_invalid", "hint": "Use /ignorar N com o número mostrado em /fila."}
+        staged = peek_staging()
+        if idx < 1 or idx > len(staged):
+            return {"ok": False, "error": "item_not_found", "hint": "Use /fila para ver os itens atuais."}
+        selected_id = str(staged[idx - 1].get("staging_id") or "")
+    if not selected_id:
+        return {"ok": False, "error": "staging_id_required", "hint": "Use /ignorar N com o número mostrado em /fila."}
+
+    with _connect() as conn:
+        row = conn.execute(
+            "SELECT * FROM registration_staging WHERE id=? AND expires_at > ? LIMIT 1",
+            (selected_id, utc_now()),
+        ).fetchone()
+        if row is None:
+            return {"ok": False, "error": "item_not_found_or_expired", "hint": "Use /fila para ver os itens atuais."}
+        row_dict = dict(row)
+        kind = str(row_dict.get("kind") or "contact").strip().lower()
+        raw_ref = _raw_ref_for_kind(kind, str(row_dict.get("contact_ref_raw") or ""), str(row_dict.get("thread_ref_raw") or ""))
+        ref_hash = str(row_dict.get("ref_hash") or (hash_text(raw_ref) if raw_ref else ""))
+        public_item = _public_staging_item(row_dict)
+        if not ref_hash:
+            return {"ok": False, "error": "ref_hash_missing"}
+        ignored_id = "ignored_" + uuid.uuid4().hex[:12]
+        now = utc_now()
+        conn.execute(
+            """
+            INSERT INTO registration_ignored (id, kind, ref_hash, safe_hint_json, created_at, source_staging_id)
+            VALUES (?, ?, ?, ?, ?, ?)
+            ON CONFLICT(kind, ref_hash) DO UPDATE SET
+                safe_hint_json=excluded.safe_hint_json,
+                created_at=excluded.created_at,
+                source_staging_id=excluded.source_staging_id
+            """,
+            (
+                ignored_id,
+                kind,
+                ref_hash,
+                json.dumps({
+                    "safe_id": public_item.get("safe_id", ""),
+                    "display_name": public_item.get("display_name", ""),
+                    "kind": kind,
+                    "source_group_name": public_item.get("source_group_name", ""),
+                }, ensure_ascii=False, sort_keys=True),
+                now,
+                selected_id,
+            ),
+        )
+        _delete_staging_row(conn, row_dict)
+    return {
+        "ok": True,
+        "ignored": True,
+        "kind": kind,
+        "staging_id": selected_id,
+        "safe_id": public_item.get("safe_id", ""),
+        "display_name": public_item.get("display_name", ""),
+        "message": "Item removido da fila e marcado para não reaparecer automaticamente.",
+        "send_performed": False,
+        "provider_history_used": False,
+    }
+
+
 
 def registration_staging_diagnostics() -> dict[str, Any]:
     """Return sanitized registration-staging diagnostics for operator UX."""
     init_db()
     _staging_cleanup()
+    staging_count = len(peek_staging())
+    latest_created_at = None
     with _connect() as conn:
-        staging_count = conn.execute(
-            "SELECT COUNT(*) FROM registration_staging WHERE expires_at > ?",
-            (utc_now(),),
-        ).fetchone()[0]
         inbound_count = conn.execute("SELECT COUNT(*) FROM inbound_events").fetchone()[0]
-        latest = conn.execute(
-            "SELECT created_at FROM inbound_events ORDER BY created_at DESC LIMIT 1"
-        ).fetchone()
-    latest_created_at = latest["created_at"] if latest else None
+        latest_rows = conn.execute(
+            "SELECT created_at, payload_redacted_json FROM inbound_events ORDER BY created_at DESC LIMIT 20"
+        ).fetchall()
+    for row in latest_rows:
+        try:
+            payload = json.loads(row["payload_redacted_json"] or "{}")
+        except json.JSONDecodeError:
+            payload = {}
+        if not isinstance(payload, dict) or _payload_message_type(payload) == "system":
+            continue
+        latest_created_at = row["created_at"]
+        break
     empty_reason = "none"
     if not staging_count:
         empty_reason = "no_inbound_yet" if not inbound_count else "no_active_staging_or_expired"
@@ -713,7 +1089,7 @@ def upsert_contact(
     if not contact_id or not display_name:
         raise ValueError("contact_id and display_name are required")
     now = utc_now()
-    phone_digits = _phone_digits(phone_e164)
+    phone_digits = _trusted_phone_digits(phone_e164)
     with _connect() as conn:
         conn.execute(
             """
@@ -756,7 +1132,7 @@ def upsert_contact(
     return {
         "contact_id": contact_id,
         "display_name": display_name,
-        "phone_masked": mask_phone(phone_e164),
+        "phone_masked": _safe_existing_phone_mask(phone_e164),
         "whitelisted": bool(whitelisted),
         "policy_group": policy_group,
     }
@@ -1430,7 +1806,7 @@ def get_latest_approval(draft_id: str) -> dict[str, Any] | None:
 def resolve_approval(approval_id: str, decision: str, approver_ref: str | None = None) -> dict[str, Any]:
     init_db()
     decision_norm = str(decision or "").strip().lower()
-    if decision_norm not in {"approved", "denied"}:
+    if decision_norm not in {"approved", "denied", "edit_requested"}:
         return {"ok": False, "approval_id": approval_id, "error": "decision_invalid"}
     now = utc_now()
     with _connect() as conn:
@@ -1457,9 +1833,10 @@ def resolve_approval(approval_id: str, decision: str, approver_ref: str | None =
             "UPDATE approvals SET status=?, approver_ref_hash=?, resolved_at=? WHERE id=?",
             (decision_norm, approver_hash, now, approval_id),
         )
+        draft_status = "needs_edit" if decision_norm == "edit_requested" else decision_norm
         conn.execute(
             "UPDATE drafts SET status=?, updated_at=? WHERE id=?",
-            (decision_norm, now, approval["draft_id"]),
+            (draft_status, now, approval["draft_id"]),
         )
     return {"ok": True, "approval_id": approval_id, "draft_id": approval["draft_id"], "status": decision_norm}
 
@@ -1577,6 +1954,8 @@ def _sanitize_payload(value: Any) -> Any:
             key_norm = key_str.strip().lower()
             if key_norm in secret_keys or any(part in key_norm for part in ("token", "secret", "password", "api_key")):
                 safe[key_str] = "<redacted>"
+            elif key_norm in {"phone", "phone_e164", "number"}:
+                safe[key_str] = _safe_existing_phone_mask(item) or "<redacted>"
             elif key_norm in pii_keys:
                 safe[key_str] = "<redacted>"
             elif key_norm in url_keys or key_norm.endswith("url") or key_norm.endswith("uri"):
@@ -1607,7 +1986,8 @@ def _sanitize_payload(value: Any) -> Any:
         cleaned = re.sub(r"(?i)\bhttps?://[^\s<>\]\)\"']+", "<redacted-url>", cleaned)
         cleaned = re.sub(r"(?i)\b(?:data|blob):[^\s<>\]\)\"']+", "<redacted-url>", cleaned)
         cleaned = re.sub(r"(?i)\b[\w.+:-]+@(?:lid|g\.us|s\.whatsapp\.net)\b", "<redacted-wa-ref>", cleaned)
-        cleaned = re.sub(r"\+?\d[\d\s().-]{6,}\d", "<redacted-phone>", cleaned)
+        cleaned = _replace_phone_mentions_with_names(cleaned)
+        cleaned = re.sub(r"\+?\d[\d\s().-]{6,}\d", lambda match: _mask_phone_fragment(match.group(0)), cleaned)
         cleaned = re.sub(r"(?i)<redacted-phone>[:\w.+-]*@(?:lid|g\.us|s\.whatsapp\.net)\b", "<redacted-wa-ref>", cleaned)
         return cleaned
     return value
@@ -2188,7 +2568,8 @@ def _sanitize_summary_text(value: Any, max_chars: int = 500) -> str:
     text = _SUMMARY_BEARER_RE.sub("Bearer <redacted>", text)
     text = _SUMMARY_TOKEN_PREFIX_RE.sub("<redacted-token>", text)
     text = _SUMMARY_WA_REF_RE.sub("<redacted-ref>", text)
-    text = _SUMMARY_PHONE_RE.sub("<redacted-phone>", text)
+    text = _replace_phone_mentions_with_names(text)
+    text = _SUMMARY_PHONE_RE.sub(lambda match: _mask_phone_fragment(match.group(0)), text)
     text = _SUMMARY_LONG_B64_RE.sub("<redacted-base64>", text)
     return _truncate_text(text, max_chars)
 
@@ -2232,6 +2613,40 @@ def _safe_media_for_summary(media: dict[str, Any]) -> dict[str, Any]:
     return safe
 
 
+def _participant_payload(payload: dict[str, Any]) -> dict[str, Any]:
+    for key in ("participant", "sender", "author", "from"):
+        value = payload.get(key)
+        if isinstance(value, dict):
+            return value
+    body = payload.get("body") if isinstance(payload.get("body"), dict) else {}
+    for key in ("participant", "sender", "author", "from"):
+        value = body.get(key)
+        if isinstance(value, dict):
+            return value
+    return {}
+
+
+def _sender_label_from_payload(payload: dict[str, Any]) -> tuple[str, str, str]:
+    participant = _participant_payload(payload)
+    name = ""
+    for key in ("pushName", "displayName", "name", "title", "notify", "verifiedName"):
+        name = _safe_person_name(participant.get(key), limit=60)
+        if name:
+            break
+    phone_masked = ""
+    for key in ("phone", "phone_e164", "number"):
+        phone_masked = _safe_existing_phone_mask(participant.get(key))
+        if phone_masked:
+            break
+    if name and phone_masked:
+        return f"{name} ({phone_masked})", name, phone_masked
+    if name:
+        return name, name, ""
+    if phone_masked:
+        return phone_masked, "", phone_masked
+    return "", "", ""
+
+
 def _summary_event(event: dict[str, Any], max_text_chars: int) -> dict[str, Any]:
     payload_obj = event.get("payload")
     payload: dict[str, Any] = payload_obj if isinstance(payload_obj, dict) else {}
@@ -2246,6 +2661,13 @@ def _summary_event(event: dict[str, Any], max_text_chars: int) -> dict[str, Any]
     }
     if media:
         item["media"] = media
+    sender_label, sender_display_name, sender_phone_masked = _sender_label_from_payload(payload)
+    if sender_label:
+        item["sender_label"] = sender_label
+    if sender_display_name:
+        item["sender_display_name"] = sender_display_name
+    if sender_phone_masked:
+        item["sender_phone_masked"] = sender_phone_masked
     if max_text_chars > 0:
         preview = _first_text_preview(payload, max_text_chars)
         if preview:
@@ -2511,6 +2933,260 @@ def get_cockpit_overview(limit: int = 10) -> dict[str, Any]:
             "wpp_cancel",
             "wpp_register_alias",
         ],
+    }
+
+
+def _queue_registration_item(item: dict[str, Any], index: int) -> dict[str, Any]:
+    subtype = str(item.get("kind") or "contact").strip().lower()
+    command = "/addgp" if subtype == "group" else "/addct"
+    label = "grupo" if subtype == "group" else "contato"
+    title = str(item.get("display_name") or item.get("phone_masked") or item.get("safe_id") or "sem nome")[:120]
+    suggested_name = title if title and title != "sem nome" else "Nome"
+    primary_action = f"{command} {suggested_name} --item {index}"
+    origin = str(item.get("source_group_name") or item.get("source_group_safe_id") or "").strip()
+    message_type = str(item.get("last_message_type") or "").strip()
+    why = (
+        "grupo novo com atividade recente; cadastrar libera contexto e ações controladas"
+        if subtype == "group"
+        else "contato novo com interação recente; cadastrar evita perder follow-up comercial"
+    )
+    details: list[str] = []
+    if origin:
+        details.append(f"origem: {origin}")
+    if message_type:
+        details.append(f"última msg: {message_type}")
+    if item.get("message_count") and int(item.get("message_count") or 0) > 1:
+        details.append(f"{int(item.get('message_count') or 0)} mensagens")
+    if subtype == "contact" and item.get("phone_status") == "unresolved":
+        details.append("número não resolvido")
+    if item.get("last_text_preview"):
+        details.append(f"msg: {str(item.get('last_text_preview'))[:80]}")
+    result: dict[str, Any] = {
+        "kind": "registration",
+        "subtype": subtype,
+        "priority": "normal",
+        "title": f"Cadastrar {label}: {title}",
+        "operator_state": "ACTION_REQUIRED",
+        "operator_title": f"Cadastrar {label}",
+        "operator_summary": " · ".join(details) if details else why,
+        "why_it_matters": why,
+        "suggested_label": suggested_name,
+        "safe_origin": origin,
+        "primary_action": primary_action,
+        "ignore_action": f"/ignorar {index}",
+        "secondary_actions": [f"/ignorar {index}", "/ctxwpp", "/fila debug"],
+        "staging_id": item.get("staging_id", ""),
+        "display_name": title,
+        "safe_id": item.get("safe_id", ""),
+        "message_count": int(item.get("message_count") or 1),
+        "created_at": item.get("created_at"),
+        "last_seen_at": item.get("last_seen_at") or item.get("created_at"),
+        "actions": [primary_action],
+    }
+    for key in (
+        "phone_masked", "last4", "source_group_safe_id", "source_group_name",
+        "last_message_type", "has_media", "last_text_preview", "context_summary",
+        "recent_messages", "phone_status", "identity_note",
+    ):
+        if item.get(key) not in (None, "", []):
+            result[key] = item[key]
+    return result
+
+
+def _queue_context_item(event: dict[str, Any]) -> dict[str, Any]:
+    context = _event_context(event, "operator", 140)
+    preview = context.get("text_preview")
+    if preview:
+        context["text_preview"] = _sanitize_summary_text(preview, 140)
+    message_type = context.get("message_type") or "unknown"
+    has_media = bool(context.get("has_media"))
+    safe_preview = context.get("text_preview", "")
+    operator_summary = safe_preview or ("mídia recebida" if has_media else f"mensagem {message_type} recebida")
+    return {
+        "kind": "context",
+        "priority": "info",
+        "title": f"Inbound recente: {message_type}",
+        "operator_state": "ACTION_REQUIRED" if safe_preview or has_media else "INFO",
+        "operator_title": "Revisar mensagem recente",
+        "operator_summary": operator_summary,
+        "why_it_matters": "contexto recente pode exigir resposta, cadastro ou follow-up",
+        "safe_preview": safe_preview,
+        "primary_action": "/ctxwpp",
+        "secondary_actions": ["/fila debug"],
+        "safe_event_id": context.get("safe_event_id", ""),
+        "created_at": context.get("created_at", ""),
+        "status": context.get("status", ""),
+        "message_type": message_type,
+        "has_media": has_media,
+        "text_preview": safe_preview,
+        "media": context.get("media", {}),
+        "actions": list(context.get("suggested_actions") or []),
+    }
+
+
+def _queue_operator_summary(items: list[dict[str, Any]], counts: dict[str, Any], warnings: list[str], latest_inbound_created_at: Any) -> dict[str, Any]:
+    total = int(counts.get("total") or len(items) or 0)
+    if total:
+        headline = f"{total} " + ("ação" if total == 1 else "ações") + " no WhatsApp profissional"
+        health = "warning" if warnings else "ok"
+    elif "stale_local_inbound_store" in warnings:
+        headline = "Sem ação atual — contexto antigo oculto"
+        health = "warning"
+    else:
+        headline = "Sem ação agora no WhatsApp profissional"
+        health = "ok"
+
+    best_item = next((item for item in items if item.get("primary_action")), None)
+    best_next_action = ""
+    if best_item:
+        title = str(best_item.get("operator_title") or best_item.get("title") or "agir").strip()
+        action = str(best_item.get("primary_action") or "").strip()
+        best_next_action = f"{title}: {action}" if action else title
+    elif not items:
+        best_next_action = "Aguardar novo inbound ou abrir /crm next"
+
+    risk_bits: list[str] = []
+    if "expired_pending_approvals_hidden" in warnings:
+        risk_bits.append(f"{counts.get('expired_pending_approvals', 0)} approval(s) expirado(s) oculto(s)")
+    if "stale_local_inbound_store" in warnings:
+        risk_bits.append("contexto local antigo oculto")
+
+    return {
+        "headline": headline,
+        "health": health,
+        "best_next_action": best_next_action,
+        "risk_note": "; ".join(risk_bits),
+        "identity_note": "fila usa local_inbound_store recente; raw refs permanecem ocultas",
+        "latest_inbound_created_at": latest_inbound_created_at,
+    }
+
+
+def get_actionable_queue(limit: int = 10) -> dict[str, Any]:
+    """Return a read-only sanitized operator queue for WhatsApp Ops.
+
+    Combines pending approvals, registration staging, and recent local inbound
+    context. This never sends, drafts, approves, fetches provider history, or
+    exposes raw WhatsApp refs/message ids/approval tokens.
+    """
+    init_db()
+    limit_value, limit_clamped = _clamp_int(limit, 10, 1, 50)
+    with _connect() as conn:
+        approval_rows = conn.execute(
+            """
+            SELECT id, draft_id, status, expires_at, created_at, resolved_at
+            FROM approvals
+            WHERE status='pending' AND expires_at > ?
+            ORDER BY created_at DESC
+            LIMIT ?
+            """,
+            (utc_now(), limit_value),
+        ).fetchall()
+        expired_pending_approvals = int(conn.execute(
+            "SELECT COUNT(*) FROM approvals WHERE status='pending' AND expires_at <= ?",
+            (utc_now(),),
+        ).fetchone()[0])
+        counts = {
+            "pending_approvals": int(approval_rows and len(approval_rows) or 0),
+            "expired_pending_approvals": expired_pending_approvals,
+            "active_staging": 0,
+            "inbound_events": _count_rows(conn, "inbound_events"),
+            "drafts_by_status": _count_by_status(conn, "drafts"),
+            "outbox_by_status": _count_by_status(conn, "outbox"),
+        }
+
+    items: list[dict[str, Any]] = []
+    for row in approval_rows:
+        draft_id = row["draft_id"]
+        items.append({
+            "kind": "approval",
+            "priority": "high",
+            "title": "Aprovação WhatsApp pendente",
+            "operator_state": "WAITING_APPROVAL",
+            "operator_title": "Aprovar ou negar WhatsApp",
+            "operator_summary": "há um draft aguardando decisão humana no card Telegram",
+            "why_it_matters": "sem clique humano o Hunter não deve enviar nem executar ação real",
+            "primary_action": "aprovar/negar no card Telegram",
+            "secondary_actions": [f"wpp_status({draft_id})", "/fila debug"],
+            "approval_id": row["id"],
+            "draft_id": draft_id,
+            "status": row["status"],
+            "created_at": row["created_at"],
+            "expires_at": row["expires_at"],
+            "resolved_at": row["resolved_at"],
+            "actions": [
+                "aprovar/negar no card Telegram",
+                f"wpp_status({draft_id})",
+                f"wpp_send_approved({draft_id}) após aprovação",
+            ],
+        })
+
+    staged_all = peek_staging()
+    staged = [
+        item for item in staged_all
+        if str(item.get("last_message_type") or "").strip().lower() != "system"
+    ][:limit_value]
+    counts["active_staging"] = len(staged)
+    for index, staged_item in enumerate(staged, 1):
+        items.append(_queue_registration_item(staged_item, index))
+
+    latest_inbound_created_at = None
+    max_context_age = timedelta(hours=24)
+    recent_events: list[dict[str, Any]] = []
+    for event in lookup_inbound_events(limit=max(limit_value * 5, 20)):
+        payload = event.get("payload") if isinstance(event.get("payload"), dict) else {}
+        if _message_type_from_payload(payload) == "system":
+            continue
+        if latest_inbound_created_at is None:
+            latest_inbound_created_at = event.get("created_at") or None
+        if _payload_from_self(payload):
+            continue
+        if not _is_recent_iso(event.get("created_at"), max_age=max_context_age):
+            continue
+        recent_events.append(event)
+        if len(recent_events) >= limit_value:
+            break
+    for event in recent_events:
+        items.append(_queue_context_item(event))
+
+    counts["registration_items"] = len(staged)
+    counts["context_items"] = len(recent_events)
+    counts["total"] = len(items)
+    warnings = ["limit_clamped"] if limit_clamped else []
+    if latest_inbound_created_at and not _is_recent_iso(latest_inbound_created_at, max_age=max_context_age):
+        warnings.append("stale_local_inbound_store")
+    if expired_pending_approvals:
+        warnings.append("expired_pending_approvals_hidden")
+    if not items:
+        warnings.append("empty_queue")
+    operator_summary = _queue_operator_summary(items, counts, warnings, latest_inbound_created_at)
+    return {
+        "ok": True,
+        "source": "local_inbound_store",
+        "generated_by": "deterministic_local_v1",
+        "read_only": True,
+        "local_store_only": True,
+        "send_performed": False,
+        "draft_created": False,
+        "approval_resolved": False,
+        "provider_history_used": False,
+        "summary_persisted": False,
+        "exposes_raw_refs": False,
+        "limit": limit_value,
+        "context_max_age_hours": int(max_context_age.total_seconds() // 3600),
+        "latest_inbound_created_at": latest_inbound_created_at,
+        "operator_summary": operator_summary,
+        "counts": counts,
+        "items": items[: limit_value * 3],
+        "operator_actions": [
+            "wpp_actionable_queue",
+            "wpp_cockpit_overview",
+            "wpp_thread_context",
+            "wpp_conversation_summary",
+            "wpp_register_staging_status",
+            "wpp_request_approval",
+            "wpp_send_approved",
+        ],
+        "warnings": warnings,
     }
 
 

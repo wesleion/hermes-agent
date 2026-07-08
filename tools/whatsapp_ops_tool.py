@@ -8,6 +8,8 @@ from __future__ import annotations
 
 import json
 import os
+import re
+import time
 import urllib.error
 import urllib.parse
 import urllib.request
@@ -24,6 +26,7 @@ from tools.whatsapp_ops_store import (
     consume_latest_raw_ref,
     create_approval,
     create_draft,
+    get_actionable_queue,
     get_cockpit_overview,
     get_conversation_summary,
     get_media_transcription_status,
@@ -31,6 +34,7 @@ from tools.whatsapp_ops_store import (
     get_transport_contact_ref,
     get_transport_group_ref,
     import_contact_list_local,
+    ignore_staging_item,
     list_contact_segment_members,
     list_contact_segments,
     registration_staging_diagnostics,
@@ -51,6 +55,7 @@ from tools.whatsapp_ops_store import (
     request_media_transcription,
     reserve_outbox_send,
     resolve_approval,
+    _payload_from_self,
     resolve_contact,
     stage_raw_ref,
     sync_allowlist_from_env,
@@ -71,6 +76,20 @@ def _default_config() -> dict[str, Any]:
         "approval": {"required": True, "timeout_minutes": 60, "telegram": {}},
         "allowlists": {"contacts": [], "groups": []},
         "quepasa": {"backend": "n8n_or_http", "send_enabled": False},
+        "humanized_send": {
+            "enabled": False,
+            "delay_mode": "fixed",
+            "delay_seconds": 0,
+            "min_delay_seconds": 0.8,
+            "max_delay_seconds": 6.0,
+            "chars_per_second": 38.0,
+            "max_blocks": 4,
+            "max_blocks_max": 5,
+            "min_blocks": 1,
+            "target_block_chars": 260,
+            "max_block_chars": 360,
+            "typing": {"enabled": False, "presence_type": "text"},
+        },
     }
 
 
@@ -286,11 +305,43 @@ def _raw_group_entries() -> list[dict[str, Any]]:
     return [item for item in groups if isinstance(item, dict)] if isinstance(groups, list) else []
 
 
+def _raw_contact_entries_from_config(cfg: dict[str, Any] | None) -> list[dict[str, Any]]:
+    allowlists = (cfg or {}).get("allowlists") if isinstance(cfg, dict) else {}
+    contacts = allowlists.get("contacts") if isinstance(allowlists, dict) else []
+    entries: list[dict[str, Any]] = []
+    if isinstance(contacts, list):
+        for raw_ref in contacts:
+            text = str(raw_ref or "").strip()
+            if not text or text.startswith("contact_"):
+                continue
+            digits = _digits(text)
+            if "@" not in text and len(digits) < 8:
+                continue
+            entries.append({"target_ref": text, "kind": "contact", "allow_send": True})
+    return entries
+
+
+def _raw_group_entries_from_config(cfg: dict[str, Any] | None) -> list[dict[str, Any]]:
+    allowlists = (cfg or {}).get("allowlists") if isinstance(cfg, dict) else {}
+    groups = allowlists.get("groups") if isinstance(allowlists, dict) else []
+    entries: list[dict[str, Any]] = []
+    if isinstance(groups, list):
+        for raw_ref in groups:
+            text = str(raw_ref or "").strip()
+            if not text or text.startswith("list_"):
+                continue
+            digits = _digits(text)
+            if "@" not in text and len(digits) < 8:
+                continue
+            entries.append({"target_ref": text, "kind": "group", "allow_send": True})
+    return entries
+
+
 def _digits(value: str) -> str:
     return "".join(ch for ch in str(value or "") if ch.isdigit())
 
 
-def _resolve_raw_contact_ref(query: str) -> str:
+def _resolve_raw_contact_ref(query: str, cfg: dict[str, Any] | None = None) -> str:
     """Resolve an operator alias to a raw provider ref for transport only.
 
     Raw refs are sourced from env/Infisical-rendered allowlists and are never
@@ -302,7 +353,7 @@ def _resolve_raw_contact_ref(query: str) -> str:
     needle_norm = needle.casefold()
     needle_digits = _digits(needle)
     matches: list[str] = []
-    for item in _raw_contact_entries():
+    for item in [*_raw_contact_entries(), *_raw_contact_entries_from_config(cfg)]:
         kind = str(item.get("kind") or "contact").strip().lower()
         if kind not in {"contact", "dm"}:
             continue
@@ -326,14 +377,14 @@ def _resolve_raw_contact_ref(query: str) -> str:
     return get_transport_contact_ref(needle)
 
 
-def _resolve_raw_group_ref(query: str) -> str:
+def _resolve_raw_group_ref(query: str, cfg: dict[str, Any] | None = None) -> str:
     """Resolve a group/list alias or sanitized list id to a raw provider ref for transport only."""
     needle = str(query or "").strip()
     if not needle:
         return ""
     needle_norm = needle.casefold()
     matches: list[str] = []
-    for item in _raw_group_entries():
+    for item in [*_raw_group_entries(), *_raw_group_entries_from_config(cfg)]:
         kind = str(item.get("kind") or "group").strip().lower()
         if kind not in {"group", "list"}:
             continue
@@ -355,7 +406,7 @@ def _resolve_raw_group_ref(query: str) -> str:
     return get_transport_group_ref(needle)
 
 
-def _provider_targets_for_transport(targets: list[dict[str, Any]]) -> tuple[list[dict[str, Any]], str | None]:
+def _provider_targets_for_transport(targets: list[dict[str, Any]], cfg: dict[str, Any] | None = None) -> tuple[list[dict[str, Any]], str | None]:
     provider_targets: list[dict[str, Any]] = []
     for target in targets:
         if not isinstance(target, dict):
@@ -363,14 +414,16 @@ def _provider_targets_for_transport(targets: list[dict[str, Any]]) -> tuple[list
         target_type = str(target.get("type") or "").strip().lower()
         if target_type == "contact":
             raw_ref = _resolve_raw_contact_ref(
-                str(target.get("contact_id") or target.get("alias") or target.get("name") or target.get("ref") or "")
+                str(target.get("contact_id") or target.get("alias") or target.get("name") or target.get("ref") or ""),
+                cfg,
             )
             if not raw_ref:
                 return [], "target_ref_unresolved"
             provider_targets.append({"type": "contact", "contact_id": raw_ref})
         elif target_type in {"group", "list"}:
             raw_ref = _resolve_raw_group_ref(
-                str(target.get("group_id") or target.get("list_id") or target.get("alias") or target.get("name") or "")
+                str(target.get("group_id") or target.get("list_id") or target.get("alias") or target.get("name") or ""),
+                cfg,
             )
             if not raw_ref:
                 return [], "target_ref_unresolved"
@@ -393,7 +446,12 @@ def _extract_group_create_target(draft: dict[str, Any] | None) -> dict[str, Any]
     return matches[0] if len(matches) == 1 else None
 
 
-def _group_create_provider_payload(draft_id: str, draft: dict[str, Any] | None, idempotency_key: str) -> tuple[dict[str, Any] | None, str | None]:
+def _group_create_provider_payload(
+    draft_id: str,
+    draft: dict[str, Any] | None,
+    idempotency_key: str,
+    cfg: dict[str, Any] | None = None,
+) -> tuple[dict[str, Any] | None, str | None]:
     target = _extract_group_create_target(draft)
     if not target:
         return None, "payload_invalid"
@@ -403,7 +461,7 @@ def _group_create_provider_payload(draft_id: str, draft: dict[str, Any] | None, 
         return None, "payload_invalid"
     participants: list[str] = []
     for member in members:
-        raw_ref = _resolve_raw_contact_ref(str(member or ""))
+        raw_ref = _resolve_raw_contact_ref(str(member or ""), cfg)
         if not raw_ref:
             return None, "participant_ref_unresolved"
         participants.append(raw_ref)
@@ -466,9 +524,9 @@ def _send_telegram_approval_card(approval: dict[str, Any], draft: dict[str, Any]
     except Exception:
         is_group_create = False
     approval_note = (
-        "Aprovar tenta executar a criação via QuePasa/direct, respeitando flags e allowlist."
+        "Aprovar e enviar executa a criação via QuePasa/direct agora. Editar pede revisão sem enviar."
         if is_group_create
-        else "Aprovar só marca o draft como approved. O envio continua separado."
+        else "Aprovar e enviar dispara via QuePasa/direct agora. Editar pede revisão sem enviar."
     )
     text = (
         "📲 <b>WhatsApp Ops approval</b>\n\n"
@@ -484,7 +542,8 @@ def _send_telegram_approval_card(approval: dict[str, Any], draft: dict[str, Any]
         "parse_mode": "HTML",
         "reply_markup": {
             "inline_keyboard": [[
-                {"text": "✅ Aprovar", "callback_data": f"wpp:a:{approval_id}"},
+                {"text": "✅ Aprovar e Enviar", "callback_data": f"wpp:a:{approval_id}"},
+                {"text": "✏️ Editar", "callback_data": f"wpp:e:{approval_id}"},
                 {"text": "❌ Negar", "callback_data": f"wpp:d:{approval_id}"},
             ]]
         },
@@ -538,11 +597,243 @@ def wpp_create_draft(
     return _json(response)
 
 
+def _humanized_truthy(value: Any) -> bool:
+    if isinstance(value, str):
+        return value.strip().lower() in {"1", "true", "yes", "on"}
+    return bool(value)
+
+
+def _humanized_send_options(cfg: dict[str, Any]) -> dict[str, Any]:
+    raw = (cfg or {}).get("humanized_send")
+    options = raw if isinstance(raw, dict) else {}
+    typing_raw = options.get("typing")
+    typing_options = typing_raw if isinstance(typing_raw, dict) else {}
+
+    def _int(name: str, default: int, minimum: int, maximum: int) -> int:
+        try:
+            value = int(options.get(name, default))
+        except (TypeError, ValueError):
+            value = default
+        return max(minimum, min(maximum, value))
+
+    def _float(name: str, default: float, minimum: float, maximum: float) -> float:
+        try:
+            value = float(options.get(name, default))
+        except (TypeError, ValueError):
+            value = default
+        return max(minimum, min(maximum, value))
+
+    def _str(name: str, default: str) -> str:
+        value = str(options.get(name, default) or default).strip().lower()
+        return value or default
+
+    presence_type = str(typing_options.get("presence_type") or "text").strip().lower()
+    if presence_type not in {"text", "audio"}:
+        presence_type = "text"
+    min_delay = _float("min_delay_seconds", 0.8, 0.0, 20.0)
+    max_delay = _float("max_delay_seconds", max(min_delay, 6.0), min_delay, 30.0)
+    chars_per_second = _float("chars_per_second", 38.0, 8.0, 120.0)
+    max_block_chars = _int("max_block_chars", 360, 80, 1200)
+
+    raw_max_blocks = options.get("max_blocks", 4)
+    max_blocks_mode = "fixed"
+    if isinstance(raw_max_blocks, str) and raw_max_blocks.strip().lower() in {"auto", "dynamic"}:
+        max_blocks_mode = "dynamic"
+        max_blocks = _int("max_blocks_max", 5, 2, 8)
+    else:
+        max_blocks = _int("max_blocks", 4, 2, 8)
+    min_blocks = _int("min_blocks", 1, 1, max_blocks)
+    target_block_chars = _int("target_block_chars", min(260, max_block_chars), 80, max_block_chars)
+
+    return {
+        "enabled": _humanized_truthy(options.get("enabled", False)),
+        "delay_mode": _str("delay_mode", "fixed"),
+        "delay_seconds": _float("delay_seconds", 0.0, 0.0, 30.0),
+        "min_delay_seconds": min_delay,
+        "max_delay_seconds": max_delay,
+        "chars_per_second": chars_per_second,
+        "max_blocks": max_blocks,
+        "max_blocks_mode": max_blocks_mode,
+        "min_blocks": min_blocks,
+        "target_block_chars": target_block_chars,
+        "max_block_chars": max_block_chars,
+        "typing_enabled": _humanized_truthy(typing_options.get("enabled", False)),
+        "typing_presence_type": presence_type,
+    }
+
+
+def _humanized_block_delay_seconds(block: str, options: dict[str, Any]) -> float:
+    if str(options.get("delay_mode") or "fixed").lower() != "adaptive":
+        return round(float(options.get("delay_seconds") or 0.0), 2)
+    text = str(block or "").strip()
+    if not text:
+        return 0.0
+    weighted_chars = len(text) + 20 * text.count("\n") + 8 * len(re.findall(r"[,;:!?]", text))
+    estimate = weighted_chars / float(options.get("chars_per_second") or 38.0)
+    bounded = max(float(options.get("min_delay_seconds") or 0.0), min(float(options.get("max_delay_seconds") or estimate), estimate))
+    return round(bounded, 2)
+
+
+def _effective_humanized_max_blocks(text: str, candidate_count: int, options: dict[str, Any]) -> int:
+    cap = max(1, int(options.get("max_blocks") or 1))
+    if str(options.get("max_blocks_mode") or "fixed").lower() != "dynamic":
+        return cap
+    clean_text = str(text or "").strip()
+    if not clean_text:
+        return 1
+    target_chars = max(1, int(options.get("target_block_chars") or options.get("max_block_chars") or 360))
+    by_size = max(1, (len(clean_text) + target_chars - 1) // target_chars)
+    by_structure = max(1, int(candidate_count or 1))
+    min_blocks = max(1, int(options.get("min_blocks") or 1))
+    needed = max(min_blocks, min(cap, max(by_size, by_structure)))
+    return max(1, min(cap, needed))
+
+
+def _expand_oversized_humanized_candidates(candidates: list[str], max_block_chars: int) -> list[str]:
+    expanded: list[str] = []
+    for candidate in candidates:
+        part = str(candidate or "").strip()
+        if not part:
+            continue
+        if len(part) <= max_block_chars:
+            expanded.append(part)
+            continue
+        sentences = [s.strip() for s in re.split(r"(?<=[.!?])\s+", part) if s.strip()]
+        if len(sentences) <= 1:
+            expanded.append(part)
+            continue
+        expanded.extend(_pack_message_blocks(sentences, max_block_chars, 50))
+    return expanded
+
+
+def _limit_humanized_blocks(blocks: list[str], max_blocks: int) -> list[str]:
+    clean = [str(block or "").strip() for block in blocks if str(block or "").strip()]
+    if len(clean) > max_blocks:
+        head = clean[: max_blocks - 1]
+        tail = "\n\n".join(clean[max_blocks - 1:]).strip()
+        return [*head, tail] if tail else head
+    return clean
+
+
+def _pack_message_blocks(candidates: list[str], max_block_chars: int, max_blocks: int) -> list[str]:
+    blocks: list[str] = []
+    current = ""
+    for candidate in candidates:
+        part = str(candidate or "").strip()
+        if not part:
+            continue
+        separator = "\n\n" if "\n" in current or "\n" in part else " "
+        proposed = f"{current}{separator}{part}" if current else part
+        if current and len(proposed) > max_block_chars:
+            blocks.append(current.strip())
+            current = part
+        else:
+            current = proposed
+    if current.strip():
+        blocks.append(current.strip())
+    if len(blocks) > max_blocks:
+        head = blocks[: max_blocks - 1]
+        tail = "\n\n".join(blocks[max_blocks - 1:]).strip()
+        blocks = [*head, tail] if tail else head
+    return blocks
+
+
+def _split_humanized_message(message: str, cfg: dict[str, Any]) -> list[str]:
+    options = _humanized_send_options(cfg)
+    text = str(message or "").replace("\r\n", "\n").strip()
+    if not options["enabled"] or not text:
+        return [text]
+    max_chars = int(options["max_block_chars"])
+    paragraphs = [p.strip() for p in re.split(r"\n\s*\n+", text) if p.strip()]
+    if len(paragraphs) > 1:
+        candidates = _expand_oversized_humanized_candidates(paragraphs, max_chars)
+        max_blocks = _effective_humanized_max_blocks(text, len(candidates), options)
+        return _limit_humanized_blocks(candidates, max_blocks) or [text]
+    if len(text) <= max_chars:
+        return [text]
+    sentences = [s.strip() for s in re.split(r"(?<=[.!?])\s+", text) if s.strip()]
+    if len(sentences) <= 1:
+        return [text]
+    max_blocks = _effective_humanized_max_blocks(text, len(sentences), options)
+    return _pack_message_blocks(sentences, max_chars, max_blocks) or [text]
+
+
+def _send_humanized_or_single(
+    client: Callable[[dict[str, Any], dict[str, Any]], dict[str, Any]],
+    payload: dict[str, Any],
+    cfg: dict[str, Any],
+    sleep_fn: Callable[[float], None] | None = None,
+    presence_client: Callable[[dict[str, Any], dict[str, Any]], dict[str, Any]] | None = None,
+) -> dict[str, Any]:
+    if payload.get("media"):
+        return client(payload, cfg)
+    blocks = _split_humanized_message(str(payload.get("message") or ""), cfg)
+    if len(blocks) <= 1:
+        return client(payload, cfg)
+    options = _humanized_send_options(cfg)
+    sleeper = sleep_fn or time.sleep
+    results: list[dict[str, Any]] = []
+    presence_results: list[dict[str, Any]] = []
+    block_delays = [_humanized_block_delay_seconds(block, options) for block in blocks]
+    typing_enabled = bool(options.get("typing_enabled")) and presence_client is not None
+
+    for index, block in enumerate(blocks, start=1):
+        wait_seconds = float(block_delays[index - 1])
+        if typing_enabled and wait_seconds > 0:
+            presence_payload = {
+                "targets": payload.get("targets") or [],
+                "presence_type": options.get("typing_presence_type") or "text",
+                "duration_ms": int(wait_seconds * 1000),
+                "humanized": {"block_index": index, "block_count": len(blocks)},
+            }
+            presence_result = presence_client(presence_payload, cfg)
+            presence_results.append(presence_result)
+            # Typing is best-effort; do not fail an already-approved send if the
+            # indicator endpoint is unavailable.
+            sleeper(wait_seconds)
+        elif index > 1 and wait_seconds > 0:
+            sleeper(wait_seconds)
+
+        block_payload = dict(payload)
+        block_payload["message"] = block
+        block_payload["humanized"] = {"block_index": index, "block_count": len(blocks)}
+        result = client(block_payload, cfg)
+        results.append(result)
+        if not bool(result.get("ok")):
+            return {
+                "ok": False,
+                "transport": "humanized_sequence",
+                "error": str(result.get("error") or "block_send_failed")[:120],
+                "failed_block_index": index,
+                "blocks_attempted": len(results),
+                "delays_seconds": block_delays,
+                "typing_attempted": bool(presence_results),
+                "messages": results,
+            }
+    response = {
+        "ok": True,
+        "transport": "humanized_sequence",
+        "blocks_sent": len(results),
+        "delay_mode": str(options.get("delay_mode") or "fixed"),
+        "max_blocks_mode": str(options.get("max_blocks_mode") or "fixed"),
+        "effective_blocks": len(blocks),
+        "max_blocks_cap": int(options.get("max_blocks") or len(blocks)),
+        "delays_seconds": block_delays,
+        "typing_attempted": bool(presence_results),
+        "messages": results,
+    }
+    if str(options.get("delay_mode") or "fixed").lower() == "fixed":
+        response["delay_seconds"] = float(options.get("delay_seconds") or 0.0)
+    return response
+
+
 def wpp_send_approved(
     draft_id: str,
     approval_token: str | None = None,
     config: dict[str, Any] | None = None,
     send_client: Callable[[dict[str, Any], dict[str, Any]], dict[str, Any]] | None = None,
+    sleep_fn: Callable[[float], None] | None = None,
+    presence_client: Callable[[dict[str, Any], dict[str, Any]], dict[str, Any]] | None = None,
 ) -> str:
     """Send an explicitly human-approved draft only if guardrails allow it."""
     init_db()
@@ -562,7 +853,7 @@ def wpp_send_approved(
 
     is_group_create = _is_group_create_policy_draft(policy_draft)
     if is_group_create:
-        payload, payload_error = _group_create_provider_payload(draft_id, draft, idempotency_key)
+        payload, payload_error = _group_create_provider_payload(draft_id, draft, idempotency_key, cfg)
         if payload_error:
             return _json({"ok": False, "draft_id": draft_id, "reasons": [payload_error]})
         if send_client is None:
@@ -573,13 +864,15 @@ def wpp_send_approved(
             client = send_client
     else:
         if send_client is None:
-            from tools.whatsapp_ops_quepasa import send_via_quepasa
+            from tools.whatsapp_ops_quepasa import send_presence_via_quepasa, send_via_quepasa
 
             client = send_via_quepasa
+            presence = presence_client or send_presence_via_quepasa
         else:
             client = send_client
+            presence = presence_client
         media = _load_draft_media(draft)
-        provider_targets, target_error = _provider_targets_for_transport(policy_draft["targets"] if policy_draft else [])
+        provider_targets, target_error = _provider_targets_for_transport(policy_draft["targets"] if policy_draft else [], cfg)
         if target_error:
             return _json({"ok": False, "draft_id": draft_id, "reasons": [target_error]})
         payload = {
@@ -594,7 +887,11 @@ def wpp_send_approved(
     if idempotency_key and not reserve_outbox_send(draft_id, idempotency_key):
         return _json({"ok": False, "draft_id": draft_id, "reasons": ["idempotency_duplicate"]})
 
-    send_result = client(payload, cfg)
+    send_result = (
+        client(payload, cfg)
+        if is_group_create
+        else _send_humanized_or_single(client, payload, cfg, sleep_fn=sleep_fn, presence_client=presence)
+    )
     if idempotency_key:
         if bool(send_result.get("ok")):
             mark_outbox_result(draft_id, idempotency_key, "sent")
@@ -784,6 +1081,24 @@ def wpp_cockpit_overview(limit: int = 10) -> str:
     return _json(overview)
 
 
+def wpp_actionable_queue(limit: int = 10) -> str:
+    """Return a read-only WhatsApp Ops operator queue with safe next actions."""
+    cfg = _runtime_config()
+    queue = get_actionable_queue(limit=limit)
+    queue["send_flags"] = {
+        "send_enabled": bool(cfg.get("send_enabled", False)),
+        "quepasa_send_enabled": bool((cfg.get("quepasa") or {}).get("send_enabled", False)),
+        "approval_required": bool((cfg.get("approval") or {}).get("required", True)),
+        "require_target_whitelist": bool(cfg.get("require_target_whitelist", True)),
+    }
+    return _json(queue)
+
+
+def wpp_ignore_staging_item(item: int = 0, staging_id: str = "") -> str:
+    """Ignore a WhatsApp Ops registration queue item without sending anything."""
+    return _json(ignore_staging_item(staging_id=str(staging_id or ""), item_index=item))
+
+
 def _nested_dict(value: Any, *keys: str) -> dict[str, Any]:
     current: Any = value
     for key in keys:
@@ -866,6 +1181,20 @@ def _registration_hints(
         contact_hint["source_group_name"] = group_name
     if participant_name:
         contact_hint["participant_name"] = participant_name
+    participant_phone = _first_text(
+        participant.get("phone"),
+        participant.get("phone_e164"),
+        participant.get("phoneNumber"),
+        participant.get("phone_number"),
+        payload.get("senderPhone"),
+        payload.get("participantPhone"),
+        payload.get("phone"),
+        data.get("senderPhone"),
+        data.get("participantPhone"),
+        data.get("phone"),
+    )
+    if participant_phone:
+        contact_hint["phone"] = participant_phone
     return group_hint, contact_hint
 
 
@@ -916,7 +1245,12 @@ def wpp_ingest_inbound_event(payload: dict[str, Any]) -> str:
         )
         # Stage raw refs temporarily for registration use. For group messages,
         # expose both actionable targets: the group and the participant/contact.
-        if result.get("ok") and not result.get("deduped"):
+        # Provider echoes from the connected account (fromme/key.fromMe) are not
+        # external leads: keep the group registration item if useful, but never
+        # offer the operator's own number as a contact to register.
+        from_self = _payload_from_self(payload)
+        registration_msg_type = _registration_message_type(payload, data)
+        if result.get("ok") and not result.get("deduped") and registration_msg_type != "system":
             try:
                 group_hint, contact_hint = _registration_hints(payload, data, chat, participant)
                 if thread_ref and thread_ref != contact_ref:
@@ -927,7 +1261,7 @@ def wpp_ingest_inbound_event(payload: dict[str, Any]) -> str:
                         kind="group",
                         safe_hint=group_hint,
                     )
-                    if contact_ref:
+                    if contact_ref and not from_self:
                         stage_raw_ref(
                             contact_ref=contact_ref,
                             thread_ref=thread_ref,
@@ -935,7 +1269,7 @@ def wpp_ingest_inbound_event(payload: dict[str, Any]) -> str:
                             kind="contact",
                             safe_hint=contact_hint,
                         )
-                else:
+                elif not from_self:
                     stage_raw_ref(
                         contact_ref=contact_ref or thread_ref,
                         thread_ref=thread_ref or contact_ref,
@@ -1431,6 +1765,41 @@ registry.register(
         [],
     ),
     handler=lambda args, **kw: wpp_cockpit_overview(limit=args.get("limit", 10)),
+    check_fn=check_whatsapp_ops_requirements,
+    emoji="📲",
+)
+
+registry.register(
+    name="wpp_actionable_queue",
+    toolset=TOOLSET,
+    schema=_schema(
+        "wpp_actionable_queue",
+        "Return a sanitized read-only WhatsApp Ops operator queue combining pending approvals, registration staging, recent local inbound context, and safe next actions. Never sends, never approves, never creates drafts, and never fetches provider history.",
+        {"limit": {"type": "integer"}},
+        [],
+    ),
+    handler=lambda args, **kw: wpp_actionable_queue(limit=args.get("limit", 10)),
+    check_fn=check_whatsapp_ops_requirements,
+    emoji="📲",
+)
+
+
+registry.register(
+    name="wpp_ignore_staging_item",
+    toolset=TOOLSET,
+    schema=_schema(
+        "wpp_ignore_staging_item",
+        "Ignore/remove a contact or group from the current registration queue without sending messages.",
+        {
+            "item": {"type": "integer", "description": "1-based item number from /fila", "default": 0},
+            "staging_id": {"type": "string", "description": "Optional explicit staging id"},
+        },
+        [],
+    ),
+    handler=lambda args, **kw: wpp_ignore_staging_item(
+        item=args.get("item", 0),
+        staging_id=args.get("staging_id", ""),
+    ),
     check_fn=check_whatsapp_ops_requirements,
     emoji="📲",
 )
