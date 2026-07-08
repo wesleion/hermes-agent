@@ -888,6 +888,48 @@ def test_thread_context_operator_mode_summarizes_local_store_without_raw_refs(tm
     assert "secret" not in serialized
 
 
+def test_conversation_summary_hides_system_events_from_operational_counts(tmp_path):
+    from tools.whatsapp_ops_store import get_conversation_summary, init_db, record_inbound_event
+
+    token = set_hermes_home_override(tmp_path)
+    try:
+        init_db()
+        record_inbound_event(
+            source_event_id="summary-text-001",
+            contact_ref="172185238905034@lid",
+            thread_ref="120363375521827492@g.us",
+            payload={"id": "summary-text-001", "type": "text", "text": "Mensagem comercial útil"},
+        )
+        record_inbound_event(
+            source_event_id="summary-system-001",
+            contact_ref="system@s.whatsapp.net",
+            thread_ref="120363375521827492@g.us",
+            payload={"id": "summary-system-001", "type": "system", "message": "Internal System Message"},
+        )
+        summary = get_conversation_summary(
+            thread="120363375521827492@g.us",
+            mode="brief",
+            limit=10,
+            max_text_chars=120,
+        )
+    finally:
+        reset_hermes_home_override(token)
+
+    serialized = json.dumps(summary, ensure_ascii=False)
+    assert summary["ok"] is True
+    assert summary["message_count"] == 1
+    assert summary["hidden_system_events"] == 1
+    assert "system_events_hidden" in summary["warnings"]
+    assert summary["type_counts"] == {"text": 1}
+    assert "system" not in summary["type_counts"]
+    assert "Internal System Message" not in serialized
+    assert "summary-system-001" not in serialized
+    assert "@g.us" not in serialized
+    assert "@lid" not in serialized
+    assert "120363375521827492" not in serialized
+    assert "172185238905034" not in serialized
+
+
 def test_sync_allowlist_from_env_fails_closed_on_malformed_json(tmp_path, monkeypatch):
     from tools.whatsapp_ops_store import init_db, list_contacts, sync_allowlist_from_env
 
