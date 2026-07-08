@@ -1551,6 +1551,251 @@ def register_group_local(
 
 
 # ---------------------------------------------------------------------------
+# Conversation target resolution (read-only, no raw refs in public output)
+# ---------------------------------------------------------------------------
+
+
+def _public_conversation_candidate(candidate: dict[str, Any]) -> dict[str, Any]:
+    result = {
+        "target_kind": str(candidate.get("target_kind") or ""),
+        "target_label": _clean_registration_text(candidate.get("target_label") or candidate.get("target_safe_id") or "alvo", limit=80) or "alvo",
+        "target_safe_id": str(candidate.get("target_safe_id") or "")[:80],
+        "source": str(candidate.get("source") or "local")[:80],
+        "thread_filter_set": bool(candidate.get("thread_ref")),
+        "contact_filter_set": bool(candidate.get("contact_ref")),
+    }
+    if candidate.get("staging_id"):
+        result["staging_id"] = str(candidate.get("staging_id"))[:80]
+    if candidate.get("message_count") not in (None, ""):
+        try:
+            result["message_count"] = int(candidate.get("message_count") or 0)
+        except Exception:
+            pass
+    if candidate.get("last_seen_at"):
+        result["last_seen_at"] = str(candidate.get("last_seen_at"))[:80]
+    return result
+
+
+def _conversation_target_response(candidate: dict[str, Any], *, include_transport: bool = False) -> dict[str, Any]:
+    public = _public_conversation_candidate(candidate)
+    public.update({"ok": True, "ambiguous": False})
+    if include_transport:
+        public["_thread_ref"] = str(candidate.get("thread_ref") or "")
+        public["_contact_ref"] = str(candidate.get("contact_ref") or "")
+    return public
+
+
+def _candidate_from_staging_row(row: dict[str, Any], *, source: str = "staging") -> dict[str, Any] | None:
+    kind = str(row.get("kind") or "contact").strip().lower()
+    contact_ref = str(row.get("contact_ref_raw") or "")
+    thread_ref = str(row.get("thread_ref_raw") or "")
+    raw_ref = _raw_ref_for_kind(kind, contact_ref, thread_ref)
+    if not raw_ref:
+        return None
+    public = _public_staging_item(row)
+    label = public.get("display_name") or public.get("phone_masked") or public.get("safe_id") or "alvo"
+    return {
+        "target_kind": "group" if kind == "group" else "contact",
+        "target_label": label,
+        "target_safe_id": public.get("safe_id") or _safe_registration_id(kind, raw_ref),
+        "source": source,
+        "thread_ref": raw_ref if kind == "group" else "",
+        "contact_ref": raw_ref if kind != "group" else "",
+        "staging_id": public.get("staging_id") or row.get("id") or "",
+        "message_count": public.get("message_count"),
+        "last_seen_at": public.get("last_seen_at") or public.get("created_at"),
+    }
+
+
+def _candidate_from_registered_group(row: dict[str, Any]) -> dict[str, Any] | None:
+    raw_ref = str(row.get("target_ref_enc") or "").strip()
+    if not raw_ref:
+        return None
+    return {
+        "target_kind": "group",
+        "target_label": row.get("name") or "grupo",
+        "target_safe_id": str(row.get("id") or ("list_" + hash_text(raw_ref)[:16])),
+        "source": "registered_group",
+        "thread_ref": raw_ref,
+        "contact_ref": "",
+    }
+
+
+def _candidate_from_registered_contact(row: dict[str, Any]) -> dict[str, Any] | None:
+    raw_ref = str(row.get("phone_e164_enc") or "").strip()
+    if not raw_ref:
+        return None
+    return {
+        "target_kind": "contact",
+        "target_label": row.get("display_name") or "contato",
+        "target_safe_id": _safe_contact_id(str(row.get("id") or "")),
+        "source": "registered_contact",
+        "thread_ref": "",
+        "contact_ref": raw_ref,
+    }
+
+
+def _conversation_target_for_queue_item(item_index: int) -> dict[str, Any] | None:
+    queue = get_actionable_queue(limit=max(10, min(int(item_index or 0), 50)))
+    items = queue.get("items") if isinstance(queue, dict) else []
+    if not isinstance(items, list) or item_index < 1 or item_index > len(items):
+        return {"ok": False, "error": "item_not_found", "hint": "Use /fila para ver os itens atuais."}
+    item = items[item_index - 1]
+    if not isinstance(item, dict):
+        return {"ok": False, "error": "item_invalid"}
+    if item.get("kind") == "context":
+        return {
+            "target_kind": "context",
+            "target_label": item.get("operator_title") or item.get("title") or "Contexto recente",
+            "target_safe_id": str(item.get("safe_event_id") or "context_recent")[:80],
+            "source": "queue_context",
+            "thread_ref": "",
+            "contact_ref": "",
+            "message_count": 1,
+            "last_seen_at": item.get("created_at") or "",
+        }
+    if item.get("kind") != "registration" or not item.get("staging_id"):
+        return {
+            "ok": False,
+            "error": "item_not_conversation_target",
+            "hint": "Use um item de cadastro mostrado em /fila ou informe o nome do grupo/contato.",
+        }
+    with _connect() as conn:
+        row = conn.execute(
+            "SELECT * FROM registration_staging WHERE id=? AND expires_at > ? LIMIT 1",
+            (str(item.get("staging_id") or ""), utc_now()),
+        ).fetchone()
+    if row is None:
+        return {"ok": False, "error": "item_not_found_or_expired", "hint": "Use /fila novamente."}
+    return _candidate_from_staging_row(dict(row), source="queue")
+
+
+def resolve_conversation_target(
+    query: str = "",
+    *,
+    item_index: Any = 0,
+    prefer: str = "",
+    include_transport: bool = False,
+) -> dict[str, Any]:
+    """Resolve an operator-safe WhatsApp conversation target.
+
+    Public output never includes raw WhatsApp refs, phones, URLs, or payloads.
+    ``include_transport=True`` is only for internal callers that need the raw
+    local ref to filter already-sanitized ``inbound_events``.
+    """
+    init_db()
+    try:
+        idx = int(str(item_index or 0).strip() or "0")
+    except Exception:
+        return {"ok": False, "error": "item_invalid", "hint": "Use /ctxwpp item N ou /ctxwpp <nome>."}
+    if idx > 0:
+        candidate = _conversation_target_for_queue_item(idx)
+        if not candidate or candidate.get("ok") is False:
+            return candidate or {"ok": False, "error": "item_not_found"}
+        return _conversation_target_response(candidate, include_transport=include_transport)
+
+    needle = str(query or "").strip()
+    if not needle:
+        return {"ok": False, "error": "target_required", "hint": "Use /ctxwpp <nome>, /ctxwpp item N ou /ctxwpp ajuda."}
+    needle_norm = _normalize(needle)
+    needle_digits = _phone_digits(needle)
+    prefer_norm = str(prefer or "").strip().lower()
+    candidates: list[dict[str, Any]] = []
+
+    with _connect() as conn:
+        list_rows = conn.execute(
+            """
+            SELECT *
+            FROM lists
+            WHERE id = ? OR name_norm = ? OR lower(name) LIKE ?
+            ORDER BY CASE WHEN name_norm = ? THEN 0 ELSE 1 END, name ASC
+            LIMIT 8
+            """,
+            (needle, needle_norm, f"%{needle_norm}%", needle_norm),
+        ).fetchall()
+        contact_rows = conn.execute(
+            """
+            SELECT DISTINCT c.*
+            FROM contacts c
+            LEFT JOIN contact_aliases a ON a.contact_id = c.id
+            WHERE c.id = ?
+               OR a.alias_norm = ?
+               OR (? != '' AND c.phone_e164_hash = ?)
+               OR lower(c.display_name) LIKE ?
+            ORDER BY CASE WHEN lower(c.display_name) = ? THEN 0 ELSE 1 END, c.display_name ASC
+            LIMIT 8
+            """,
+            (needle, needle_norm, needle_digits, hash_text(needle_digits) if needle_digits else "", f"%{needle_norm}%", needle_norm),
+        ).fetchall()
+        staging_rows = conn.execute(
+            """
+            SELECT *
+            FROM registration_staging
+            WHERE expires_at > ?
+            ORDER BY COALESCE(last_seen_at, created_at) DESC, created_at DESC
+            LIMIT 50
+            """,
+            (utc_now(),),
+        ).fetchall()
+
+    for row in list_rows:
+        candidate = _candidate_from_registered_group(dict(row))
+        if candidate:
+            candidates.append(candidate)
+    for row in contact_rows:
+        candidate = _candidate_from_registered_contact(dict(row))
+        if candidate:
+            candidates.append(candidate)
+    for row in staging_rows:
+        row_dict = dict(row)
+        if _is_system_staging_row(row_dict):
+            continue
+        public = _public_staging_item(row_dict)
+        safe_id = str(public.get("safe_id") or "")
+        label = str(public.get("display_name") or public.get("phone_masked") or "")
+        if needle in {str(public.get("staging_id") or ""), safe_id} or _normalize(label) == needle_norm or needle_norm in _normalize(label):
+            candidate = _candidate_from_staging_row(row_dict, source="staging")
+            if candidate:
+                candidates.append(candidate)
+
+    if prefer_norm in {"group", "grupo"}:
+        candidates = [c for c in candidates if c.get("target_kind") == "group"]
+    elif prefer_norm in {"contact", "contato", "dm"}:
+        candidates = [c for c in candidates if c.get("target_kind") == "contact"]
+
+    deduped: list[dict[str, Any]] = []
+    seen: set[tuple[str, str, str]] = set()
+    for candidate in candidates:
+        key = (
+            str(candidate.get("target_kind") or ""),
+            hash_text(str(candidate.get("thread_ref") or candidate.get("contact_ref") or candidate.get("target_safe_id") or "")),
+            str(candidate.get("source") or ""),
+        )
+        if key in seen:
+            continue
+        seen.add(key)
+        deduped.append(candidate)
+    candidates = deduped
+
+    if not candidates:
+        return {
+            "ok": False,
+            "error": "target_not_found",
+            "query": _clean_registration_text(needle, limit=80),
+            "hint": "Use /fila para ver itens recentes ou cadastre o grupo/contato primeiro.",
+        }
+    if len(candidates) == 1:
+        return _conversation_target_response(candidates[0], include_transport=include_transport)
+    return {
+        "ok": True,
+        "ambiguous": True,
+        "query": _clean_registration_text(needle, limit=80),
+        "matches": [_public_conversation_candidate(candidate) for candidate in candidates[:6]],
+        "hint": "Alvo ambíguo. Use /ctxwpp item N pela fila ou refine o nome.",
+    }
+
+
+# ---------------------------------------------------------------------------
 # Env-based allowlist sync
 # ---------------------------------------------------------------------------
 
