@@ -509,6 +509,73 @@ def test_staging_phone_bearing_refs_still_mask_contacts(tmp_path):
     assert "@s.whatsapp.net" not in serialized
 
 
+def test_staging_hides_refs_already_registered_locally(tmp_path):
+    from tools.whatsapp_ops_store import (
+        init_db,
+        peek_staging,
+        register_contact_local,
+        register_group_local,
+        registration_staging_diagnostics,
+        stage_raw_ref,
+    )
+
+    token = set_hermes_home_override(tmp_path)
+    try:
+        init_db()
+        contact_ref = "551199998888@s.whatsapp.net"
+        group_ref = "120363375521827492@g.us"
+        register_contact_local(alias="Lead já cadastrado", raw_ref=contact_ref, allow_send=True)
+        register_group_local(alias="Grupo já cadastrado", raw_ref=group_ref, allow_send=False)
+        stage_raw_ref(
+            contact_ref=contact_ref,
+            thread_ref=group_ref,
+            display_name="Lead já cadastrado",
+            kind="contact",
+            safe_hint={"display_name": "Lead já cadastrado", "last_message_type": "text"},
+        )
+        stage_raw_ref(
+            contact_ref=group_ref,
+            thread_ref=group_ref,
+            display_name="Grupo já cadastrado",
+            kind="group",
+            safe_hint={"group_name": "Grupo já cadastrado", "last_message_type": "text"},
+        )
+        visible_staging = peek_staging()
+        diagnostics = registration_staging_diagnostics()
+    finally:
+        reset_hermes_home_override(token)
+
+    assert visible_staging == []
+    assert diagnostics["staged_count"] == 0
+
+
+def test_staging_keeps_same_name_when_provider_ref_is_different(tmp_path):
+    from tools.whatsapp_ops_store import init_db, peek_staging, register_group_local, stage_raw_ref
+
+    token = set_hermes_home_override(tmp_path)
+    try:
+        init_db()
+        register_group_local(
+            alias="H-Ops",
+            raw_ref="120363111111111111@g.us",
+            allow_send=False,
+        )
+        stage_raw_ref(
+            contact_ref="120363222222222222@g.us",
+            thread_ref="120363222222222222@g.us",
+            display_name="H-Ops",
+            kind="group",
+            safe_hint={"group_name": "H-Ops", "last_message_type": "text"},
+        )
+        staged = peek_staging()
+    finally:
+        reset_hermes_home_override(token)
+
+    assert len(staged) == 1
+    assert staged[0]["kind"] == "group"
+    assert staged[0]["display_name"] == "H-Ops"
+
+
 def test_actionable_queue_combines_staging_approvals_and_context_without_raw_refs(tmp_path):
     from tools.whatsapp_ops_store import (
         create_approval,
