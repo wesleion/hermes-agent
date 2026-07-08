@@ -69,6 +69,56 @@ def test_render_thread_context_command_redacts_transport_refs_and_media_blobs():
     assert "<url-redigida>" in rendered
 
 
+def test_render_thread_context_command_explains_default_scope_and_hides_system_counts():
+    seen_kwargs = {}
+
+    def fake_loader(**kwargs):
+        seen_kwargs.update(kwargs)
+        return json.dumps(
+            {
+                "ok": True,
+                "source": "local_inbound_store",
+                "message_count": 3,
+                "thread_filter_set": False,
+                "contact_filter_set": False,
+                "type_counts": {"system": 2, "text": 1},
+                "media_counts": {},
+                "events": [
+                    {"created_at": "2026-07-08T21:00:00+00:00", "message_type": "system", "status": "received"},
+                    {"created_at": "2026-07-08T21:01:00+00:00", "message_type": "system", "status": "received"},
+                    {
+                        "created_at": "2026-07-08T21:02:00+00:00",
+                        "message_type": "text",
+                        "status": "received",
+                        "text_preview": "Teste operacional",
+                    },
+                ],
+            },
+            ensure_ascii=False,
+        )
+
+    rendered = render_thread_context_command("", context_loader=fake_loader)
+
+    assert seen_kwargs["limit"] == 10
+    assert seen_kwargs["thread"] == ""
+    assert seen_kwargs["contact"] == ""
+    assert "Escopo: sem filtro específico" in rendered
+    assert "Limite pedido: 10 eventos locais" in rendered
+    assert "Ocultos: 2 evento(s) system" in rendered
+    assert "Tipos exibidos: text=1" in rendered
+    assert "system=2" not in rendered
+    assert "Teste operacional" in rendered
+
+def test_render_thread_context_command_usage_for_help_and_incomplete_filter():
+    help_text = render_thread_context_command("ajuda", context_loader=lambda **kwargs: "{}")
+    incomplete = render_thread_context_command("thread 5", context_loader=lambda **kwargs: "{}")
+
+    assert "/ctxwpp — mostra as últimas 10" in help_text
+    assert "/ctxwpp 20" in help_text
+    assert "Sem argumento ele NÃO adivinha um grupo" in help_text
+    assert "Filtro incompleto" in incomplete
+    assert "thread <ref>" in incomplete
+
 def test_render_thread_context_command_reports_safe_failure():
     def failing_loader(**kwargs):
         raise RuntimeError("token=abc https://secret.invalid user@lid")
