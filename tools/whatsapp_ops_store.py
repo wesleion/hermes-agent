@@ -877,6 +877,44 @@ def _is_system_staging_row(row: dict[str, Any]) -> bool:
     return str(hint.get("last_message_type") or "").strip().lower() == "system"
 
 
+def _metadata_target_ref_hash(value: Any) -> str:
+    try:
+        data = json.loads(value or "{}")
+    except (TypeError, json.JSONDecodeError):
+        return ""
+    if not isinstance(data, dict):
+        return ""
+    return str(data.get("target_ref_hash") or "").strip()
+
+
+def _staging_ref_is_registered(conn: sqlite3.Connection, row: dict[str, Any]) -> bool:
+    """Return True when a staging row already has a local contact/group record.
+
+    Registration staging is a short-lived operator queue. If the same raw-ref
+    hash is already present in the local allowlist cache, showing it again as
+    "Cadastrar" is redundant and can make the operator think the register step
+    failed. Name-only collisions are intentionally not enough: same display
+    name can point to a different provider ref.
+    """
+    kind = str(row.get("kind") or "contact").strip().lower()
+    ref_hash = str(row.get("ref_hash") or "").strip()
+    if not ref_hash:
+        return False
+    if kind == "group":
+        expected_id = "list_" + ref_hash[:16]
+        direct = conn.execute("SELECT 1 FROM lists WHERE id=? LIMIT 1", (expected_id,)).fetchone()
+        if direct is not None:
+            return True
+        rows = conn.execute("SELECT metadata_json FROM lists WHERE metadata_json LIKE ?", (f"%{ref_hash[:16]}%",)).fetchall()
+    else:
+        expected_id = "contact_" + ref_hash[:16]
+        direct = conn.execute("SELECT 1 FROM contacts WHERE id=? LIMIT 1", (expected_id,)).fetchone()
+        if direct is not None:
+            return True
+        rows = conn.execute("SELECT metadata_json FROM contacts WHERE metadata_json LIKE ?", (f"%{ref_hash[:16]}%",)).fetchall()
+    return any(_metadata_target_ref_hash(row_meta["metadata_json"]) == ref_hash for row_meta in rows)
+
+
 def _payload_message_type(payload: dict[str, Any]) -> str:
     return str(_message_type_from_payload(payload) or "").strip().lower()
 
@@ -940,7 +978,8 @@ def peek_staging() -> list[dict[str, Any]]:
     init_db()
     _staging_cleanup()
     with _connect() as conn:
-        rows = [dict(row) for row in conn.execute(
+        rows = []
+        for row in conn.execute(
             """
             SELECT *
             FROM registration_staging
@@ -948,11 +987,15 @@ def peek_staging() -> list[dict[str, Any]]:
             ORDER BY COALESCE(last_seen_at, created_at) DESC, created_at DESC
             """,
             (utc_now(),),
-        ).fetchall()]
+        ).fetchall():
+            row_dict = dict(row)
+            if _is_system_staging_row(row_dict):
+                continue
+            if _staging_ref_is_registered(conn, row_dict):
+                continue
+            rows.append(row_dict)
     grouped: dict[tuple[str, str], dict[str, Any]] = {}
     for row in rows:
-        if _is_system_staging_row(row):
-            continue
         key = (str(row.get("kind") or "contact"), str(row.get("ref_hash") or row.get("id")))
         if key not in grouped:
             grouped[key] = dict(row)
