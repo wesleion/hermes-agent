@@ -103,6 +103,10 @@ COMMAND_REGISTRY: list[CommandDef] = [
                aliases=("bg", "btw"), args_hint="<prompt>"),
     CommandDef("agents", "Show active agents and running tasks", "Session",
                aliases=("tasks",)),
+    CommandDef("journey", "Open the learning journey timeline",
+               "Session", aliases=("learning", "memory-graph"), cli_only=True,
+               args_hint="[list|delete <id>|edit <id>]",
+               subcommands=("list", "delete", "edit")),
     CommandDef("queue", "Queue a prompt for the next turn (doesn't interrupt)", "Session",
                aliases=("q",), args_hint="<prompt>"),
     CommandDef("steer", "Inject a message after the next tool call without interrupting", "Session",
@@ -187,8 +191,6 @@ COMMAND_REGISTRY: list[CommandDef] = [
                "Tools & Skills", cli_only=True, aliases=("generate-pet",), args_hint="[description]"),
     CommandDef("learn", "Learn a reusable skill from anything you describe (dirs, URLs, this chat, notes)",
                "Tools & Skills", args_hint="<what to learn from>"),
-    CommandDef("missao", "Transform a request into an executable Mission Contract with clarify and gates",
-               "Tools & Skills", args_hint="[what to accomplish]"),
     CommandDef("cron", "Manage scheduled tasks", "Tools & Skills",
                cli_only=True, args_hint="[subcommand]",
                subcommands=("list", "add", "create", "edit", "pause", "resume", "run", "remove")),
@@ -236,27 +238,45 @@ COMMAND_REGISTRY: list[CommandDef] = [
                cli_only=True, aliases=("gateway",)),
     CommandDef("platform", "Pause, resume, or list a failing gateway platform", "Info",
                gateway_only=True, args_hint="<pause|resume|list> [name]"),
-    CommandDef("wpp", "WhatsApp Ops: painel rápido e ajuda",
+    CommandDef("wpp", "Hunter WPP: cockpit e ajuda tática",
                "WhatsApp Ops", cli_only=True,
                gateway_config_gate="whatsapp_ops.slash_commands_enabled"),
-    CommandDef("fila", "WhatsApp Ops: ver fila de cadastro",
+    CommandDef("fila", "Hunter WPP: fila acionável",
                "WhatsApp Ops", cli_only=True,
                aliases=("wpp_register_staging_status",),
                gateway_config_gate="whatsapp_ops.slash_commands_enabled"),
-    CommandDef("addct", "WhatsApp Ops: adicionar contato",
+    CommandDef("modo", "Hunter WPP: modo operacional/autonomia",
+               "WhatsApp Ops", cli_only=True,
+               args_hint="[status|manual|copiloto|comercial|autonomo]",
+               subcommands=("status", "manual", "copiloto", "comercial", "autonomo"),
+               gateway_config_gate="whatsapp_ops.slash_commands_enabled"),
+    CommandDef("crm", "Hunter CRM: workbook Google Sheets",
+               "WhatsApp Ops", cli_only=True,
+               args_hint="[status|check|map|pipeline|next|projeto]",
+               subcommands=("status", "check", "map", "schema", "pipeline", "next", "projeto", "help"),
+               gateway_config_gate="whatsapp_ops.slash_commands_enabled"),
+    CommandDef("ctxwpp", "Hunter WPP: contexto local seguro",
+               "WhatsApp Ops", cli_only=True, args_hint="[alvo|item N|limite]",
+               aliases=("wpp_thread_context",),
+               gateway_config_gate="whatsapp_ops.slash_commands_enabled"),
+    CommandDef("sumwpp", "Hunter WPP: resumo local determinístico",
+               "WhatsApp Ops", cli_only=True, args_hint="[alvo|item N|limite]",
+               aliases=("wpp_conversation_summary",),
+               gateway_config_gate="whatsapp_ops.slash_commands_enabled"),
+    CommandDef("addct", "Hunter WPP: cadastrar contato",
                "WhatsApp Ops", cli_only=True, args_hint="<nome> [| ref]",
                aliases=("wpp_register_contact",),
                gateway_config_gate="whatsapp_ops.slash_commands_enabled"),
-    CommandDef("addgp", "WhatsApp Ops: adicionar grupo existente",
+    CommandDef("addgp", "Hunter WPP: cadastrar grupo existente",
                "WhatsApp Ops", cli_only=True, args_hint="<nome> [| ref]",
                aliases=("wpp_register_group",),
                gateway_config_gate="whatsapp_ops.slash_commands_enabled"),
-    CommandDef("crgp", "WhatsApp Ops: preparar criação de grupo com aprovação",
-               "WhatsApp Ops", cli_only=True, args_hint="<nome> [| membros]",
+    CommandDef("ignorar", "Hunter WPP: ignorar item da fila",
+               "WhatsApp Ops", cli_only=True, args_hint="<item>",
+               aliases=("ignore", "wpp_ignore_staging_item"),
                gateway_config_gate="whatsapp_ops.slash_commands_enabled"),
-    CommandDef("ctxwpp", "WhatsApp Ops: contexto local da conversa (somente leitura)",
-               "WhatsApp Ops", cli_only=True, args_hint="[thread|contact] [limit]",
-               aliases=("wpp_thread_context",),
+    CommandDef("crgp", "Hunter WPP: preparar grupo com aprovação",
+               "WhatsApp Ops", cli_only=True, args_hint="<nome> [| membros]",
                gateway_config_gate="whatsapp_ops.slash_commands_enabled"),
     CommandDef("copy", "Copy the last assistant response to clipboard", "Info",
                cli_only=True, args_hint="[number]"),
@@ -266,7 +286,8 @@ COMMAND_REGISTRY: list[CommandDef] = [
                cli_only=True, args_hint="<path>"),
     CommandDef("update", "Update Hermes Agent to the latest version", "Info"),
     CommandDef("version", "Show Hermes Agent version", "Info", aliases=("v",)),
-    CommandDef("debug", "Upload debug report (system info + logs) and get shareable links", "Info"),
+    CommandDef("debug", "Upload debug report (system info + logs) and get shareable links", "Info",
+               args_hint="[nous|local]"),
 
     # Exit
     CommandDef("quit", "Exit the CLI (use --delete to also remove session history)", "Exit",
@@ -389,7 +410,6 @@ ACTIVE_SESSION_BYPASS_COMMANDS: frozenset[str] = frozenset(
         "approve",
         "background",
         "commands",
-        "crgp",
         "deny",
         "help",
         "new",
@@ -428,32 +448,6 @@ def should_bypass_active_session(command_name: str | None) -> bool:
     return resolve_command(command_name) is not None if command_name else False
 
 
-def _resolve_config_gates_from_config(cfg: Mapping[str, Any] | None) -> set[str]:
-    """Return config-gated command names enabled by an already-loaded config.
-
-    This keeps every command surface (gateway help, Telegram menu, Discord,
-    TUI command catalog) on the same gate semantics while allowing callers that
-    already loaded a profile config to avoid reading a possibly different
-    ``HERMES_HOME``.
-    """
-    if not isinstance(cfg, Mapping):
-        return set()
-    result: set[str] = set()
-    for cmd in COMMAND_REGISTRY:
-        if not cmd.gateway_config_gate:
-            continue
-        val: Any = cfg
-        for key in cmd.gateway_config_gate.split("."):
-            if isinstance(val, Mapping):
-                val = val.get(key)
-            else:
-                val = None
-                break
-        if is_truthy_value(val, default=False):
-            result.add(cmd.name)
-    return result
-
-
 def _resolve_config_gates() -> set[str]:
     """Return canonical names of commands whose ``gateway_config_gate`` is truthy.
 
@@ -461,12 +455,26 @@ def _resolve_config_gates() -> set[str]:
     config-gated command.  Returns an empty set on any error so callers
     degrade gracefully.
     """
+    gated = [c for c in COMMAND_REGISTRY if c.gateway_config_gate]
+    if not gated:
+        return set()
     try:
         from hermes_cli.config import read_raw_config
         cfg = read_raw_config()
     except Exception:
         return set()
-    return _resolve_config_gates_from_config(cfg)
+    result: set[str] = set()
+    for cmd in gated:
+        val: Any = cfg
+        for key in cmd.gateway_config_gate.split("."):
+            if isinstance(val, dict):
+                val = val.get(key)
+            else:
+                val = None
+                break
+        if is_truthy_value(val, default=False):
+            result.add(cmd.name)
+    return result
 
 
 def _is_gateway_available(cmd: CommandDef, config_overrides: set[str] | None = None) -> bool:
@@ -575,11 +583,11 @@ def telegram_bot_commands() -> list[tuple[str, str]]:
     return result
 
 
-# Telegram allows up to 100 BotCommands. Use the full Bot API cap by default
-# so user-installed skill commands remain visible as Hermes' built-in command
-# surface grows. Users can tune this via
-# platforms.telegram.extra.command_menu.max_commands.
-_DEFAULT_TELEGRAM_MENU_MAX_COMMANDS = 100
+# Telegram allows up to 100 BotCommands. Hermes ships ~50 built-in commands;
+# a 60-slot default keeps every built-in plus common skill commands visible in
+# the `/` menu while staying comfortably under Telegram's ~4KB payload limit.
+# Users can tune this via platforms.telegram.extra.command_menu.max_commands.
+_DEFAULT_TELEGRAM_MENU_MAX_COMMANDS = 60
 _TELEGRAM_BOT_API_MAX_COMMANDS = 100
 _TELEGRAM_PRIORITY_MODES = {"prepend", "append", "replace"}
 
@@ -592,7 +600,10 @@ _TELEGRAM_MENU_PRIORITY = (
     # Profile-gated WhatsApp Ops cockpit commands — only surface when enabled.
     "wpp",
     "fila",
+    "modo",
+    "crm",
     "ctxwpp",
+    "sumwpp",
     "addct",
     "addgp",
     "crgp",
@@ -934,13 +945,11 @@ def telegram_menu_commands(max_commands: int = 100) -> tuple[list[tuple[str, str
     """Return Telegram menu commands capped to the Bot API limit.
 
     Priority order (higher priority = never bumped by overflow):
-      1. Commands named in ``platforms.telegram.extra.command_menu.priority``
-      2. Default high-value built-in commands
-      3. Remaining core/plugin/skill commands in discovery order
+      1. Core CommandDef commands (always included)
+      2. Plugin slash commands (take precedence over skills)
+      3. Built-in skill commands (fill remaining slots, alphabetical)
 
-    Skills are collected before the final cap is applied so a configured
-    priority such as ``prompt_up`` can keep an installed skill visible even on
-    profiles whose built-in command list already exceeds the menu cap.
+    Skills are the only tier that gets trimmed when the cap is hit.
     User-installed hub skills are excluded — accessible via /skills.
     Skills disabled for the ``"telegram"`` platform (via ``hermes skills
     config``) are excluded from the menu entirely.
@@ -949,22 +958,22 @@ def telegram_menu_commands(max_commands: int = 100) -> tuple[list[tuple[str, str
         (menu_commands, hidden_count) where hidden_count is the number of
         commands omitted due to the cap.
     """
-    core_commands = list(telegram_bot_commands())
+    core_commands = _prioritize_telegram_menu_commands(list(telegram_bot_commands()))
     reserved_names = {n for n, _ in core_commands}
-    entries, collected_hidden_count = _collect_gateway_skill_entries(
+    all_commands = list(core_commands)
+    hidden_core_count = max(0, len(all_commands) - max_commands)
+
+    remaining_slots = max(0, max_commands - len(all_commands))
+    entries, hidden_count = _collect_gateway_skill_entries(
         platform="telegram",
-        max_slots=max_commands,
+        max_slots=remaining_slots,
         reserved_names=reserved_names,
         desc_limit=40,
         sanitize_name=_sanitize_telegram_name,
     )
-
     # Drop the cmd_key — Telegram only needs (name, desc) pairs.
-    all_commands = list(core_commands)
     all_commands.extend((n, d) for n, d, _k in entries)
-    prioritized = _prioritize_telegram_menu_commands(all_commands)
-    hidden_count = collected_hidden_count + max(0, len(prioritized) - max_commands)
-    return prioritized[:max_commands], hidden_count
+    return all_commands[:max_commands], hidden_count + hidden_core_count
 
 
 def discord_skill_commands(

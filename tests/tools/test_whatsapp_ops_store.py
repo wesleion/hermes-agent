@@ -509,6 +509,110 @@ def test_staging_phone_bearing_refs_still_mask_contacts(tmp_path):
     assert "@s.whatsapp.net" not in serialized
 
 
+def test_resolve_conversation_target_by_registered_group_and_queue_item_without_raw_refs(tmp_path):
+    from tools.whatsapp_ops_store import (
+        init_db,
+        record_inbound_event,
+        register_group_local,
+        resolve_conversation_target,
+        stage_raw_ref,
+    )
+
+    token = set_hermes_home_override(tmp_path)
+    try:
+        init_db()
+        raw_group = "120363375521827492@g.us"
+        raw_contact = "172185238905034@lid"
+        register_group_local(alias="H-Ops", raw_ref=raw_group, allow_send=False)
+        record_inbound_event(
+            source_event_id="resolve-target-001",
+            contact_ref=raw_contact,
+            thread_ref=raw_group,
+            payload={"id": "resolve-target-001", "type": "text", "text": "Teste H-Ops"},
+        )
+        registered = resolve_conversation_target(query="H-Ops")
+        private_registered = resolve_conversation_target(query="H-Ops", include_transport=True)
+
+        stage_raw_ref(
+            contact_ref="551199998888@s.whatsapp.net",
+            thread_ref="120363000000000000@g.us",
+            display_name="Novo Grupo",
+            kind="group",
+            safe_hint={"group_name": "Novo Grupo", "last_message_type": "text"},
+        )
+        queued = resolve_conversation_target(item_index=1)
+        private_queued = resolve_conversation_target(item_index=1, include_transport=True)
+    finally:
+        reset_hermes_home_override(token)
+
+    serialized = json.dumps([registered, queued], ensure_ascii=False)
+    assert registered["ok"] is True
+    assert registered["ambiguous"] is False
+    assert registered["target_kind"] == "group"
+    assert registered["target_label"] == "H-Ops"
+    assert registered["thread_filter_set"] is True
+    assert private_registered["_thread_ref"] == raw_group
+    assert queued["ok"] is True
+    assert queued["target_kind"] == "group"
+    assert queued["source"] == "queue"
+    assert queued["target_label"] == "Novo Grupo"
+    assert private_queued["_thread_ref"] == "120363000000000000@g.us"
+    assert "@g.us" not in serialized
+    assert "@lid" not in serialized
+    assert "120363375521827492" not in serialized
+    assert "172185238905034" not in serialized
+    assert "551199998888" not in serialized
+
+
+def test_resolve_conversation_target_item_can_reference_recent_context_without_raw_refs(tmp_path):
+    from tools.whatsapp_ops_store import init_db, record_inbound_event, resolve_conversation_target
+
+    token = set_hermes_home_override(tmp_path)
+    try:
+        init_db()
+        record_inbound_event(
+            source_event_id="resolve-context-item-001",
+            contact_ref="172185238905034@lid",
+            thread_ref="120363375521827492@g.us",
+            payload={"id": "resolve-context-item-001", "type": "text", "text": "Teste contexto"},
+        )
+        result = resolve_conversation_target(item_index=1)
+    finally:
+        reset_hermes_home_override(token)
+
+    serialized = json.dumps(result, ensure_ascii=False)
+    assert result["ok"] is True
+    assert result["target_kind"] == "context"
+    assert result["source"] == "queue_context"
+    assert result["thread_filter_set"] is False
+    assert result["contact_filter_set"] is False
+    assert "@g.us" not in serialized
+    assert "@lid" not in serialized
+    assert "120363375521827492" not in serialized
+    assert "172185238905034" not in serialized
+
+
+def test_resolve_conversation_target_reports_ambiguity_without_raw_refs(tmp_path):
+    from tools.whatsapp_ops_store import init_db, register_group_local, resolve_conversation_target
+
+    token = set_hermes_home_override(tmp_path)
+    try:
+        init_db()
+        register_group_local(alias="Duplicado A", raw_ref="120363000000000001@g.us", allow_send=False)
+        register_group_local(alias="Duplicado B", raw_ref="120363000000000002@g.us", allow_send=False)
+        result = resolve_conversation_target(query="Duplicado")
+    finally:
+        reset_hermes_home_override(token)
+
+    serialized = json.dumps(result, ensure_ascii=False)
+    assert result["ok"] is True
+    assert result["ambiguous"] is True
+    assert len(result["matches"]) == 2
+    assert "@g.us" not in serialized
+    assert "120363000000000001" not in serialized
+    assert "120363000000000002" not in serialized
+
+
 def test_staging_hides_refs_already_registered_locally(tmp_path):
     from tools.whatsapp_ops_store import (
         init_db,

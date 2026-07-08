@@ -55,6 +55,7 @@ from tools.whatsapp_ops_store import (
     request_media_transcription,
     reserve_outbox_send,
     resolve_approval,
+    resolve_conversation_target,
     _payload_from_self,
     resolve_contact,
     stage_raw_ref,
@@ -1005,6 +1006,11 @@ def wpp_inbound_lookup(thread: str = "", contact: str = "", limit: int = 20) -> 
     return _json({"ok": True, "thread_filter_set": bool(thread), "contact_filter_set": bool(contact), "events": events})
 
 
+def wpp_resolve_conversation_target(query: str = "", item: int = 0, prefer: str = "") -> str:
+    """Resolve an operator target by name or /fila item without exposing raw refs."""
+    return _json(resolve_conversation_target(query=str(query or ""), item_index=item, prefer=str(prefer or "")))
+
+
 def wpp_thread_context(
     thread: str = "",
     contact: str = "",
@@ -1640,6 +1646,22 @@ registry.register(
     ),
     handler=lambda args, **kw: wpp_inbound_lookup(
         thread=args.get("thread", ""), contact=args.get("contact", ""), limit=args.get("limit", 20)
+    ),
+    check_fn=check_whatsapp_ops_requirements,
+    emoji="📲",
+)
+
+registry.register(
+    name="wpp_resolve_conversation_target",
+    toolset=TOOLSET,
+    schema=_schema(
+        "wpp_resolve_conversation_target",
+        "Resolve a WhatsApp conversation target by operator name or /fila item. Read-only; never sends and never exposes raw refs.",
+        {"query": {"type": "string"}, "item": {"type": "integer"}, "prefer": {"type": "string", "enum": ["", "group", "contact", "grupo", "contato"]}},
+        [],
+    ),
+    handler=lambda args, **kw: wpp_resolve_conversation_target(
+        query=args.get("query", ""), item=args.get("item", 0), prefer=args.get("prefer", "")
     ),
     check_fn=check_whatsapp_ops_requirements,
     emoji="📲",

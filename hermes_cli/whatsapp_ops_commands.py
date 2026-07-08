@@ -12,7 +12,7 @@ import re
 from collections.abc import Callable
 from typing import Any
 
-_RAW_WA_REF_RE = re.compile(r"(?i)\b[\w.-]+@(?:g\.us|lid|s\.whatsapp\.net)\b")
+_RAW_WA_REF_RE = re.compile(r"(?i)\b[\w.-]+@(?:g\.us|lid|s\.whatsapp\.net|c\.us)\b")
 _URL_RE = re.compile(r"(?i)\bhttps?://\S+")
 _PHONE_RE = re.compile(r"\+?\d[\d\s().-]{6,}\d")
 _DATA_B64_RE = re.compile(r"(?i)data:[^\s,]*?;base64,[A-Za-z0-9+/=]{16,}")
@@ -21,6 +21,8 @@ _MEDIA_WORD_RE = re.compile(r"(?i)\b(?:base64|blob)\b")
 _SECRET_ASSIGNMENT_RE = re.compile(
     r"(?i)\b(token|api[_-]?key|authorization|password|secret)\s*[=:]\s*\S+"
 )
+_RAW_THREAD_SUFFIXES = ("@g.us",)
+_RAW_CONTACT_SUFFIXES = ("@lid", "@s.whatsapp.net", "@c.us")
 
 
 def _redact_phone_match(match: re.Match[str]) -> str:
@@ -44,54 +46,85 @@ def _safe_text(value: Any, *, max_len: int = 500) -> str:
     return text
 
 
-def _parse_thread_context_args(arg: str) -> dict[str, Any]:
-    """Parse `/ctxwpp [limit]` or `/ctxwpp [thread|contact] <ref> [limit]` safely."""
+def _token_is_raw_thread_ref(token: str) -> bool:
+    lowered = str(token or "").strip().lower()
+    return lowered.endswith(_RAW_THREAD_SUFFIXES)
+
+
+def _token_is_raw_contact_ref(token: str) -> bool:
+    lowered = str(token or "").strip().lower()
+    return lowered.endswith(_RAW_CONTACT_SUFFIXES)
+
+
+def _parse_targeted_args(arg: str, *, default_limit: int, max_limit: int) -> dict[str, Any]:
+    """Parse `/ctxwpp|sumwpp [target|item N|limit]` safely."""
     tokens = [part.strip() for part in str(arg or "").split() if part.strip()]
-    ref = ""
-    selector = ""
-    limit = 10
-    help_requested = False
-    error = ""
+    parsed: dict[str, Any] = {
+        "thread": "",
+        "contact": "",
+        "target": "",
+        "item": 0,
+        "limit": default_limit,
+        "help": False,
+        "error": "",
+        "technical_filter": False,
+    }
+    target_parts: list[str] = []
     idx = 0
     while idx < len(tokens):
         token = tokens[idx]
         token_lower = token.lower()
         if token_lower in {"help", "ajuda", "?", "uso"}:
-            help_requested = True
+            parsed["help"] = True
+            idx += 1
+            continue
+        if token_lower in {"item", "fila", "--item"}:
+            if idx + 1 < len(tokens) and tokens[idx + 1].isdigit():
+                parsed["item"] = int(tokens[idx + 1])
+                idx += 2
+                continue
+            parsed["error"] = "item_without_number"
+            idx += 1
+            continue
+        if token_lower.startswith("--item=") and token_lower.split("=", 1)[1].isdigit():
+            parsed["item"] = int(token_lower.split("=", 1)[1])
             idx += 1
             continue
         if token.isdigit():
-            limit = max(1, min(int(token), 25))
+            parsed["limit"] = max(1, min(int(token), max_limit))
             idx += 1
             continue
         if token_lower in {"thread", "conversa", "grupo"}:
-            selector = "thread"
             if idx + 1 < len(tokens) and not tokens[idx + 1].isdigit():
                 ref = tokens[idx + 1]
+                parsed["thread"] = ref
+                parsed["technical_filter"] = True
                 idx += 2
                 continue
-            error = "thread_without_ref"
+            parsed["error"] = "thread_without_ref"
             idx += 1
             continue
         if token_lower in {"contact", "contato", "dm"}:
-            selector = "contact"
             if idx + 1 < len(tokens) and not tokens[idx + 1].isdigit():
                 ref = tokens[idx + 1]
+                parsed["contact"] = ref
+                parsed["technical_filter"] = True
                 idx += 2
                 continue
-            error = "contact_without_ref"
+            parsed["error"] = "contact_without_ref"
             idx += 1
             continue
-        if not ref:
-            ref = token
-        idx += 1
-    ref_lower = ref.lower()
-    parsed: dict[str, Any] = {"thread": "", "contact": "", "limit": limit, "help": help_requested, "error": error}
-    if ref:
-        if selector == "contact" or (not selector and (ref_lower.endswith("@lid") or ref_lower.endswith("@s.whatsapp.net"))):
-            parsed["contact"] = ref
+        if _token_is_raw_thread_ref(token):
+            parsed["thread"] = token
+            parsed["technical_filter"] = True
+        elif _token_is_raw_contact_ref(token):
+            parsed["contact"] = token
+            parsed["technical_filter"] = True
         else:
-            parsed["thread"] = ref
+            target_parts.append(token)
+        idx += 1
+    if target_parts:
+        parsed["target"] = " ".join(target_parts)
     return parsed
 
 
@@ -101,10 +134,23 @@ def _thread_context_usage_lines() -> list[str]:
         "Uso operacional:",
         "- /ctxwpp — mostra as últimas 10 mensagens operacionais locais já ingeridas.",
         "- /ctxwpp 20 — mostra até 20 eventos locais; máximo 25.",
-        "- /ctxwpp thread <ref> 10 ou /ctxwpp contact <ref> 10 — filtro técnico quando uma ref segura já é conhecida.",
+        "- /ctxwpp H-Ops 20 — resolve grupo/contato por nome local ou fila recente.",
+        "- /ctxwpp item 1 20 — usa o item exatamente como aparece em /fila.",
+        "- /ctxwpp thread <ref> 10 ou /ctxwpp contact <ref> 10 — filtro técnico quando uma ref já é conhecida.",
         "",
         "Sem argumento ele NÃO adivinha um grupo por intenção; ele usa o local_inbound_store mais recente.",
         "Não busca histórico do provedor, não envia WhatsApp e não imprime refs/telefones/URLs/mídia bruta.",
+    ]
+
+
+def _summary_usage_lines() -> list[str]:
+    return [
+        "🧾 WhatsApp Ops — resumo local determinístico (somente leitura)",
+        "Uso operacional:",
+        "- /sumwpp H-Ops 50 — resume até 50 eventos locais do grupo/contato resolvido.",
+        "- /sumwpp item 1 50 — resume o alvo do item mostrado em /fila.",
+        "- /sumwpp 50 — resumo não filtrado dos eventos locais mais recentes.",
+        "Limite padrão 50; máximo 100. Não usa LLM, não busca histórico do provedor, não persiste resumo e não envia WhatsApp.",
     ]
 
 
@@ -160,24 +206,69 @@ def _format_event(event: dict[str, Any], idx: int) -> list[str]:
     return lines
 
 
+def _resolve_target_for_command(
+    parsed: dict[str, Any],
+    *,
+    resolver: Callable[..., dict[str, Any]] | None = None,
+) -> tuple[dict[str, Any] | None, str, str, list[str]]:
+    """Return (target_public, thread, contact, error_lines)."""
+    if parsed.get("thread") or parsed.get("contact"):
+        return None, str(parsed.get("thread") or ""), str(parsed.get("contact") or ""), []
+    target = str(parsed.get("target") or "").strip()
+    item = int(parsed.get("item") or 0)
+    if not target and item <= 0:
+        return None, "", "", []
+    if resolver is None:
+        from tools.whatsapp_ops_store import resolve_conversation_target as default_resolver  # type: ignore[import-not-found]
+
+        resolver = default_resolver
+    assert resolver is not None
+    resolved = resolver(query=target, item_index=item, include_transport=True)
+    if not isinstance(resolved, dict) or resolved.get("ok") is not True:
+        err = _safe_text((resolved or {}).get("error") if isinstance(resolved, dict) else "resolver_invalid", max_len=120)
+        hint = _safe_text((resolved or {}).get("hint") if isinstance(resolved, dict) else "", max_len=240)
+        return None, "", "", [
+            f"Não consegui resolver o alvo: {err or 'erro desconhecido'}.",
+            hint or "Use /fila para ver itens recentes ou informe um nome mais específico.",
+        ]
+    if resolved.get("ambiguous"):
+        lines = ["Alvo ambíguo. Use /ctxwpp item N pela fila ou refine o nome."]
+        matches_obj = resolved.get("matches")
+        matches: list[Any] = matches_obj if isinstance(matches_obj, list) else []
+        for idx, match in enumerate(matches[:6], start=1):
+            if isinstance(match, dict):
+                lines.append(
+                    f"{idx}. {_safe_text(match.get('target_kind'), max_len=30)} · "
+                    f"{_safe_text(match.get('target_label'), max_len=80)} · "
+                    f"{_safe_text(match.get('source'), max_len=40)}"
+                )
+        return None, "", "", lines
+    return resolved, str(resolved.get("_thread_ref") or ""), str(resolved.get("_contact_ref") or ""), []
+
+
 def render_thread_context_command(
     arg: str = "",
     *,
     context_loader: Callable[..., str] | None = None,
+    target_resolver: Callable[..., dict[str, Any]] | None = None,
 ) -> str:
-    """Render a PT-BR, operator-safe local thread context summary.
-
-    The default loader is ``tools.whatsapp_ops_tool.wpp_thread_context`` in
-    operator mode.  It reads only ``local_inbound_store`` and does not send or
-    fetch provider history.
-    """
-    parsed = _parse_thread_context_args(arg)
+    """Render a PT-BR, operator-safe local thread context summary."""
+    parsed = _parse_targeted_args(arg, default_limit=10, max_limit=25)
     if parsed.get("help"):
         return "\n".join(_safe_text(line, max_len=600) for line in _thread_context_usage_lines())
     if parsed.get("error"):
         lines = _thread_context_usage_lines()
-        lines.insert(1, "Filtro incompleto: informe a ref depois de thread/contact, ou use só /ctxwpp 10.")
+        lines.insert(1, "Filtro incompleto: use /ctxwpp item N, /ctxwpp <nome> 10, ou /ctxwpp thread <ref> 10.")
         return "\n".join(_safe_text(line, max_len=600) for line in lines)
+
+    target_public, thread_ref, contact_ref, target_errors = _resolve_target_for_command(parsed, resolver=target_resolver)
+    if target_errors:
+        return "\n".join([
+            "📲 WhatsApp Ops — contexto local (somente leitura)",
+            *(_safe_text(line, max_len=600) for line in target_errors),
+            "Nenhum envio foi disparado e nenhum histórico do provedor foi buscado.",
+        ])
+
     if context_loader is None:
         from tools.whatsapp_ops_tool import wpp_thread_context as default_loader  # type: ignore[import-not-found]
 
@@ -187,8 +278,8 @@ def render_thread_context_command(
 
     try:
         raw = loader(
-            thread=parsed["thread"],
-            contact=parsed["contact"],
+            thread=thread_ref,
+            contact=contact_ref,
             limit=parsed["limit"],
             mode="operator",
             max_text_chars=180,
@@ -226,7 +317,13 @@ def render_thread_context_command(
     if data.get("contact_filter_set"):
         filter_bits.append("contato informado")
     filtro = "+".join(filter_bits) if filter_bits else "últimos eventos locais ingeridos"
-    if filter_bits:
+    if target_public:
+        scope_hint = (
+            "Alvo: "
+            f"{_safe_text(target_public.get('target_label'), max_len=100)} "
+            f"({_safe_text(target_public.get('target_kind'), max_len=30)} · {_safe_text(target_public.get('source'), max_len=40)})"
+        )
+    elif filter_bits:
         scope_hint = "Escopo: filtro técnico informado no comando."
     else:
         scope_hint = "Escopo: sem filtro específico; usa o local_inbound_store mais recente."
@@ -255,3 +352,109 @@ def render_thread_context_command(
                 lines.extend(_format_event(event, idx))
 
     return "\n".join(_safe_text(line, max_len=600) for line in lines)
+
+
+def render_conversation_summary_command(
+    arg: str = "",
+    *,
+    summary_loader: Callable[..., str] | None = None,
+    target_resolver: Callable[..., dict[str, Any]] | None = None,
+) -> str:
+    """Render a deterministic local WhatsApp conversation summary."""
+    parsed = _parse_targeted_args(arg, default_limit=50, max_limit=100)
+    if parsed.get("help"):
+        return "\n".join(_safe_text(line, max_len=600) for line in _summary_usage_lines())
+    if parsed.get("error"):
+        lines = _summary_usage_lines()
+        lines.insert(1, "Filtro incompleto: use /sumwpp item N, /sumwpp <nome> 50, ou /sumwpp 50.")
+        return "\n".join(_safe_text(line, max_len=600) for line in lines)
+
+    target_public, thread_ref, contact_ref, target_errors = _resolve_target_for_command(parsed, resolver=target_resolver)
+    if target_errors:
+        return "\n".join([
+            "🧾 WhatsApp Ops — resumo local determinístico (somente leitura)",
+            *(_safe_text(line, max_len=600) for line in target_errors),
+            "Nenhum envio foi disparado, nenhum resumo foi persistido e nenhum histórico do provedor foi buscado.",
+        ])
+
+    if summary_loader is None:
+        from tools.whatsapp_ops_tool import wpp_conversation_summary as default_loader  # type: ignore[import-not-found]
+
+        loader: Callable[..., str] = default_loader
+    else:
+        loader = summary_loader
+    try:
+        raw = loader(
+            thread=thread_ref,
+            contact=contact_ref,
+            limit=parsed["limit"],
+            mode="brief",
+            max_text_chars=180,
+            include_evidence=False,
+        )
+        data = json.loads(raw) if isinstance(raw, str) else raw
+    except Exception as exc:
+        return "\n".join([
+            "🧾 WhatsApp Ops — resumo local determinístico (somente leitura)",
+            f"Falha ao resumir local_inbound_store: {_safe_text(exc, max_len=160)}",
+            "Nenhum envio foi disparado, nenhum resumo foi persistido e nenhum histórico do provedor foi buscado.",
+        ])
+
+    if not isinstance(data, dict) or data.get("ok") is not True:
+        err = _safe_text((data or {}).get("error") if isinstance(data, dict) else "resposta inválida", max_len=160)
+        return "\n".join([
+            "🧾 WhatsApp Ops — resumo local determinístico (somente leitura)",
+            f"Não foi possível montar o resumo: {err or 'erro desconhecido'}",
+            "Nenhum envio foi disparado, nenhum resumo foi persistido e nenhum histórico do provedor foi buscado.",
+        ])
+
+    if target_public:
+        scope_hint = (
+            "Alvo: "
+            f"{_safe_text(target_public.get('target_label'), max_len=100)} "
+            f"({_safe_text(target_public.get('target_kind'), max_len=30)} · {_safe_text(target_public.get('source'), max_len=40)})"
+        )
+    elif data.get("thread_filter_set") or data.get("contact_filter_set"):
+        scope_hint = "Escopo: filtro técnico informado no comando."
+    else:
+        scope_hint = "Escopo: sem filtro específico; resumo dos eventos locais mais recentes."
+
+    type_counts_obj = data.get("type_counts")
+    media_counts_obj = data.get("media_counts")
+    type_counts: dict[str, Any] = type_counts_obj if isinstance(type_counts_obj, dict) else {}
+    media_counts: dict[str, Any] = media_counts_obj if isinstance(media_counts_obj, dict) else {}
+    lines = [
+        "🧾 WhatsApp Ops — resumo local determinístico (somente leitura)",
+        scope_hint,
+        f"Fonte: {_safe_text(data.get('source'), max_len=80)} · gerador: {_safe_text(data.get('generated_by'), max_len=80)}",
+        f"Limite pedido: {parsed['limit']} eventos locais (padrão 50; máximo 100) · analisados: {int(data.get('message_count') or 0)}",
+        f"Tipos: {_format_counts(type_counts)}",
+        f"Mídias: {_format_counts(media_counts)}",
+        "Garantias: llm_used=false · provider_history_used=false · send_performed=false · summary_persisted=false.",
+    ]
+    headline = _safe_text(data.get("headline"), max_len=300)
+    if headline:
+        lines.extend(["", f"Resumo: {headline}"])
+    bullets = data.get("bullets") if isinstance(data.get("bullets"), list) else []
+    if bullets:
+        lines.append("Pontos:")
+        for bullet in bullets[:8]:
+            lines.append(f"- {_safe_text(bullet, max_len=260)}")
+    previews = data.get("latest_previews") if isinstance(data.get("latest_previews"), list) else []
+    if previews:
+        lines.append("Últimas prévias:")
+        for preview in previews[:5]:
+            if isinstance(preview, dict):
+                created = _safe_text(preview.get("created_at"), max_len=32) or "sem horário"
+                msg_type = _safe_text(preview.get("message_type"), max_len=40) or "unknown"
+                text = _safe_text(preview.get("text_preview"), max_len=180)
+                if text:
+                    lines.append(f"- {created} · {msg_type}: {text}")
+    actions = data.get("suggested_actions") if isinstance(data.get("suggested_actions"), list) else []
+    if actions:
+        safe_actions = [_safe_text(action, max_len=80) for action in actions[:6]]
+        lines.append("Ações sugeridas locais: " + ", ".join(action for action in safe_actions if action))
+    warnings = data.get("warnings") if isinstance(data.get("warnings"), list) else []
+    if warnings:
+        lines.append("Warnings: " + ", ".join(_safe_text(warning, max_len=60) for warning in warnings[:6]))
+    return "\n".join(_safe_text(line, max_len=700) for line in lines)

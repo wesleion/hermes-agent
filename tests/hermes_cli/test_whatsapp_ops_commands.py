@@ -5,7 +5,23 @@ from __future__ import annotations
 import json
 
 from hermes_cli.commands import COMMAND_REGISTRY
-from hermes_cli.whatsapp_ops_commands import render_thread_context_command
+from hermes_cli.whatsapp_ops_commands import render_conversation_summary_command, render_thread_context_command
+
+
+def test_whatsapp_ops_commands_are_registered_as_gated_tactical_commands():
+    commands = {cmd.name: cmd for cmd in COMMAND_REGISTRY if cmd.category == "WhatsApp Ops"}
+
+    for name in ("wpp", "fila", "modo", "crm", "ctxwpp", "sumwpp", "addct", "addgp", "ignorar", "crgp"):
+        assert name in commands
+        assert commands[name].gateway_config_gate == "whatsapp_ops.slash_commands_enabled"
+        assert commands[name].description.startswith(("Hunter WPP", "Hunter CRM"))
+
+    assert "wpp_thread_context" in commands["ctxwpp"].aliases
+    assert "wpp_conversation_summary" in commands["sumwpp"].aliases
+    assert "ignore" in commands["ignorar"].aliases
+    assert "comercial" in commands["modo"].subcommands
+    assert "schema" in commands["crm"].subcommands
+    assert "check" in commands["crm"].subcommands
 
 
 def test_ctxwpp_command_is_registered_as_gated_whatsapp_ops_command():
@@ -15,6 +31,15 @@ def test_ctxwpp_command_is_registered_as_gated_whatsapp_ops_command():
     assert command.category == "WhatsApp Ops"
     assert command.gateway_config_gate == "whatsapp_ops.slash_commands_enabled"
     assert "wpp_thread_context" in command.aliases
+
+
+def test_sumwpp_command_is_registered_as_gated_whatsapp_ops_command():
+    command = next((cmd for cmd in COMMAND_REGISTRY if cmd.name == "sumwpp"), None)
+
+    assert command is not None
+    assert command.category == "WhatsApp Ops"
+    assert command.gateway_config_gate == "whatsapp_ops.slash_commands_enabled"
+    assert "wpp_conversation_summary" in command.aliases
 
 
 def test_render_thread_context_command_redacts_transport_refs_and_media_blobs():
@@ -69,6 +94,115 @@ def test_render_thread_context_command_redacts_transport_refs_and_media_blobs():
     assert "<url-redigida>" in rendered
 
 
+def test_render_thread_context_command_resolves_operator_target_without_printing_raw_ref():
+    seen_loader = {}
+
+    def fake_resolver(**kwargs):
+        assert kwargs["query"] == "H-Ops"
+        assert kwargs["item_index"] == 0
+        assert kwargs["include_transport"] is True
+        return {
+            "ok": True,
+            "ambiguous": False,
+            "target_kind": "group",
+            "target_label": "H-Ops",
+            "target_safe_id": "grp_safe",
+            "source": "staging",
+            "thread_filter_set": True,
+            "contact_filter_set": False,
+            "_thread_ref": "120363375521827492@g.us",
+            "_contact_ref": "",
+        }
+
+    def fake_loader(**kwargs):
+        seen_loader.update(kwargs)
+        return json.dumps(
+            {
+                "ok": True,
+                "source": "local_inbound_store",
+                "thread_filter_set": True,
+                "contact_filter_set": False,
+                "events": [
+                    {
+                        "created_at": "2026-07-08T21:02:00+00:00",
+                        "message_type": "text",
+                        "status": "received",
+                        "text_preview": "Mensagem segura",
+                    }
+                ],
+            },
+            ensure_ascii=False,
+        )
+
+    rendered = render_thread_context_command("H-Ops 20", context_loader=fake_loader, target_resolver=fake_resolver)
+
+    assert seen_loader["thread"] == "120363375521827492@g.us"
+    assert seen_loader["limit"] == 20
+    assert "Alvo: H-Ops" in rendered
+    assert "Mensagem segura" in rendered
+    assert "@g.us" not in rendered
+    assert "120363375521827492" not in rendered
+
+
+def test_render_conversation_summary_command_resolves_item_and_shows_safe_flags():
+    seen_loader = {}
+
+    def fake_resolver(**kwargs):
+        assert kwargs["query"] == ""
+        assert kwargs["item_index"] == 1
+        assert kwargs["include_transport"] is True
+        return {
+            "ok": True,
+            "ambiguous": False,
+            "target_kind": "group",
+            "target_label": "H-Ops",
+            "target_safe_id": "grp_safe",
+            "source": "queue",
+            "thread_filter_set": True,
+            "contact_filter_set": False,
+            "_thread_ref": "120363375521827492@g.us",
+            "_contact_ref": "",
+        }
+
+    def fake_summary(**kwargs):
+        seen_loader.update(kwargs)
+        return json.dumps(
+            {
+                "ok": True,
+                "source": "local_inbound_store",
+                "generated_by": "deterministic_local_v1",
+                "llm_used": False,
+                "provider_history_used": False,
+                "send_performed": False,
+                "summary_persisted": False,
+                "thread_filter_set": True,
+                "contact_filter_set": False,
+                "message_count": 2,
+                "type_counts": {"text": 2},
+                "media_counts": {},
+                "headline": "2 evento(s) local(is); tipos: text: 2.",
+                "bullets": ["Total local analisado: 2 evento(s)."],
+                "latest_previews": [
+                    {"created_at": "2026-07-08T21:02:00+00:00", "message_type": "text", "text_preview": "Resumo seguro"}
+                ],
+                "suggested_actions": ["/ctxwpp item 1"],
+            },
+            ensure_ascii=False,
+        )
+
+    rendered = render_conversation_summary_command("item 1 60", summary_loader=fake_summary, target_resolver=fake_resolver)
+
+    assert seen_loader["thread"] == "120363375521827492@g.us"
+    assert seen_loader["limit"] == 60
+    assert seen_loader["mode"] == "brief"
+    assert "Alvo: H-Ops" in rendered
+    assert "llm_used=false" in rendered
+    assert "provider_history_used=false" in rendered
+    assert "Resumo seguro" in rendered
+    assert "@g.us" not in rendered
+    assert "120363375521827492" not in rendered
+
+
 def test_render_thread_context_command_explains_default_scope_and_hides_system_counts():
     seen_kwargs = {}
 
@@ -109,6 +243,7 @@ def test_render_thread_context_command_explains_default_scope_and_hides_system_c
     assert "system=2" not in rendered
     assert "Teste operacional" in rendered
 
+
 def test_render_thread_context_command_usage_for_help_and_incomplete_filter():
     help_text = render_thread_context_command("ajuda", context_loader=lambda **kwargs: "{}")
     incomplete = render_thread_context_command("thread 5", context_loader=lambda **kwargs: "{}")
@@ -118,6 +253,7 @@ def test_render_thread_context_command_usage_for_help_and_incomplete_filter():
     assert "Sem argumento ele NÃO adivinha um grupo" in help_text
     assert "Filtro incompleto" in incomplete
     assert "thread <ref>" in incomplete
+
 
 def test_render_thread_context_command_reports_safe_failure():
     def failing_loader(**kwargs):
