@@ -45,23 +45,67 @@ def _safe_text(value: Any, *, max_len: int = 500) -> str:
 
 
 def _parse_thread_context_args(arg: str) -> dict[str, Any]:
-    """Parse `/ctxwpp [thread|contact] [limit]` without echoing raw refs."""
+    """Parse `/ctxwpp [limit]` or `/ctxwpp [thread|contact] <ref> [limit]` safely."""
     tokens = [part.strip() for part in str(arg or "").split() if part.strip()]
     ref = ""
+    selector = ""
     limit = 10
-    for token in tokens:
+    help_requested = False
+    error = ""
+    idx = 0
+    while idx < len(tokens):
+        token = tokens[idx]
+        token_lower = token.lower()
+        if token_lower in {"help", "ajuda", "?", "uso"}:
+            help_requested = True
+            idx += 1
+            continue
         if token.isdigit():
             limit = max(1, min(int(token), 25))
+            idx += 1
+            continue
+        if token_lower in {"thread", "conversa", "grupo"}:
+            selector = "thread"
+            if idx + 1 < len(tokens) and not tokens[idx + 1].isdigit():
+                ref = tokens[idx + 1]
+                idx += 2
+                continue
+            error = "thread_without_ref"
+            idx += 1
+            continue
+        if token_lower in {"contact", "contato", "dm"}:
+            selector = "contact"
+            if idx + 1 < len(tokens) and not tokens[idx + 1].isdigit():
+                ref = tokens[idx + 1]
+                idx += 2
+                continue
+            error = "contact_without_ref"
+            idx += 1
             continue
         if not ref:
             ref = token
+        idx += 1
     ref_lower = ref.lower()
-    parsed: dict[str, Any] = {"thread": "", "contact": "", "limit": limit}
-    if ref_lower.endswith("@lid") or ref_lower.endswith("@s.whatsapp.net"):
-        parsed["contact"] = ref
-    elif ref:
-        parsed["thread"] = ref
+    parsed: dict[str, Any] = {"thread": "", "contact": "", "limit": limit, "help": help_requested, "error": error}
+    if ref:
+        if selector == "contact" or (not selector and (ref_lower.endswith("@lid") or ref_lower.endswith("@s.whatsapp.net"))):
+            parsed["contact"] = ref
+        else:
+            parsed["thread"] = ref
     return parsed
+
+
+def _thread_context_usage_lines() -> list[str]:
+    return [
+        "📲 WhatsApp Ops — contexto local (somente leitura)",
+        "Uso operacional:",
+        "- /ctxwpp — mostra as últimas 10 mensagens operacionais locais já ingeridas.",
+        "- /ctxwpp 20 — mostra até 20 eventos locais; máximo 25.",
+        "- /ctxwpp thread <ref> 10 ou /ctxwpp contact <ref> 10 — filtro técnico quando uma ref segura já é conhecida.",
+        "",
+        "Sem argumento ele NÃO adivinha um grupo por intenção; ele usa o local_inbound_store mais recente.",
+        "Não busca histórico do provedor, não envia WhatsApp e não imprime refs/telefones/URLs/mídia bruta.",
+    ]
 
 
 def _format_counts(counts: dict[str, Any]) -> str:
@@ -71,8 +115,21 @@ def _format_counts(counts: dict[str, Any]) -> str:
             count = int(value)
         except Exception:
             continue
+        if count <= 0:
+            continue
         parts.append(f"{_safe_text(key, max_len=40)}={count}")
     return ", ".join(parts) if parts else "nenhum"
+
+
+def _count_visible_events(events: list[dict[str, Any]]) -> tuple[dict[str, int], dict[str, int]]:
+    type_counts: dict[str, int] = {}
+    media_counts: dict[str, int] = {}
+    for event in events:
+        msg_type = _safe_text(event.get("message_type") or "unknown", max_len=40) or "unknown"
+        type_counts[msg_type] = type_counts.get(msg_type, 0) + 1
+        if event.get("has_media"):
+            media_counts[msg_type] = media_counts.get(msg_type, 0) + 1
+    return type_counts, media_counts
 
 
 def _format_event(event: dict[str, Any], idx: int) -> list[str]:
@@ -115,6 +172,12 @@ def render_thread_context_command(
     fetch provider history.
     """
     parsed = _parse_thread_context_args(arg)
+    if parsed.get("help"):
+        return "\n".join(_safe_text(line, max_len=600) for line in _thread_context_usage_lines())
+    if parsed.get("error"):
+        lines = _thread_context_usage_lines()
+        lines.insert(1, "Filtro incompleto: informe a ref depois de thread/contact, ou use só /ctxwpp 10.")
+        return "\n".join(_safe_text(line, max_len=600) for line in lines)
     if context_loader is None:
         from tools.whatsapp_ops_tool import wpp_thread_context as default_loader  # type: ignore[import-not-found]
 
@@ -147,25 +210,44 @@ def render_thread_context_command(
         ])
 
     source = _safe_text(data.get("source") or "local_inbound_store", max_len=80)
-    count = int(data.get("message_count") or 0)
+    raw_events = data.get("events")
+    all_events = raw_events if isinstance(raw_events, list) else []
+    events = [
+        event for event in all_events
+        if isinstance(event, dict) and str(event.get("message_type") or "").strip().lower() != "system"
+    ]
+    visible_type_counts, visible_media_counts = _count_visible_events(events)
+    fetched_count = len(all_events)
+    visible_count = len(events)
+    system_hidden = max(0, fetched_count - visible_count)
     filter_bits = []
     if data.get("thread_filter_set"):
-        filter_bits.append("conversa")
+        filter_bits.append("conversa informada")
     if data.get("contact_filter_set"):
-        filter_bits.append("contato")
-    filtro = "+".join(filter_bits) if filter_bits else "recentes locais"
+        filter_bits.append("contato informado")
+    filtro = "+".join(filter_bits) if filter_bits else "últimos eventos locais ingeridos"
+    if filter_bits:
+        scope_hint = "Escopo: filtro técnico informado no comando."
+    else:
+        scope_hint = "Escopo: sem filtro específico; usa o local_inbound_store mais recente."
 
     lines = [
         "📲 WhatsApp Ops — contexto local (somente leitura)",
-        f"Fonte: {source} · modo: operador · filtro: {filtro} · mensagens: {count}",
-        f"Tipos: {_format_counts(data.get('type_counts') or {})}",
-        f"Mídias: {_format_counts(data.get('media_counts') or {})}",
-        "Garantias: não envia, não busca histórico do provedor, não imprime refs/telefones/URLs/mídia bruta.",
+        f"Fonte: {source} · modo: operador",
+        scope_hint,
+        f"Filtro: {filtro}",
+        f"Limite pedido: {parsed['limit']} eventos locais (padrão 10; máximo 25) · exibidas: {visible_count}",
     ]
+    if system_hidden:
+        lines.append(f"Ocultos: {system_hidden} evento(s) system/conexão não operacional.")
+    lines.extend([
+        f"Tipos exibidos: {_format_counts(visible_type_counts)}",
+        f"Mídias exibidas: {_format_counts(visible_media_counts)}",
+        "Garantias: não envia, não busca histórico do provedor, não imprime refs/telefones/URLs/mídia bruta.",
+    ])
 
-    events = data.get("events") if isinstance(data.get("events"), list) else []
     if not events:
-        lines.append("Nenhuma mensagem local encontrada no escopo informado.")
+        lines.append("Nenhuma mensagem operacional local encontrada no escopo informado.")
     else:
         lines.append("Eventos locais:")
         for idx, event in enumerate(events[: parsed["limit"]], start=1):
