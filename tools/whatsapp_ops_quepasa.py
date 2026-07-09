@@ -60,6 +60,187 @@ def _normalize_document_send_url(raw_url: str) -> str:
     return _normalize_endpoint_url(raw_url, "/senddocument")
 
 
+def _normalize_swagger_doc_url(raw_url: str) -> str:
+    raw_url = str(raw_url or "").strip()
+    parsed = urllib.parse.urlsplit(raw_url)
+    if parsed.scheme not in {"http", "https"} or not parsed.netloc:
+        return ""
+    return urllib.parse.urlunsplit((parsed.scheme, parsed.netloc, "/swagger/doc.json", "", ""))
+
+
+def _safe_int(value: Any, default: int, minimum: int, maximum: int) -> int:
+    try:
+        parsed = int(value)
+    except (TypeError, ValueError):
+        parsed = default
+    return max(minimum, min(parsed, maximum))
+
+
+def _history_config(config: dict[str, Any]) -> dict[str, Any]:
+    raw = (config or {}).get("provider_history")
+    cfg = raw if isinstance(raw, dict) else {}
+    return {
+        "enabled": _truthy(cfg.get("enabled", False)),
+        "max_messages": _safe_int(cfg.get("max_messages", 250), 250, 1, 500),
+        "max_pages": _safe_int(cfg.get("max_pages", 3), 3, 1, 10),
+    }
+
+
+def _history_safety() -> dict[str, Any]:
+    return {
+        "read_only": True,
+        "send_performed": False,
+        "summary_persisted": False,
+        "draft_created": False,
+        "crm_write_performed": False,
+        "llm_used": False,
+        "sends_messages": False,
+        "writes_local_store": False,
+        "exposes_raw_refs": False,
+    }
+
+
+def _history_target(thread: str = "", contact: str = "") -> dict[str, Any]:
+    thread_value = str(thread or "").strip()
+    contact_value = str(contact or "").strip()
+    target: dict[str, Any] = {
+        "thread_filter_set": bool(thread_value),
+        "contact_filter_set": bool(contact_value),
+    }
+    if thread_value:
+        target["thread_ref_hash"] = _hash_ref(thread_value)
+    if contact_value:
+        target["contact_ref_hash"] = _hash_ref(contact_value)
+    return target
+
+
+def _history_base_result(
+    *,
+    thread: str = "",
+    contact: str = "",
+    limit: int = 100,
+    pages: int = 1,
+    cfg: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    history_cfg = cfg or {"max_messages": 250, "max_pages": 3}
+    return {
+        "ok": False,
+        "transport": "quepasa_direct_history",
+        "provider": "quepasa",
+        "provider_history_used": False,
+        "target": _history_target(thread=thread, contact=contact),
+        "request_limits": {
+            "limit": min(_safe_int(limit, 100, 1, 500), int(history_cfg.get("max_messages", 250))),
+            "pages": min(_safe_int(pages, 1, 1, 10), int(history_cfg.get("max_pages", 3))),
+        },
+        **_history_safety(),
+    }
+
+
+def _parse_swagger_paths(body: bytes) -> dict[str, Any]:
+    parsed = _parse_json_body(body)
+    paths = parsed.get("paths") if isinstance(parsed, dict) else None
+    return paths if isinstance(paths, dict) else {}
+
+
+def _history_capabilities_from_paths(paths: dict[str, Any]) -> dict[str, Any]:
+    history_candidates: list[str] = []
+    single_message_lookup_supported = False
+    for path, methods in sorted(paths.items()):
+        methods_dict = methods if isinstance(methods, dict) else {}
+        lower_path = str(path).lower()
+        method_names = {str(method).lower() for method in methods_dict.keys()}
+        if lower_path == "/message/{messageid}" and "get" in method_names:
+            single_message_lookup_supported = True
+        if "get" not in method_names:
+            continue
+        if any(term in lower_path for term in ("history", "messages", "chat/history", "chats/history")):
+            if lower_path != "/message/{messageid}":
+                history_candidates.append(str(path))
+    return {
+        "swagger_checked": True,
+        "endpoint_count": len(paths),
+        "history_list_supported": bool(history_candidates),
+        "history_candidate_paths": history_candidates[:10],
+        "single_message_lookup_supported": single_message_lookup_supported,
+        "download_supported": "/download" in paths,
+        "contacts_supported": "/contacts" in paths,
+    }
+
+
+def quepasa_history_capabilities(config: dict[str, Any]) -> dict[str, Any]:
+    raw_url = _quepasa_base_url(config)
+    swagger_url = _normalize_swagger_doc_url(raw_url)
+    result = {
+        "ok": False,
+        "transport": "quepasa_direct_history",
+        "provider": "quepasa",
+        "base_url_configured": bool(raw_url),
+        **_history_safety(),
+    }
+    if not swagger_url:
+        return {**result, "error": "quepasa_swagger_url_missing", "capabilities": {"swagger_checked": False}}
+    req = urllib.request.Request(swagger_url, headers={"Accept": "application/json"}, method="GET")
+    try:
+        with urllib.request.urlopen(req, timeout=10) as resp:
+            paths = _parse_swagger_paths(resp.read(2_000_000))
+            status = int(getattr(resp, "status", 200) or 200)
+    except urllib.error.HTTPError as exc:
+        return {**result, "error": "quepasa_swagger_http_error", "status": int(exc.code), "capabilities": {"swagger_checked": False}}
+    except Exception as exc:  # pragma: no cover - defensive transport stack
+        return {**result, "error": _redact_error(str(exc)), "capabilities": {"swagger_checked": False}}
+    capabilities = _history_capabilities_from_paths(paths)
+    return {**result, "ok": True, "status": status, "capabilities": capabilities}
+
+
+def pull_history_via_quepasa(
+    thread: str = "",
+    contact: str = "",
+    limit: int = 100,
+    pages: int = 1,
+    window_days: int = 0,
+    mode: str = "summary",
+    config: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    """Attempt a read-only provider-history pull through QuePasa.
+
+    QuePasa currently exposes single-message lookup in the live Swagger but no
+    paginated chat-history/list endpoint. This adapter therefore gates capability
+    discovery separately from history use: when unsupported, it returns a safe
+    refusal and leaves ``provider_history_used=false``.
+    """
+    cfg = _history_config(config or {})
+    result = _history_base_result(thread=thread, contact=contact, limit=limit, pages=pages, cfg=cfg)
+    result["window_days"] = _safe_int(window_days, 0, 0, 365)
+    result["mode"] = str(mode or "summary").strip().lower()[:40] or "summary"
+    if not cfg.get("enabled"):
+        return {**result, "error": "provider_history_disabled"}
+    raw_url = _quepasa_base_url(config or {})
+    if not raw_url:
+        return {**result, "error": "provider_history_url_missing"}
+    if not _quepasa_api_key():
+        return {**result, "error": "provider_history_api_key_missing"}
+
+    capabilities_result = quepasa_history_capabilities(config or {})
+    capabilities = capabilities_result.get("capabilities") if isinstance(capabilities_result, dict) else {}
+    result["capabilities"] = capabilities if isinstance(capabilities, dict) else {}
+    result["provider_capability_checked"] = bool(result["capabilities"].get("swagger_checked"))
+    if not capabilities_result.get("ok"):
+        return {**result, "error": capabilities_result.get("error") or "provider_history_capability_check_failed"}
+    if not result["capabilities"].get("history_list_supported"):
+        return {
+            **result,
+            "error": "provider_history_unsupported",
+            "blocked_reason": "quepasa_history_list_endpoint_missing",
+        }
+
+    return {
+        **result,
+        "error": "provider_history_adapter_not_implemented_for_detected_endpoint",
+        "blocked_reason": "safe_pagination_mapping_required",
+    }
+
+
 def _target_chat_id(target: dict[str, Any]) -> str:
     if not isinstance(target, dict):
         return ""
