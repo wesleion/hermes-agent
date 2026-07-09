@@ -2000,7 +2000,7 @@ def test_wpp_inbound_burst_status_tool_is_default_disabled_and_read_only(tmp_pat
     from tools.whatsapp_ops_store import init_db
     from tools.whatsapp_ops_tool import wpp_ingest_inbound_event, wpp_inbound_burst_status
 
-    raw_group = "120363430137938027@g.us"
+    raw_group = "tool_burst_thread"
     token = set_hermes_home_override(tmp_path)
     try:
         init_db()
@@ -2008,7 +2008,7 @@ def test_wpp_inbound_burst_status_tool_is_default_disabled_and_read_only(tmp_pat
             assert _parse(wpp_ingest_inbound_event({
                 "id": f"TOOL_BURST_{idx}",
                 "chat": {"id": raw_group, "title": "Grupo Comercial Alpha"},
-                "participant": {"id": "553199998765@s.whatsapp.net", "title": "Lead Rajada"},
+                "participant": {"id": "tool_burst_contact", "title": "Lead Rajada"},
                 "type": "text",
                 "text": text,
             }))["ok"] is True
@@ -2028,7 +2028,7 @@ def test_wpp_inbound_burst_status_tool_is_default_disabled_and_read_only(tmp_pat
     assert status["crm_write_performed"] is False
     assert status["provider_history_used"] is False
     assert raw_group not in serialized
-    assert "553199998765" not in serialized
+    assert "tool_burst_contact" not in serialized
     assert "TOOL_BURST" not in serialized
 
 

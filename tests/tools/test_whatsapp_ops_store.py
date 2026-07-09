@@ -1053,8 +1053,8 @@ def test_inbound_burst_status_groups_recent_messages_without_raw_refs(tmp_path):
         record_inbound_event,
     )
 
-    raw_group = "120363430137938027@g.us"
-    raw_contact = "553199998765@s.whatsapp.net"
+    raw_group = "burst_thread_synthetic"
+    raw_contact = "burst_contact_synthetic"
     token = set_hermes_home_override(tmp_path)
     try:
         init_db()
@@ -1105,7 +1105,6 @@ def test_inbound_burst_status_groups_recent_messages_without_raw_refs(tmp_path):
     assert "BURST_REAL" not in serialized
     assert raw_group not in serialized
     assert raw_contact not in serialized
-    assert "553199998765" not in serialized
 
 
 def test_inbound_burst_status_collecting_single_message_without_draft(tmp_path):
@@ -1116,8 +1115,8 @@ def test_inbound_burst_status_collecting_single_message_without_draft(tmp_path):
         init_db()
         assert record_inbound_event(
             source_event_id="BURST_SINGLE_001",
-            contact_ref="lead_single@lid",
-            thread_ref="thread_single@g.us",
+            contact_ref="lead_single_ref",
+            thread_ref="thread_single_ref",
             payload={"id": "BURST_SINGLE_001", "type": "text", "text": "mensagem única"},
         )["ok"] is True
         status = get_inbound_burst_status(limit=10, window_seconds=60, quorum=3)
