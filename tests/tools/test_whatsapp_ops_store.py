@@ -1044,3 +1044,89 @@ def test_sanitize_payload_redacts_data_blob_base64_and_media_tokens(tmp_path):
     assert "/v/media/" not in stored_json
     assert "nest_media_key_value" not in stored_json
     assert "T3J0aVNwZWNpZmljVGVzdExvbmdCYXNlNjRTdHJpbmc=" not in stored_json
+
+
+def test_inbound_burst_status_groups_recent_messages_without_raw_refs(tmp_path):
+    from tools.whatsapp_ops_store import (
+        get_inbound_burst_status,
+        init_db,
+        record_inbound_event,
+    )
+
+    raw_group = "120363430137938027@g.us"
+    raw_contact = "553199998765@s.whatsapp.net"
+    token = set_hermes_home_override(tmp_path)
+    try:
+        init_db()
+        for idx, text in enumerate(("oi", "tenho uma dúvida", "pode ajudar?"), 1):
+            assert record_inbound_event(
+                source_event_id=f"BURST_REAL_{idx}",
+                contact_ref=raw_contact,
+                thread_ref=raw_group,
+                payload={"id": f"BURST_REAL_{idx}", "type": "text", "text": text},
+            )["ok"] is True
+        # System events must not become operator-facing burst evidence.
+        assert record_inbound_event(
+            source_event_id="BURST_SYSTEM_001",
+            contact_ref=raw_contact,
+            thread_ref=raw_group,
+            payload={"id": "BURST_SYSTEM_001", "type": "system", "text": "internal"},
+        )["ok"] is True
+        status = get_inbound_burst_status(
+            thread=raw_group,
+            limit=20,
+            window_seconds=60,
+            quorum=2,
+            max_text_chars=80,
+        )
+    finally:
+        reset_hermes_home_override(token)
+
+    serialized = json.dumps(status, ensure_ascii=False)
+    assert status["ok"] is True
+    assert status["read_only"] is True
+    assert status["draft_created"] is False
+    assert status["send_performed"] is False
+    assert status["provider_history_used"] is False
+    assert status["coalescing"]["window_seconds"] == 60
+    assert status["coalescing"]["quorum"] == 2
+    assert status["counts"]["events_considered"] == 3
+    assert status["counts"]["quorum_bursts"] == 1
+    burst = status["bursts"][0]
+    assert burst["state"] == "quorum"
+    assert burst["message_count"] == 3
+    assert burst["primary_action"] == "review_coalesced_context"
+    assert [event["text_preview"] for event in burst["events"]] == [
+        "oi",
+        "tenho uma dúvida",
+        "pode ajudar?",
+    ]
+    assert "system" not in serialized
+    assert "BURST_REAL" not in serialized
+    assert raw_group not in serialized
+    assert raw_contact not in serialized
+    assert "553199998765" not in serialized
+
+
+def test_inbound_burst_status_collecting_single_message_without_draft(tmp_path):
+    from tools.whatsapp_ops_store import get_inbound_burst_status, init_db, record_inbound_event
+
+    token = set_hermes_home_override(tmp_path)
+    try:
+        init_db()
+        assert record_inbound_event(
+            source_event_id="BURST_SINGLE_001",
+            contact_ref="lead_single@lid",
+            thread_ref="thread_single@g.us",
+            payload={"id": "BURST_SINGLE_001", "type": "text", "text": "mensagem única"},
+        )["ok"] is True
+        status = get_inbound_burst_status(limit=10, window_seconds=60, quorum=3)
+    finally:
+        reset_hermes_home_override(token)
+
+    assert status["ok"] is True
+    assert status["counts"]["collecting_bursts"] == 1
+    assert status["counts"]["quorum_bursts"] == 0
+    assert status["bursts"][0]["state"] == "collecting"
+    assert status["bursts"][0]["primary_action"] == "wait_for_more_inbound"
+    assert status["draft_created"] is False
