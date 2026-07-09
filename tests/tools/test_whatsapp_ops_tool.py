@@ -1988,11 +1988,48 @@ def test_whatsapp_ops_toolset_is_registered():
         "wpp_cancel",
         "wpp_status",
         "wpp_inbound_lookup",
+        "wpp_inbound_burst_status",
         "wpp_resolve_conversation_target",
         "wpp_thread_context",
         "wpp_actionable_queue",
         "wpp_ingest_inbound_event",
     }.issubset(names)
+
+
+def test_wpp_inbound_burst_status_tool_is_default_disabled_and_read_only(tmp_path):
+    from tools.whatsapp_ops_store import init_db
+    from tools.whatsapp_ops_tool import wpp_ingest_inbound_event, wpp_inbound_burst_status
+
+    raw_group = "120363430137938027@g.us"
+    token = set_hermes_home_override(tmp_path)
+    try:
+        init_db()
+        for idx, text in enumerate(("primeira", "segunda"), 1):
+            assert _parse(wpp_ingest_inbound_event({
+                "id": f"TOOL_BURST_{idx}",
+                "chat": {"id": raw_group, "title": "Grupo Comercial Alpha"},
+                "participant": {"id": "553199998765@s.whatsapp.net", "title": "Lead Rajada"},
+                "type": "text",
+                "text": text,
+            }))["ok"] is True
+        status = _parse(wpp_inbound_burst_status(thread=raw_group, limit=10))
+    finally:
+        reset_hermes_home_override(token)
+
+    serialized = json.dumps(status, ensure_ascii=False)
+    assert status["ok"] is True
+    assert status["read_only"] is True
+    assert status["coalesce_config"]["enabled"] is False
+    assert status["coalescing"]["window_seconds"] == 60
+    assert status["coalescing"]["quorum"] == 2
+    assert status["counts"]["quorum_bursts"] == 1
+    assert status["draft_created"] is False
+    assert status["send_performed"] is False
+    assert status["crm_write_performed"] is False
+    assert status["provider_history_used"] is False
+    assert raw_group not in serialized
+    assert "553199998765" not in serialized
+    assert "TOOL_BURST" not in serialized
 
 
 def test_wpp_resolve_and_list_contacts_use_sanitized_synthetic_seed(tmp_path):

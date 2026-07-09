@@ -29,6 +29,7 @@ from tools.whatsapp_ops_store import (
     get_actionable_queue,
     get_cockpit_overview,
     get_conversation_summary,
+    get_inbound_burst_status,
     get_media_transcription_status,
     get_thread_context,
     get_transport_contact_ref,
@@ -77,6 +78,7 @@ def _default_config() -> dict[str, Any]:
         "approval": {"required": True, "timeout_minutes": 60, "telegram": {}},
         "allowlists": {"contacts": [], "groups": []},
         "quepasa": {"backend": "n8n_or_http", "send_enabled": False},
+        "inbound_coalesce": {"enabled": False, "window_seconds": 60, "quorum": 2},
         "humanized_send": {
             "enabled": False,
             "delay_mode": "fixed",
@@ -1028,6 +1030,62 @@ def wpp_thread_context(
     return _json(context)
 
 
+def _coalesce_runtime_config() -> dict[str, Any]:
+    cfg = _runtime_config()
+    raw = cfg.get("inbound_coalesce") if isinstance(cfg.get("inbound_coalesce"), dict) else {}
+
+    def _int_value(key: str, default: int, low: int, high: int) -> int:
+        try:
+            value = int((raw or {}).get(key, default))
+        except (TypeError, ValueError):
+            value = default
+        return max(low, min(value, high))
+
+    return {
+        "enabled": bool((raw or {}).get("enabled", False)),
+        "window_seconds": _int_value("window_seconds", 60, 30, 90),
+        "quorum": _int_value("quorum", 2, 2, 10),
+    }
+
+
+def wpp_inbound_burst_status(
+    thread: str = "",
+    contact: str = "",
+    limit: int = 50,
+    window_seconds: int = 0,
+    quorum: int = 0,
+    max_text_chars: int = 160,
+) -> str:
+    """Return read-only local inbound burst/coalescing status.
+
+    Default config is disabled/fail-closed. Even when enabled, this tool only
+    reports whether a reply/draft should wait for a burst window; it never
+    creates drafts, approves, sends, writes CRM, calls an LLM, or fetches
+    provider history.
+    """
+    coalesce = _coalesce_runtime_config()
+    status = get_inbound_burst_status(
+        thread=str(thread or ""),
+        contact=str(contact or ""),
+        limit=limit,
+        window_seconds=window_seconds or coalesce["window_seconds"],
+        quorum=quorum or coalesce["quorum"],
+        max_text_chars=max_text_chars,
+    )
+    status["coalesce_config"] = {
+        "enabled": bool(coalesce["enabled"]),
+        "window_seconds": int(coalesce["window_seconds"]),
+        "quorum": int(coalesce["quorum"]),
+    }
+    status["coalescing_enabled"] = bool(coalesce["enabled"])
+    status["recommendation"] = (
+        "hold_draft_until_burst_settles"
+        if coalesce["enabled"] and status.get("counts", {}).get("collecting_bursts")
+        else "read_only_status_only"
+    )
+    return _json(status)
+
+
 def wpp_conversation_summary(
     thread: str = "",
     contact: str = "",
@@ -1687,6 +1745,34 @@ registry.register(
         contact=args.get("contact", ""),
         limit=args.get("limit", 20),
         mode=args.get("mode", "summary"),
+        max_text_chars=args.get("max_text_chars", 160),
+    ),
+    check_fn=check_whatsapp_ops_requirements,
+    emoji="📲",
+)
+
+registry.register(
+    name="wpp_inbound_burst_status",
+    toolset=TOOLSET,
+    schema=_schema(
+        "wpp_inbound_burst_status",
+        "Return read-only local inbound burst/coalescing windows before draft/response. Default config is disabled; this never sends, creates drafts, writes CRM, calls an LLM, or fetches provider history.",
+        {
+            "thread": {"type": "string"},
+            "contact": {"type": "string"},
+            "limit": {"type": "integer"},
+            "window_seconds": {"type": "integer"},
+            "quorum": {"type": "integer"},
+            "max_text_chars": {"type": "integer"},
+        },
+        [],
+    ),
+    handler=lambda args, **kw: wpp_inbound_burst_status(
+        thread=args.get("thread", ""),
+        contact=args.get("contact", ""),
+        limit=args.get("limit", 50),
+        window_seconds=args.get("window_seconds", 0),
+        quorum=args.get("quorum", 0),
         max_text_chars=args.get("max_text_chars", 160),
     ),
     check_fn=check_whatsapp_ops_requirements,
