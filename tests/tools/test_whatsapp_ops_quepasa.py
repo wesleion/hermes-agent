@@ -72,6 +72,71 @@ def test_quepasa_client_fails_closed_without_api_key(monkeypatch):
     urlopen.assert_not_called()
 
 
+def test_provider_history_pull_fails_closed_when_disabled(monkeypatch):
+    from tools.whatsapp_ops_quepasa import pull_history_via_quepasa
+
+    with patch("urllib.request.urlopen") as urlopen:
+        result = pull_history_via_quepasa(
+            thread="provider_history_thread_synthetic",
+            config={"provider_history": {"enabled": False}, "quepasa": {"send_url": "https://quepasa.wesleion.com"}},
+        )
+
+    assert result["ok"] is False
+    assert result["error"] == "provider_history_disabled"
+    assert result["read_only"] is True
+    assert result["provider_history_used"] is False
+    assert result["send_performed"] is False
+    assert result["summary_persisted"] is False
+    urlopen.assert_not_called()
+
+
+def test_provider_history_pull_reports_quepasa_unsupported_without_leaking_refs(monkeypatch):
+    from tools.whatsapp_ops_quepasa import pull_history_via_quepasa
+
+    monkeypatch.setenv("WHATSAPP_OPS_QUEPASA_API_KEY", "secret-token")
+    captured = {}
+    swagger = json.dumps({
+        "paths": {
+            "/message/{messageid}": {"get": {"summary": "Get message"}},
+            "/groups/get": {"get": {"summary": "Get group information"}},
+            "/send": {"post": {"summary": "Send message"}},
+        }
+    })
+
+    def fake_urlopen(req, timeout):
+        captured["req"] = req
+        captured["timeout"] = timeout
+        return _FakeResponse(swagger)
+
+    with patch("urllib.request.urlopen", fake_urlopen):
+        result = pull_history_via_quepasa(
+            thread="provider_history_thread_synthetic",
+            limit=5000,
+            pages=99,
+            config={
+                "provider_history": {"enabled": True, "max_messages": 250, "max_pages": 3},
+                "quepasa": {"send_url": "https://quepasa.wesleion.com/swagger/doc.json"},
+            },
+        )
+
+    serialized = json.dumps(result, ensure_ascii=False)
+    assert result["ok"] is False
+    assert result["error"] == "provider_history_unsupported"
+    assert result["provider_history_used"] is False
+    assert result["read_only"] is True
+    assert result["send_performed"] is False
+    assert result["summary_persisted"] is False
+    assert result["target"]["thread_filter_set"] is True
+    assert result["request_limits"] == {"limit": 250, "pages": 3}
+    assert result["capabilities"]["history_list_supported"] is False
+    assert result["capabilities"]["single_message_lookup_supported"] is True
+    assert captured["req"].get_method() == "GET"
+    assert captured["req"].full_url == "https://quepasa.wesleion.com/swagger/doc.json"
+    assert "provider_history_thread_synthetic" not in serialized
+    assert "@g.us" not in serialized
+    assert "secret-token" not in serialized
+
+
 def test_quepasa_client_does_not_call_http_when_disabled():
     from tools.whatsapp_ops_quepasa import send_via_quepasa
 

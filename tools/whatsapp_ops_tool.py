@@ -17,6 +17,7 @@ from typing import Any, Callable
 
 from tools.registry import registry
 from tools.whatsapp_ops_policy import evaluate_send_guardrails
+from tools.whatsapp_ops_quepasa import pull_history_via_quepasa
 
 try:  # config loading is best-effort; tool remains fail-closed if unavailable
     from hermes_cli.config import load_config
@@ -78,6 +79,7 @@ def _default_config() -> dict[str, Any]:
         "approval": {"required": True, "timeout_minutes": 60, "telegram": {}},
         "allowlists": {"contacts": [], "groups": []},
         "quepasa": {"backend": "n8n_or_http", "send_enabled": False},
+        "provider_history": {"enabled": False, "backend": "quepasa_direct", "max_messages": 250, "max_pages": 3},
         "inbound_coalesce": {"enabled": False, "window_seconds": 60, "quorum": 2},
         "humanized_send": {
             "enabled": False,
@@ -1109,6 +1111,36 @@ def wpp_conversation_summary(
     return _json(summary)
 
 
+def wpp_provider_history_pull(
+    thread: str = "",
+    contact: str = "",
+    limit: int = 100,
+    pages: int = 1,
+    window_days: int = 0,
+    mode: str = "summary",
+    config: dict[str, Any] | None = None,
+    history_client: Callable[..., dict[str, Any]] | None = None,
+) -> str:
+    """Gate provider-history pull through a read-only adapter.
+
+    Defaults to disabled and never sends, creates drafts/approvals/outbox, writes
+    CRM, calls an LLM, or persists summaries. The QuePasa adapter currently
+    reports unsupported when no paginated history endpoint is present.
+    """
+    cfg = _runtime_config() if config is None else _deep_merge(_default_config(), config)
+    client = history_client or pull_history_via_quepasa
+    result = client(
+        thread=str(thread or ""),
+        contact=str(contact or ""),
+        limit=limit,
+        pages=pages,
+        window_days=window_days,
+        mode=str(mode or "summary"),
+        config=cfg,
+    )
+    return _json(result if isinstance(result, dict) else {"ok": False, "error": "provider_history_invalid_result"})
+
+
 def wpp_transcribe_media(
     event_id: str,
     mode: str = "on_request",
@@ -1810,6 +1842,34 @@ registry.register(
         include_evidence=bool(args.get("include_evidence", False)),
         window_days=args.get("window_days", 0),
         chunk_size=args.get("chunk_size", 25),
+    ),
+    check_fn=check_whatsapp_ops_requirements,
+    emoji="📲",
+)
+
+registry.register(
+    name="wpp_provider_history_pull",
+    toolset=TOOLSET,
+    schema=_schema(
+        "wpp_provider_history_pull",
+        "Gate a read-only provider-history pull adapter. Default disabled; never sends WhatsApp, never writes CRM/local store, never creates drafts/approvals/outbox, never calls an LLM, and never persists summaries. Returns safe capability/unsupported status when QuePasa lacks paginated history.",
+        {
+            "thread": {"type": "string"},
+            "contact": {"type": "string"},
+            "limit": {"type": "integer"},
+            "pages": {"type": "integer"},
+            "window_days": {"type": "integer"},
+            "mode": {"type": "string", "enum": ["summary", "operator", "debug"]},
+        },
+        [],
+    ),
+    handler=lambda args, **kw: wpp_provider_history_pull(
+        thread=args.get("thread", ""),
+        contact=args.get("contact", ""),
+        limit=args.get("limit", 100),
+        pages=args.get("pages", 1),
+        window_days=args.get("window_days", 0),
+        mode=args.get("mode", "summary"),
     ),
     check_fn=check_whatsapp_ops_requirements,
     emoji="📲",
