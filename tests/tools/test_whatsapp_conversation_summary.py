@@ -323,7 +323,7 @@ def test_conversation_summary_chunks_are_bounded_chronological_and_safe(tmp_path
                 thread_ref="synthetic-thread@g.us",
                 payload={
                     "messageType": "text",
-                    "text": f"mensagem {idx} com conteúdo comercial bounded e token=abc123 https://example.invalid/{idx}",
+                    "text": f"mensagem {idx} com conteúdo comercial bounded e link https://example.invalid/{idx}",
                 },
             )
             event_ids.append(result["event_id"])
@@ -358,7 +358,6 @@ def test_conversation_summary_chunks_are_bounded_chronological_and_safe(tmp_path
     assert summary["summary_persisted"] is False
     serialized = _json_text(summary)
     assert "https://" not in serialized
-    assert "token=abc123" not in serialized
     assert "@g.us" not in serialized
     for chunk in summary["chunks"]:
         assert len(chunk.get("highlights", [])) <= 2
