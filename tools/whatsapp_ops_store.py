@@ -2533,6 +2533,194 @@ def get_thread_context(
     }
 
 
+def _seconds_between(start: Any, end: Any) -> int:
+    first = _parse_iso_datetime(start)
+    last = _parse_iso_datetime(end)
+    if first is None or last is None:
+        return 0
+    return max(0, int((last - first).total_seconds()))
+
+
+def _safe_burst_id(key: tuple[str, str], first_created_at: Any, last_created_at: Any) -> str:
+    return "burst_" + hash_text("|".join([key[0], key[1], str(first_created_at), str(last_created_at)]))[:12]
+
+
+def _burst_state(message_count: int, quorum: int) -> str:
+    return "quorum" if message_count >= quorum else "collecting"
+
+
+def _burst_primary_action(state: str) -> str:
+    return "review_coalesced_context" if state == "quorum" else "wait_for_more_inbound"
+
+
+def _burst_operator_summary(message_count: int, state: str, window_seconds: int) -> str:
+    if state == "quorum":
+        return f"{message_count} mensagens agrupadas em até {window_seconds}s; revisar contexto consolidado antes de responder"
+    return f"{message_count} mensagem em janela de {window_seconds}s; aguardar mais inbound antes de draft/resposta"
+
+
+def get_inbound_burst_status(
+    thread: str = "",
+    contact: str = "",
+    limit: int = 50,
+    window_seconds: int = 60,
+    quorum: int = 2,
+    max_text_chars: int = 160,
+) -> dict[str, Any]:
+    """Return deterministic read-only coalescing windows for recent inbound.
+
+    This is deliberately observational: no draft, approval, send, CRM write,
+    provider-history pull, summary persistence, or LLM call.  It groups already
+    sanitized local inbound events by hashed thread/contact refs and time window
+    so operator/draft code can decide to wait for a burst to settle before
+    responding.
+    """
+    init_db()
+    limit_value, limit_clamped = _clamp_int(limit, 50, 1, 200)
+    window_value, window_clamped = _clamp_int(window_seconds, 60, 30, 90)
+    quorum_value, quorum_clamped = _clamp_int(quorum, 2, 2, 10)
+    max_text = max(0, min(int(max_text_chars or 160), 500))
+    clauses: list[str] = []
+    params: list[Any] = []
+    if thread:
+        clauses.append("thread_ref_hash=?")
+        params.append(hash_text(thread))
+    if contact:
+        clauses.append("contact_ref_hash=?")
+        params.append(hash_text(contact))
+    where = " WHERE " + " AND ".join(clauses) if clauses else ""
+    params.append(limit_value)
+    with _connect() as conn:
+        rows = conn.execute(
+            f"""
+            SELECT id, contact_ref_hash, thread_ref_hash, payload_redacted_json, status, created_at
+            FROM inbound_events
+            {where}
+            ORDER BY created_at DESC
+            LIMIT ?
+            """,
+            tuple(params),
+        ).fetchall()
+
+    events: list[dict[str, Any]] = []
+    for row in rows:
+        try:
+            payload = json.loads(row["payload_redacted_json"] or "{}")
+        except json.JSONDecodeError:
+            payload = {}
+        payload = payload if isinstance(payload, dict) else {}
+        if _message_type_from_payload(payload) == "system":
+            continue
+        if _payload_from_self(payload):
+            continue
+        parsed = _parse_iso_datetime(row["created_at"])
+        events.append({
+            "event_id": row["id"],
+            "status": row["status"],
+            "created_at": row["created_at"],
+            "_created_dt": parsed,
+            "_key": (str(row["thread_ref_hash"] or ""), str(row["contact_ref_hash"] or "")),
+            "payload": payload,
+        })
+    events.sort(key=lambda item: item.get("_created_dt") or datetime.min.replace(tzinfo=timezone.utc))
+
+    grouped: dict[tuple[str, str], list[list[dict[str, Any]]]] = {}
+    for event in events:
+        key = event["_key"]
+        buckets = grouped.setdefault(key, [])
+        if not buckets:
+            buckets.append([event])
+            continue
+        last_bucket = buckets[-1]
+        previous = last_bucket[-1].get("_created_dt")
+        current = event.get("_created_dt")
+        gap = (current - previous).total_seconds() if previous and current else 0
+        if gap <= window_value:
+            last_bucket.append(event)
+        else:
+            buckets.append([event])
+
+    bursts: list[dict[str, Any]] = []
+    for key, buckets in grouped.items():
+        for bucket in buckets:
+            if not bucket:
+                continue
+            first_created_at = bucket[0].get("created_at")
+            last_created_at = bucket[-1].get("created_at")
+            state = _burst_state(len(bucket), quorum_value)
+            public_events = [
+                _event_context(
+                    {
+                        "event_id": event["event_id"],
+                        "status": event["status"],
+                        "created_at": event["created_at"],
+                        "payload": event["payload"],
+                    },
+                    "operator",
+                    max_text,
+                )
+                for event in bucket
+            ]
+            bursts.append({
+                "safe_burst_id": _safe_burst_id(key, first_created_at, last_created_at),
+                "state": state,
+                "message_count": len(bucket),
+                "first_created_at": first_created_at,
+                "last_created_at": last_created_at,
+                "duration_seconds": _seconds_between(first_created_at, last_created_at),
+                "window_seconds": window_value,
+                "quorum": quorum_value,
+                "operator_state": "ACTION_REQUIRED" if state == "quorum" else "WAITING_FOR_BURST",
+                "operator_title": "Revisar rajada inbound" if state == "quorum" else "Aguardar rajada inbound",
+                "operator_summary": _burst_operator_summary(len(bucket), state, window_value),
+                "why_it_matters": "evita draft/resposta prematura enquanto o lead ainda está mandando mensagens em sequência",
+                "primary_action": _burst_primary_action(state),
+                "secondary_actions": ["wpp_thread_context", "wpp_conversation_summary", "wpp_actionable_queue"],
+                "events": public_events[:10],
+            })
+    bursts.sort(key=lambda item: str(item.get("last_created_at") or ""), reverse=True)
+    counts = {
+        "events_considered": len(events),
+        "bursts": len(bursts),
+        "quorum_bursts": sum(1 for burst in bursts if burst.get("state") == "quorum"),
+        "collecting_bursts": sum(1 for burst in bursts if burst.get("state") == "collecting"),
+    }
+    warnings = []
+    if limit_clamped:
+        warnings.append("limit_clamped")
+    if window_clamped:
+        warnings.append("window_seconds_clamped")
+    if quorum_clamped:
+        warnings.append("quorum_clamped")
+    if not bursts:
+        warnings.append("empty_burst_status")
+    return {
+        "ok": True,
+        "source": "local_inbound_store",
+        "generated_by": "deterministic_local_v1",
+        "read_only": True,
+        "local_store_only": True,
+        "thread_filter_set": bool(thread),
+        "contact_filter_set": bool(contact),
+        "send_performed": False,
+        "draft_created": False,
+        "approval_resolved": False,
+        "crm_write_performed": False,
+        "provider_history_used": False,
+        "summary_persisted": False,
+        "llm_used": False,
+        "exposes_raw_refs": False,
+        "coalescing": {
+            "window_seconds": window_value,
+            "quorum": quorum_value,
+            "mode": "read_only_status",
+        },
+        "counts": counts,
+        "bursts": bursts,
+        "warnings": warnings,
+    }
+
+
 _TRANSCRIBABLE_MEDIA_TYPES = {"audio", "voice", "video", "ptt"}
 _TRANSCRIPTION_SAFETY_FLAGS = {
     "transcription_performed": False,
