@@ -1114,13 +1114,16 @@ def wpp_conversation_summary(
 def _commercial_safety_flags(*, draft_created: bool = False, approval_created: bool = False) -> dict[str, Any]:
     return {
         "read_only": not draft_created and not approval_created,
+        "local_store_only": True,
         "send_performed": False,
         "crm_write_performed": False,
+        "crm_written": False,
         "provider_history_used": False,
         "llm_used": False,
         "summary_persisted": False,
         "draft_created": bool(draft_created),
         "approval_created": bool(approval_created),
+        "approval_resolved": False,
         "sends_messages": False,
         "writes_crm": False,
         "fetches_provider_history": False,
@@ -1168,6 +1171,24 @@ def _safe_commercial_text(value: Any, limit: int = 180) -> str:
     return text[:limit]
 
 
+def _commercial_raw_risk_reasons(*values: Any) -> list[str]:
+    raw = " ".join(str(value or "") for value in values if value is not None)
+    if not raw:
+        return []
+    reasons: list[str] = []
+    url_pattern = r"(?i)http" + r"s?://"
+    checks = {
+        "url_or_link": url_pattern,
+        "raw_whatsapp_ref": r"(?i)@(?:g\.us|lid|s\.whatsapp\.net|c\.us|whatsapp\.net)\b",
+        "secret_like_text": r"(?i)\b(?:api[_-]?key|secret|token|authorization|bearer)\s*[=:]\s*[^\s,;]+",
+        "phone_like_text": r"(?<![\w-])\+?\d[\d\s().-]{7,}\d(?![\w-])",
+    }
+    for reason, pattern in checks.items():
+        if re.search(pattern, raw):
+            reasons.append(reason)
+    return reasons
+
+
 def _safe_lead_id(value: Any) -> str:
     raw = str(value or "").strip()
     safe = re.sub(r"[^A-Za-z0-9_.:-]+", "", raw)[:80]
@@ -1211,8 +1232,8 @@ def _lead_target(value: dict[str, Any]) -> dict[str, Any] | None:
     return None
 
 
-def _score_lead(lead: dict[str, Any], min_confidence: float) -> dict[str, Any]:
-    lead_id = _safe_lead_id(lead.get("lead_id") or lead.get("id") or lead.get("name") or lead.get("empresa"))
+def _score_lead(lead: dict[str, Any], min_confidence: float, rank: int = 0, include_evidence: bool = False) -> dict[str, Any]:
+    lead_id = _safe_lead_id(lead.get("lead_id") or lead.get("candidate_id") or lead.get("id") or lead.get("name") or lead.get("empresa"))
     name = _safe_commercial_text(lead.get("name") or lead.get("empresa") or lead.get("lead_name") or lead_id, 80)
     status = _safe_commercial_text(lead.get("status_pipeline") or lead.get("status") or lead.get("stage"), 80)
     context = _safe_commercial_text(lead.get("context") or lead.get("notes") or lead.get("last_interaction"), 180)
@@ -1220,87 +1241,132 @@ def _score_lead(lead: dict[str, Any], min_confidence: float) -> dict[str, Any]:
     stale_days = _safe_int_value(lead.get("last_interaction_days") or lead.get("stale_days") or 0, 0, 0, 365)
     target = _lead_target(lead)
 
-    confidence = 0.2
+    breakdown = {
+        "base": 0.2,
+        "pipeline": 0.0,
+        "recency": 0.0,
+        "open_tasks": 0.0,
+        "intent": 0.0,
+        "target": 0.0,
+        "data_quality": 0.0,
+    }
     signals: list[str] = []
     status_norm = status.casefold()
     context_norm = context.casefold()
     if any(term in status_norm for term in ("proposta", "negocia", "orçamento", "orcamento", "interess", "qualificado")):
-        confidence += 0.25
+        breakdown["pipeline"] = 0.25
         signals.append(f"pipeline: {status}" if status else "pipeline quente")
     if stale_days >= 14:
-        confidence += 0.18
+        breakdown["recency"] = 0.18
         signals.append(f"{stale_days}d sem avanço")
     elif stale_days >= 7:
-        confidence += 0.1
+        breakdown["recency"] = 0.1
         signals.append(f"{stale_days}d sem avanço")
     if open_tasks:
-        confidence += min(0.16, 0.06 + 0.03 * open_tasks)
+        breakdown["open_tasks"] = min(0.16, 0.06 + 0.03 * open_tasks)
         signals.append(f"{open_tasks} pendência(s) abertas")
     if any(term in context_norm for term in ("preço", "preco", "proposta", "call", "marcar", "retomar", "orçamento", "orcamento")):
-        confidence += 0.1
+        breakdown["intent"] = 0.1
         signals.append("contexto indica próximo passo comercial")
     if target:
-        confidence += 0.1
-    confidence = round(min(confidence, 0.95), 2)
+        breakdown["target"] = 0.1
+    if name and (status or context):
+        breakdown["data_quality"] = 0.04
+    confidence = round(min(sum(breakdown.values()), 0.95), 2)
 
     missing_context: list[str] = []
     if not target:
         missing_context.append("target_channel")
     if not context:
         missing_context.append("recent_context")
-    recommended_action = "draft_followup" if confidence >= min_confidence and target else "manual_required"
-    if recommended_action == "manual_required" and confidence >= min_confidence:
+    manual_required = confidence < min_confidence or bool(missing_context)
+    recommended_action = "manual_required" if manual_required else "draft_followup"
+    if manual_required and confidence >= min_confidence:
         signals.append("confiança suficiente, mas alvo/canal precisa validação manual")
     priority = "high" if confidence >= 0.75 else "medium" if confidence >= min_confidence else "low"
     reason = _safe_commercial_text("; ".join(signals) or "contexto insuficiente para ação automática", 220)
-    return {
+    opportunity_id = "opp_" + hash_text(f"{lead_id}|{name}|{status}|{reason}")[:12]
+    result = {
+        "rank": rank,
+        "opportunity_id": opportunity_id,
         "lead_id": lead_id,
         "lead_name": name,
         "priority": priority,
+        "score": confidence,
         "confidence": confidence,
         "reason": reason,
+        "manual_required": manual_required,
+        "manual_reasons": missing_context or (["confidence_below_threshold"] if confidence < min_confidence else []),
         "missing_context": missing_context,
         "recommended_action": recommended_action,
-        "risk_flags": [] if recommended_action != "manual_required" else ["manual_review_required"],
+        "recommended_next_action": recommended_action,
+        "risk_flags": [] if not manual_required else ["manual_review_required"],
         "requires_gate": ["human_approval", "allowlist", "send_flags"] if recommended_action == "draft_followup" else ["operator_review"],
         "target": target or {"target_resolved": False},
         "source": "provided_leads_plus_local_context",
+        "score_breakdown": {k: round(v, 2) for k, v in breakdown.items()},
+        "signals": signals,
     }
+    if include_evidence:
+        result["evidence"] = []
+    return result
 
 
 def wpp_opportunity_scores(
     leads: list[dict[str, Any]] | None = None,
+    lead_inputs: list[dict[str, Any]] | None = None,
     limit: int = 10,
     min_confidence: float = 0.55,
+    confidence_threshold: float | None = None,
     target_query: str = "",
+    segment_ref: str = "",
+    thread: str = "",
+    contact: str = "",
     window_days: int = 30,
+    include_evidence: bool = False,
 ) -> str:
     """Rank commercial opportunities without sending, writing CRM, or fetching provider history."""
     init_db()
-    cap = _safe_int_value(limit, 10, 1, 25)
-    threshold = _safe_float_value(min_confidence, 0.55, 0.0, 0.95)
-    input_leads = leads if isinstance(leads, list) else []
-    scored = [_score_lead(lead, threshold) for lead in input_leads if isinstance(lead, dict)]
+    cap = _safe_int_value(limit, 10, 1, 50)
+    threshold = _safe_float_value(confidence_threshold if confidence_threshold is not None else min_confidence, 0.55, 0.0, 1.0)
+    input_leads = lead_inputs if isinstance(lead_inputs, list) else leads if isinstance(leads, list) else []
+    scored = [_score_lead(lead, threshold, include_evidence=include_evidence) for lead in input_leads if isinstance(lead, dict)]
     scored.sort(key=lambda item: (float(item.get("confidence") or 0), item.get("priority") == "high"), reverse=True)
+    for idx, item in enumerate(scored, start=1):
+        item["rank"] = idx
+    capped = scored[:cap]
     response = {
         "ok": True,
         "mode": "opportunity_scores",
         "source": "provided_leads_local_deterministic",
+        "generated_by": "deterministic_local_v1",
         "target_query_set": bool(str(target_query or "").strip()),
+        "segment_ref_set": bool(str(segment_ref or "").strip()),
+        "thread_set": bool(str(thread or "").strip()),
+        "contact_set": bool(str(contact or "").strip()),
         "window_days": _safe_int_value(window_days, 30, 0, 365),
+        "confidence_threshold": threshold,
         "min_confidence": threshold,
-        "count": min(len(scored), cap),
-        "opportunities": scored[:cap],
+        "limit": cap,
+        "count": len(capped),
+        "counts": {
+            "input_leads": len(input_leads),
+            "local_candidates": 0,
+            "scored": len(scored),
+            "manual_required": sum(1 for item in scored if item.get("manual_required")),
+        },
+        "opportunities": capped,
+        "warnings": [],
         **_commercial_safety_flags(draft_created=False, approval_created=False),
     }
     return _json(response)
 
 
 def _draft_message_for_opportunity(item: dict[str, Any], objective: str = "") -> str:
-    explicit = _safe_commercial_text(item.get("draft_message"), 500)
+    explicit = _safe_commercial_text(item.get("message") or item.get("draft_message"), 500)
     if explicit:
         return explicit
-    lead_name = _safe_commercial_text(item.get("lead_name") or item.get("name") or item.get("lead_id"), 80) or "esse projeto"
+    lead_name = _safe_commercial_text(item.get("lead_name") or item.get("name") or item.get("lead_id") or item.get("candidate_id"), 80) or "esse projeto"
     goal = _safe_commercial_text(objective or item.get("objective") or "avançar no próximo passo", 120)
     return (
         f"Oi! Retomando nossa conversa sobre {lead_name}. "
@@ -1308,57 +1374,110 @@ def _draft_message_for_opportunity(item: dict[str, Any], objective: str = "") ->
     )[:600]
 
 
+def _candidate_id(value: dict[str, Any]) -> str:
+    return _safe_lead_id(value.get("candidate_id") or value.get("lead_id") or value.get("id") or value.get("lead_name"))
+
+
 def wpp_proactive_draft_queue(
     opportunities: list[dict[str, Any]] | None = None,
+    candidates: list[dict[str, Any]] | None = None,
     limit: int = 5,
+    max_items: int | None = None,
     min_confidence: float = 0.6,
     create_approvals: bool = True,
     objective: str = "",
+    mode: str = "preview",
 ) -> str:
-    """Create local proactive commercial drafts + local approval rows only.
+    """Preview or create local proactive commercial drafts + approval rows.
 
-    This never sends WhatsApp, never writes CRM, never calls Telegram, and never
-    fetches provider history. Human approval + allowlist + send flags remain the
-    only send path after a created draft.
+    Default mode is preview/read-only. ``mode='create'`` is required for local
+    draft/approval writes. This never sends WhatsApp, never writes CRM, never
+    calls Telegram by itself, and never fetches provider history. Human approval
+    + allowlist + send flags remain the only send path after a created draft.
     """
     init_db()
-    cap = _safe_int_value(limit, 5, 1, 10)
-    threshold = _safe_float_value(min_confidence, 0.6, 0.0, 0.95)
+    cap = _safe_int_value(max_items if max_items is not None else limit, 5, 1, 5)
+    threshold = _safe_float_value(min_confidence, 0.6, 0.0, 1.0)
+    normalized_mode = str(mode or "preview").strip().lower()
+    create_mode = normalized_mode == "create"
+    source_items = candidates if isinstance(candidates, list) else opportunities if isinstance(opportunities, list) else []
     items: list[dict[str, Any]] = []
     drafts_created = 0
     approvals_created = 0
-    for raw in (opportunities if isinstance(opportunities, list) else [])[:cap]:
+    seen_keys: set[str] = set()
+    for raw in source_items[:cap]:
         if not isinstance(raw, dict):
             continue
-        lead_id = _safe_lead_id(raw.get("lead_id") or raw.get("id") or raw.get("lead_name"))
+        candidate_id = _candidate_id(raw)
         confidence = _safe_float_value(raw.get("confidence"), 0.0, 0.0, 1.0)
         target = _lead_target(raw)
-        action = str(raw.get("recommended_action") or "").strip().lower()
+        action = str(raw.get("recommended_action") or "draft_followup").strip().lower()
+        message = _draft_message_for_opportunity(raw, objective=objective)
+        rationale = _safe_commercial_text(raw.get("rationale") or raw.get("reason"), 220)
+        source_context = raw.get("source_context") if isinstance(raw.get("source_context"), dict) else {}
+        source_summary = _safe_commercial_text(source_context.get("summary") if isinstance(source_context, dict) else "", 180)
+        raw_risks = _commercial_raw_risk_reasons(
+            raw.get("message"), raw.get("draft_message"), raw.get("rationale"), raw.get("reason"), source_summary
+        )
+        message_hash = "sha256:" + hash_text(message)[:16]
+        dedupe_key = _safe_lead_id(raw.get("dedupe_key") or f"{candidate_id}:{message_hash}:{target}")
         base_item = {
-            "lead_id": lead_id,
+            "candidate_id": candidate_id,
+            "lead_id": candidate_id,
             "confidence": round(confidence, 2),
             "priority": _safe_commercial_text(raw.get("priority"), 20) or "low",
-            "reason": _safe_commercial_text(raw.get("reason"), 220),
+            "reason": rationale,
+            "rationale_summary": rationale,
+            "source_context_summary": source_summary,
+            "message_hash": message_hash,
             "send_performed": False,
+            "approval_resolved": False,
             "crm_write_performed": False,
             "provider_history_used": False,
         }
-        if confidence < threshold or not target or action in {"manual_required", "ask_operator", "wait"}:
-            missing = []
-            if confidence < threshold:
-                missing.append("confidence_below_threshold")
-            if not target:
-                missing.append("target_channel")
+        missing: list[str] = []
+        if confidence < threshold:
+            missing.append("confidence_below_threshold")
+        if not target:
+            missing.append("target_channel")
+        elif target.get("type") != "contact":
+            missing.append("contact_only_v1")
+        if action in {"manual_required", "ask_operator", "wait"}:
+            missing.append("operator_review")
+        if raw_risks:
+            missing.append("unsafe_content")
+        if dedupe_key in seen_keys:
+            missing.append("duplicate_candidate")
+        seen_keys.add(dedupe_key)
+        if missing:
             items.append({
                 **base_item,
                 "status": "manual_required",
-                "missing_context": missing or ["operator_review"],
+                "missing_context": missing,
+                "risk_flags": raw_risks,
                 "draft_created": False,
                 "approval_created": False,
             })
             continue
-        message = _draft_message_for_opportunity(raw, objective=objective)
+        if not create_mode:
+            items.append({
+                **base_item,
+                "status": "would_create",
+                "target": target,
+                "missing_context": [],
+                "risk_flags": [],
+                "draft_created": False,
+                "approval_created": False,
+                "approval_card": {
+                    "mode": "preview_only",
+                    "operator_action": "call_again_with_mode_create_to_queue",
+                    "requires_gate": ["human_approval", "allowlist", "send_flags"],
+                    "telegram_notification_sent": False,
+                },
+            })
+            continue
         try:
+            assert target is not None
             draft = create_draft(targets=[target], message=message, created_by="hunter_proactive_draft_queue")
             drafts_created += 1
             approval: dict[str, Any] = {}
@@ -1381,6 +1500,8 @@ def wpp_proactive_draft_queue(
                     "telegram_notification_sent": False,
                 },
                 "message_preview": _safe_commercial_text(message, 160),
+                "missing_context": [],
+                "risk_flags": [],
                 "draft_created": True,
                 "approval_created": bool(approval),
             })
@@ -1389,18 +1510,26 @@ def wpp_proactive_draft_queue(
                 **base_item,
                 "status": "manual_required",
                 "error": _safe_commercial_text(str(exc), 120) or "draft_creation_failed",
+                "missing_context": ["draft_creation_failed"],
                 "draft_created": False,
                 "approval_created": False,
             })
     response = {
         "ok": True,
-        "mode": "proactive_draft_queue",
+        "tool": "wpp_proactive_draft_queue",
+        "mode": "create" if create_mode else "preview",
         "count": len(items),
+        "requested_count": len(source_items),
+        "created_count": drafts_created,
+        "manual_required_count": sum(1 for item in items if item.get("status") == "manual_required"),
+        "skipped_count": 0,
         "drafts_created": drafts_created,
         "approvals_created": approvals_created,
         "telegram_notification_sent": False,
         "min_confidence": threshold,
+        "limit": cap,
         "items": items,
+        "warnings": [],
         **_commercial_safety_flags(draft_created=bool(drafts_created), approval_created=bool(approvals_created)),
     }
     response["read_only"] = False if drafts_created or approvals_created else True
@@ -2151,19 +2280,31 @@ registry.register(
         "Rank Hunter commercial opportunities using provided CRM/local context. Deterministic and read-only: never sends WhatsApp, never writes CRM, never creates drafts/approvals, never calls an LLM, and never fetches provider history.",
         {
             "leads": {"type": "array", "items": {"type": "object"}},
+            "lead_inputs": {"type": "array", "items": {"type": "object"}},
+            "segment_ref": {"type": "string"},
+            "thread": {"type": "string"},
+            "contact": {"type": "string"},
             "limit": {"type": "integer"},
             "min_confidence": {"type": "number"},
+            "confidence_threshold": {"type": "number"},
             "target_query": {"type": "string"},
             "window_days": {"type": "integer"},
+            "include_evidence": {"type": "boolean"},
         },
         [],
     ),
     handler=lambda args, **kw: wpp_opportunity_scores(
         leads=args.get("leads", []),
+        lead_inputs=args.get("lead_inputs"),
         limit=args.get("limit", 10),
         min_confidence=args.get("min_confidence", 0.55),
+        confidence_threshold=args.get("confidence_threshold"),
         target_query=args.get("target_query", ""),
+        segment_ref=args.get("segment_ref", ""),
+        thread=args.get("thread", ""),
+        contact=args.get("contact", ""),
         window_days=args.get("window_days", 30),
+        include_evidence=bool(args.get("include_evidence", False)),
     ),
     check_fn=check_whatsapp_ops_requirements,
     emoji="📲",
@@ -2174,10 +2315,13 @@ registry.register(
     toolset=TOOLSET,
     schema=_schema(
         "wpp_proactive_draft_queue",
-        "Create bounded local proactive commercial drafts plus local approval rows from scored opportunities. Never sends WhatsApp, never writes CRM, never calls Telegram by itself, never fetches provider history, and low-confidence/ambiguous targets become manual_required.",
+        "Preview or create bounded local proactive commercial drafts plus local approval rows from scored opportunities. Default mode is preview/read-only; mode=create is required for local writes. Never sends WhatsApp, never writes CRM, never calls Telegram by itself, never fetches provider history, and low-confidence/ambiguous/unsafe targets become manual_required.",
         {
             "opportunities": {"type": "array", "items": {"type": "object"}},
+            "candidates": {"type": "array", "items": {"type": "object"}},
+            "mode": {"type": "string", "enum": ["preview", "create"]},
             "limit": {"type": "integer"},
+            "max_items": {"type": "integer"},
             "min_confidence": {"type": "number"},
             "create_approvals": {"type": "boolean"},
             "objective": {"type": "string"},
@@ -2186,7 +2330,10 @@ registry.register(
     ),
     handler=lambda args, **kw: wpp_proactive_draft_queue(
         opportunities=args.get("opportunities", []),
+        candidates=args.get("candidates"),
+        mode=args.get("mode", "preview"),
         limit=args.get("limit", 5),
+        max_items=args.get("max_items"),
         min_confidence=args.get("min_confidence", 0.6),
         create_approvals=bool(args.get("create_approvals", True)),
         objective=args.get("objective", ""),
