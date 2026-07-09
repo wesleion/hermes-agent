@@ -154,6 +154,20 @@ def _summary_usage_lines() -> list[str]:
     ]
 
 
+def _mission_usage_lines() -> list[str]:
+    return [
+        "🎯 Hunter — missão comercial (somente leitura)",
+        "Uso operacional:",
+        "- /missao ajuda — mostra este painel.",
+        "- /missao revisar <alvo> — monta card de revisão comercial usando contexto local.",
+        "- /missao revisar item N — usa o item exatamente como aparece em /fila.",
+        "- /missao atacar base fria — prepara plano gateado; não executa outreach.",
+        "- /missao radar comercial hoje — ainda bloqueado até gate de cron/radar.",
+        "",
+        "Este corte não envia WhatsApp, não escreve CRM, não puxa provider-history, não ativa cron e não persiste resumo.",
+    ]
+
+
 def _format_counts(counts: dict[str, Any]) -> str:
     parts = []
     for key, value in sorted((counts or {}).items()):
@@ -244,6 +258,148 @@ def _resolve_target_for_command(
                 )
         return None, "", "", lines
     return resolved, str(resolved.get("_thread_ref") or ""), str(resolved.get("_contact_ref") or ""), []
+
+
+def render_mission_command(
+    arg: str = "",
+    *,
+    summary_loader: Callable[..., str] | None = None,
+    target_resolver: Callable[..., dict[str, Any]] | None = None,
+) -> str:
+    """Render the read-only Hunter commercial mission cockpit."""
+    tokens = [part.strip() for part in str(arg or "").split() if part.strip()]
+    if not tokens or tokens[0].lower() in {"help", "ajuda", "?", "uso"}:
+        return "\n".join(_safe_text(line, max_len=700) for line in _mission_usage_lines())
+
+    action = tokens[0].lower()
+    rest = " ".join(tokens[1:]).strip()
+    if action in {"review", "revisar", "contexto", "analise", "analisar"}:
+        parsed = _parse_targeted_args(rest, default_limit=30, max_limit=50)
+        if parsed.get("help") or parsed.get("error") or not (parsed.get("target") or parsed.get("item") or parsed.get("thread") or parsed.get("contact")):
+            lines = _mission_usage_lines()
+            lines.insert(1, "Missão incompleta: informe alvo, item da /fila ou filtro técnico seguro.")
+            return "\n".join(_safe_text(line, max_len=700) for line in lines)
+
+        target_public, thread_ref, contact_ref, target_errors = _resolve_target_for_command(parsed, resolver=target_resolver)
+        if target_errors:
+            return "\n".join([
+                "🎯 Missão Hunter — revisão comercial",
+                "Estado: bloqueada antes de qualquer ação externa.",
+                *(_safe_text(line, max_len=700) for line in target_errors),
+                "Garantias: whatsapp_send=false · crm_write=false · provider_history_used=false · cron_activation=false.",
+            ])
+
+        if summary_loader is None:
+            from tools.whatsapp_ops_tool import wpp_conversation_summary as default_loader  # type: ignore[import-not-found]
+
+            loader: Callable[..., str] = default_loader
+        else:
+            loader = summary_loader
+        try:
+            raw = loader(
+                thread=thread_ref,
+                contact=contact_ref,
+                limit=parsed["limit"],
+                mode="brief",
+                max_text_chars=180,
+                include_evidence=False,
+            )
+            data = json.loads(raw) if isinstance(raw, str) else raw
+        except Exception as exc:
+            return "\n".join([
+                "🎯 Missão Hunter — revisão comercial",
+                f"Falha ao ler contexto local: {_safe_text(exc, max_len=180)}",
+                "Garantias: whatsapp_send=false · crm_write=false · provider_history_used=false · cron_activation=false.",
+            ])
+        if not isinstance(data, dict) or data.get("ok") is not True:
+            err = _safe_text((data or {}).get("error") if isinstance(data, dict) else "resposta inválida", max_len=160)
+            return "\n".join([
+                "🎯 Missão Hunter — revisão comercial",
+                f"Missão bloqueada: resumo local indisponível ({err or 'erro desconhecido'}).",
+                "Garantias: whatsapp_send=false · crm_write=false · provider_history_used=false · cron_activation=false.",
+            ])
+
+        if target_public:
+            target_line = (
+                "Alvo: "
+                f"{_safe_text(target_public.get('target_label'), max_len=100)} "
+                f"({_safe_text(target_public.get('target_kind'), max_len=30)} · {_safe_text(target_public.get('source'), max_len=40)})"
+            )
+        elif parsed.get("thread") or parsed.get("contact"):
+            target_line = "Alvo: filtro técnico informado no comando."
+        else:
+            target_line = "Alvo: contexto local recente."
+
+        warnings = data.get("warnings") if isinstance(data.get("warnings"), list) else []
+        message_count = int(data.get("message_count") or 0)
+        confidence = "alta" if message_count >= 3 and not warnings and target_public else ("média" if message_count > 0 else "baixa")
+        headline = _safe_text(data.get("headline"), max_len=300)
+        bullets = data.get("bullets") if isinstance(data.get("bullets"), list) else []
+        previews = data.get("latest_previews") if isinstance(data.get("latest_previews"), list) else []
+
+        lines = [
+            "🎯 Missão Hunter — revisão comercial",
+            "Estado: missão preparada, somente leitura.",
+            target_line,
+            f"Fonte de contexto: {_safe_text(data.get('source') or 'local_inbound_store', max_len=80)} · provider-history=false",
+            f"Confiança: {confidence} · base: {message_count} evento(s) local(is)",
+            "Gates bloqueados: WhatsApp send, CRM write, provider-history, cron/autonomia.",
+            "",
+        ]
+        if headline:
+            lines.append(f"Leitura comercial: {headline}")
+        if bullets:
+            lines.append("Sinais locais:")
+            for bullet in bullets[:5]:
+                lines.append(f"- {_safe_text(bullet, max_len=240)}")
+        if previews:
+            lines.append("Últimos sinais:")
+            for preview in previews[:3]:
+                if isinstance(preview, dict):
+                    created = _safe_text(preview.get("created_at"), max_len=32) or "sem horário"
+                    msg_type = _safe_text(preview.get("message_type"), max_len=40) or "unknown"
+                    text = _safe_text(preview.get("text_preview"), max_len=160)
+                    if text:
+                        lines.append(f"- {created} · {msg_type}: {text}")
+        if warnings:
+            lines.append("Warnings: " + ", ".join(_safe_text(w, max_len=80) for w in warnings[:5]))
+        lines.extend([
+            "",
+            "Próximo passo seguro: se o alvo for comercial, resolver Lead/Contato/Canal no CRM antes de draft proativo.",
+            "Garantias: llm_used=false · provider_history_used=false · send_performed=false · summary_persisted=false · crm_write=false.",
+        ])
+        return "\n".join(_safe_text(line, max_len=700) for line in lines)
+
+    if action in {"attack", "atacar", "reativar", "radar"}:
+        objective_raw = rest or ("radar comercial hoje" if action == "radar" else "base fria")
+        objective = _safe_text(objective_raw, max_len=120) or "base fria"
+        label = "Base fria" if objective.lower() == "base fria" else objective
+        blocked = [
+            "CRM identity",
+            "CRM contact/allowlist sync",
+            "opportunity scoring",
+            "draft approval",
+            "WhatsApp send",
+            "CRM write",
+            "provider-history",
+        ]
+        if action == "radar":
+            blocked.append("cron/radar activation")
+        lines = [
+            "🎯 Missão Hunter — ataque comercial gateado",
+            f"Objetivo: {label}",
+            "Estado: missão planejada, não executada.",
+            "Autonomia: ataque_comercial assistido — prepara fila/drafts; envio real continua por approval.",
+            "Confiança: baixa até resolver CRM identity + canal + score de oportunidade.",
+            "Gates bloqueados: " + ", ".join(blocked) + ".",
+            "",
+            "Próximo passo seguro: Batch CRM identity/sync ou `/missao revisar <lead|grupo>` para alvo específico.",
+            "Garantias: whatsapp_send=false · crm_write=false · provider_history_used=false · cron_activation=false.",
+        ]
+        return "\n".join(_safe_text(line, max_len=700) for line in lines)
+
+    # Friendly default: treat unknown non-empty text as a review target.
+    return render_mission_command(f"revisar {arg}", summary_loader=summary_loader, target_resolver=target_resolver)
 
 
 def render_thread_context_command(
