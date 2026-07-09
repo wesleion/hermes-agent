@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import sqlite3
+from datetime import datetime, timedelta, timezone
 from typing import Any
 
 from hermes_constants import reset_hermes_home_override, set_hermes_home_override
@@ -240,3 +241,156 @@ def test_wpp_conversation_summary_wrapper_and_registry(tmp_path):
     description = entry.schema["description"].lower()
     for term in ("local", "read-only", "never sends", "never creates drafts", "never fetches provider history", "never persists"):
         assert term in description
+
+
+def _seed_windowed_history_events(tmp_path):
+    from tools.whatsapp_ops_store import get_db_path, init_db, record_inbound_event
+
+    token = set_hermes_home_override(tmp_path)
+    init_db()
+    recent = record_inbound_event(
+        source_event_id="synthetic-recent-window-event",
+        contact_ref="synthetic-contact@lid",
+        thread_ref="synthetic-thread@g.us",
+        payload={"messageType": "text", "text": "sinal recente para follow-up comercial"},
+    )
+    older = record_inbound_event(
+        source_event_id="synthetic-older-window-event",
+        contact_ref="synthetic-contact@lid",
+        thread_ref="synthetic-thread@g.us",
+        payload={"messageType": "text", "text": "mensagem antiga fora da janela"},
+    )
+    very_old = record_inbound_event(
+        source_event_id="synthetic-very-old-window-event",
+        contact_ref="synthetic-contact@lid",
+        thread_ref="synthetic-thread@g.us",
+        payload={"messageType": "audio", "caption": "áudio antigo fora da janela"},
+    )
+    db_path = get_db_path()
+    now = datetime.now(timezone.utc)
+    with sqlite3.connect(db_path) as conn:
+        conn.execute("UPDATE inbound_events SET created_at=? WHERE id=?", ((now - timedelta(days=1)).isoformat(), recent["event_id"]))
+        conn.execute("UPDATE inbound_events SET created_at=? WHERE id=?", ((now - timedelta(days=10)).isoformat(), older["event_id"]))
+        conn.execute("UPDATE inbound_events SET created_at=? WHERE id=?", ((now - timedelta(days=40)).isoformat(), very_old["event_id"]))
+    return token, db_path
+
+
+def test_conversation_summary_window_days_filters_local_history_without_provider_pull(tmp_path):
+    from tools.whatsapp_ops_store import get_conversation_summary
+
+    token, db_path = _seed_windowed_history_events(tmp_path)
+    before = _snapshot_tables(db_path)
+    try:
+        summary = get_conversation_summary(
+            thread="synthetic-thread@g.us",
+            limit=20,
+            mode="brief",
+            window_days=7,
+            max_text_chars=120,
+        )
+        after = _snapshot_tables(db_path)
+    finally:
+        reset_hermes_home_override(token)
+
+    assert summary["ok"] is True
+    assert summary["message_count"] == 1
+    assert summary["history_window"]["requested_days"] == 7
+    assert summary["history_window"]["applied"] is True
+    assert summary["history_window"]["excluded_by_window"] == 2
+    assert summary["provider_history_used"] is False
+    assert summary["send_performed"] is False
+    assert summary["summary_persisted"] is False
+    assert before == after
+    serialized = _json_text(summary)
+    assert "sinal recente" in serialized
+    assert "mensagem antiga fora da janela" not in serialized
+    assert "áudio antigo fora da janela" not in serialized
+
+
+def test_conversation_summary_chunks_are_bounded_chronological_and_safe(tmp_path):
+    from tools.whatsapp_ops_store import get_db_path, get_conversation_summary, init_db, record_inbound_event
+
+    token = set_hermes_home_override(tmp_path)
+    try:
+        init_db()
+        now = datetime.now(timezone.utc)
+        db_path = get_db_path()
+        event_ids = []
+        for idx in range(5):
+            result = record_inbound_event(
+                source_event_id=f"synthetic-chunk-event-{idx}",
+                contact_ref="synthetic-contact@lid",
+                thread_ref="synthetic-thread@g.us",
+                payload={
+                    "messageType": "text",
+                    "text": f"mensagem {idx} com conteúdo comercial bounded e token=abc123 https://example.invalid/{idx}",
+                },
+            )
+            event_ids.append(result["event_id"])
+        with sqlite3.connect(db_path) as conn:
+            for idx, event_id in enumerate(event_ids):
+                conn.execute(
+                    "UPDATE inbound_events SET created_at=? WHERE id=?",
+                    ((now - timedelta(minutes=5 - idx)).isoformat(), event_id),
+                )
+        before = _snapshot_tables(db_path)
+        summary = get_conversation_summary(
+            thread="synthetic-thread@g.us",
+            limit=20,
+            mode="chunks",
+            window_days=30,
+            chunk_size=2,
+            max_text_chars=48,
+        )
+        after = _snapshot_tables(db_path)
+    finally:
+        reset_hermes_home_override(token)
+
+    assert before == after
+    assert summary["mode"] == "chunks"
+    assert summary["chunk_size"] == 2
+    assert summary["chunk_count"] == 3
+    assert [chunk["event_count"] for chunk in summary["chunks"]] == [2, 2, 1]
+    chunk_starts = [chunk["window"]["first_created_at"] for chunk in summary["chunks"]]
+    assert chunk_starts == sorted(chunk_starts)
+    assert summary["llm_used"] is False
+    assert summary["provider_history_used"] is False
+    assert summary["summary_persisted"] is False
+    serialized = _json_text(summary)
+    assert "https://" not in serialized
+    assert "token=abc123" not in serialized
+    assert "@g.us" not in serialized
+    for chunk in summary["chunks"]:
+        assert len(chunk.get("highlights", [])) <= 2
+        assert "payload" not in chunk
+
+
+def test_wpp_conversation_summary_wrapper_accepts_window_and_chunks(tmp_path):
+    import tools.whatsapp_ops_tool  # noqa: F401
+    from tools.registry import registry
+    from tools.whatsapp_ops_store import init_db
+    from tools.whatsapp_ops_tool import wpp_conversation_summary
+
+    token = set_hermes_home_override(tmp_path)
+    try:
+        init_db()
+        parsed = json.loads(wpp_conversation_summary(mode="chunks", window_days=30, chunk_size=2))
+        dispatched = json.loads(
+            registry.dispatch(
+                "wpp_conversation_summary",
+                {"mode": "chunks", "window_days": 30, "chunk_size": 2},
+            )
+        )
+    finally:
+        reset_hermes_home_override(token)
+
+    assert parsed["ok"] is True
+    assert parsed["mode"] == "chunks"
+    assert parsed["history_window"]["requested_days"] == 30
+    assert dispatched["mode"] == "chunks"
+    entry = registry.get_entry("wpp_conversation_summary")
+    assert entry is not None
+    params = entry.schema["parameters"]["properties"]
+    assert "window_days" in params
+    assert "chunk_size" in params
+    assert "chunks" in params["mode"]["enum"]

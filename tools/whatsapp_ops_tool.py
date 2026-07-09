@@ -1093,6 +1093,8 @@ def wpp_conversation_summary(
     mode: str = "brief",
     max_text_chars: int = 160,
     include_evidence: bool = False,
+    window_days: int = 0,
+    chunk_size: int = 25,
 ) -> str:
     summary = get_conversation_summary(
         thread=str(thread or ""),
@@ -1101,6 +1103,8 @@ def wpp_conversation_summary(
         mode=str(mode or "brief"),
         max_text_chars=max_text_chars,
         include_evidence=bool(include_evidence),
+        window_days=window_days,
+        chunk_size=chunk_size,
     )
     return _json(summary)
 
@@ -1789,9 +1793,11 @@ registry.register(
             "thread": {"type": "string"},
             "contact": {"type": "string"},
             "limit": {"type": "integer"},
-            "mode": {"type": "string", "enum": ["stats", "brief", "timeline", "evidence"]},
+            "mode": {"type": "string", "enum": ["stats", "brief", "timeline", "evidence", "chunks"]},
             "max_text_chars": {"type": "integer"},
             "include_evidence": {"type": "boolean"},
+            "window_days": {"type": "integer", "description": "Optional local window in days, e.g. 7, 30, 90. 0 means no date window."},
+            "chunk_size": {"type": "integer", "description": "Events per local chunk when mode=chunks."},
         },
         [],
     ),
@@ -1802,6 +1808,8 @@ registry.register(
         mode=args.get("mode", "brief"),
         max_text_chars=args.get("max_text_chars", 160),
         include_evidence=bool(args.get("include_evidence", False)),
+        window_days=args.get("window_days", 0),
+        chunk_size=args.get("chunk_size", 25),
     ),
     check_fn=check_whatsapp_ops_requirements,
     emoji="📲",

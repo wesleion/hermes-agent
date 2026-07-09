@@ -65,6 +65,9 @@ def _parse_targeted_args(arg: str, *, default_limit: int, max_limit: int) -> dic
         "target": "",
         "item": 0,
         "limit": default_limit,
+        "window_days": 0,
+        "summary_mode": "brief",
+        "chunk_size": 25,
         "help": False,
         "error": "",
         "technical_filter": False,
@@ -76,6 +79,20 @@ def _parse_targeted_args(arg: str, *, default_limit: int, max_limit: int) -> dic
         token_lower = token.lower()
         if token_lower in {"help", "ajuda", "?", "uso"}:
             parsed["help"] = True
+            idx += 1
+            continue
+        window_match = re.fullmatch(r"(\d{1,3})(?:d|dia|dias)", token_lower)
+        if window_match:
+            parsed["window_days"] = max(0, min(int(window_match.group(1)), 365))
+            idx += 1
+            continue
+        if token_lower in {"chunks", "chunk", "janelas", "janela"}:
+            parsed["summary_mode"] = "chunks"
+            idx += 1
+            continue
+        if token_lower.startswith("chunk=") and token_lower.split("=", 1)[1].isdigit():
+            parsed["summary_mode"] = "chunks"
+            parsed["chunk_size"] = max(1, min(int(token_lower.split("=", 1)[1]), 50))
             idx += 1
             continue
         if token_lower in {"item", "fila", "--item"}:
@@ -148,9 +165,11 @@ def _summary_usage_lines() -> list[str]:
         "🧾 WhatsApp Ops — resumo local determinístico (somente leitura)",
         "Uso operacional:",
         "- /sumwpp H-Ops 50 — resume até 50 eventos locais do grupo/contato resolvido.",
+        "- /sumwpp H-Ops 7d chunks — analisa janela local dos últimos 7 dias em chunks bounded.",
+        "- /sumwpp item 1 30d chunks — usa o item mostrado em /fila e janela dos últimos 30 dias.",
         "- /sumwpp item 1 50 — resume o alvo do item mostrado em /fila.",
         "- /sumwpp 50 — resumo não filtrado dos eventos locais mais recentes.",
-        "Limite padrão 50; máximo 100. Não usa LLM, não busca histórico do provedor, não persiste resumo e não envia WhatsApp.",
+        "Limite padrão 50; máximo 100. Janelas aceitas: 7d, 30d, 90d etc. Não usa LLM, não busca histórico do provedor, não persiste resumo e não envia WhatsApp.",
     ]
 
 
@@ -544,9 +563,11 @@ def render_conversation_summary_command(
             thread=thread_ref,
             contact=contact_ref,
             limit=parsed["limit"],
-            mode="brief",
+            mode=parsed.get("summary_mode") or "brief",
             max_text_chars=180,
             include_evidence=False,
+            window_days=parsed.get("window_days") or 0,
+            chunk_size=parsed.get("chunk_size") or 25,
         )
         data = json.loads(raw) if isinstance(raw, str) else raw
     except Exception as exc:
@@ -584,6 +605,7 @@ def render_conversation_summary_command(
         scope_hint,
         f"Fonte: {_safe_text(data.get('source'), max_len=80)} · gerador: {_safe_text(data.get('generated_by'), max_len=80)}",
         f"Limite pedido: {parsed['limit']} eventos locais (padrão 50; máximo 100) · analisados: {int(data.get('message_count') or 0)}",
+        f"Janela local: últimos {int((data.get('history_window') or {}).get('requested_days') or 0)} dia(s) · excluídos fora da janela: {int((data.get('history_window') or {}).get('excluded_by_window') or 0)}" if (data.get('history_window') or {}).get('applied') else "Janela local: sem filtro por dias.",
         f"Tipos: {_format_counts(type_counts)}",
         f"Mídias: {_format_counts(media_counts)}",
         "Garantias: llm_used=false · provider_history_used=false · send_performed=false · summary_persisted=false.",
@@ -606,6 +628,27 @@ def render_conversation_summary_command(
                 text = _safe_text(preview.get("text_preview"), max_len=180)
                 if text:
                     lines.append(f"- {created} · {msg_type}: {text}")
+    chunks_obj = data.get("chunks") if isinstance(data.get("chunks"), list) else []
+    if chunks_obj:
+        lines.append(f"Chunks locais: {int(data.get('chunk_count') or len(chunks_obj))} · até {int(data.get('chunk_size') or parsed.get('chunk_size') or 25)} eventos por chunk")
+        for chunk in chunks_obj[:5]:
+            if not isinstance(chunk, dict):
+                continue
+            window_obj = chunk.get("window")
+            window: dict[str, Any] = window_obj if isinstance(window_obj, dict) else {}
+            first = _safe_text(window.get("first_created_at"), max_len=32) or "sem início"
+            last = _safe_text(window.get("last_created_at"), max_len=32) or "sem fim"
+            type_counts_chunk_obj = chunk.get("type_counts")
+            type_counts_chunk: dict[str, Any] = type_counts_chunk_obj if isinstance(type_counts_chunk_obj, dict) else {}
+            lines.append(
+                f"- chunk {int(chunk.get('index') or 0)}: {int(chunk.get('event_count') or 0)} evento(s) · {first} → {last} · tipos: {_format_counts(type_counts_chunk)}"
+            )
+            highlights_obj = chunk.get("highlights")
+            highlights: list[Any] = highlights_obj if isinstance(highlights_obj, list) else []
+            for highlight in highlights[:2]:
+                safe_highlight = _safe_text(highlight, max_len=180)
+                if safe_highlight:
+                    lines.append(f"  · {safe_highlight}")
     actions = data.get("suggested_actions") if isinstance(data.get("suggested_actions"), list) else []
     if actions:
         safe_actions = [_safe_text(action, max_len=80) for action in actions[:6]]

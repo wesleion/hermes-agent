@@ -294,6 +294,78 @@ def test_render_conversation_summary_command_resolves_item_and_shows_safe_flags(
     assert "120363375521827492" not in rendered
 
 
+def test_render_conversation_summary_command_accepts_window_and_chunks():
+    seen_loader = {}
+
+    def fake_resolver(**kwargs):
+        assert kwargs["query"] == "H-Ops"
+        assert kwargs["item_index"] == 0
+        assert kwargs["include_transport"] is True
+        return {
+            "ok": True,
+            "ambiguous": False,
+            "target_kind": "group",
+            "target_label": "H-Ops",
+            "source": "registered_group",
+            "_thread_ref": "synthetic-thread@g.us",
+            "_contact_ref": "",
+        }
+
+    def fake_summary(**kwargs):
+        seen_loader.update(kwargs)
+        return json.dumps(
+            {
+                "ok": True,
+                "source": "local_inbound_store",
+                "generated_by": "deterministic_local_v1",
+                "llm_used": False,
+                "provider_history_used": False,
+                "send_performed": False,
+                "summary_persisted": False,
+                "thread_filter_set": True,
+                "contact_filter_set": False,
+                "message_count": 3,
+                "type_counts": {"text": 3},
+                "media_counts": {},
+                "history_window": {"applied": True, "requested_days": 7, "excluded_by_window": 2},
+                "chunk_count": 2,
+                "chunk_size": 2,
+                "chunks": [
+                    {
+                        "chunk_id": "chunk_01",
+                        "index": 1,
+                        "event_count": 2,
+                        "window": {"first_created_at": "2026-07-01T10:00:00+00:00", "last_created_at": "2026-07-01T10:03:00+00:00"},
+                        "type_counts": {"text": 2},
+                        "highlights": ["lead pediu proposta", "follow-up pendente"],
+                    },
+                    {
+                        "chunk_id": "chunk_02",
+                        "index": 2,
+                        "event_count": 1,
+                        "window": {"first_created_at": "2026-07-02T10:00:00+00:00", "last_created_at": "2026-07-02T10:00:00+00:00"},
+                        "type_counts": {"text": 1},
+                        "highlights": ["aguardando retorno"],
+                    },
+                ],
+                "warnings": [],
+            },
+            ensure_ascii=False,
+        )
+
+    rendered = render_conversation_summary_command("H-Ops 7d chunks", summary_loader=fake_summary, target_resolver=fake_resolver)
+
+    assert seen_loader["thread"] == "synthetic-thread@g.us"
+    assert seen_loader["mode"] == "chunks"
+    assert seen_loader["window_days"] == 7
+    assert seen_loader["chunk_size"] == 25
+    assert "Janela local: últimos 7 dia(s)" in rendered
+    assert "Chunks locais: 2" in rendered
+    assert "lead pediu proposta" in rendered
+    assert "@g.us" not in rendered
+
+
+
 def test_render_thread_context_command_explains_default_scope_and_hides_system_counts():
     seen_kwargs = {}
 
