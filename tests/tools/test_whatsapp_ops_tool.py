@@ -1383,6 +1383,132 @@ def test_wpp_ingest_system_events_do_not_create_registration_staging(tmp_path):
     assert "+5511999990000" not in serialized
 
 
+def test_wpp_opportunity_scores_rank_read_only_and_sanitized(tmp_path):
+    import sqlite3
+    from tools.whatsapp_ops_store import get_db_path, init_db
+    from tools.whatsapp_ops_tool import wpp_opportunity_scores
+
+    raw_phone = "553199998" + "765"
+    raw_thread = "120363" + "430137" + "938027@g.us"
+    raw_url = "https" + "://unsafe.example/path"
+    secretish = "tok" + "en" + "=abc123"
+    home_override = set_hermes_home_override(tmp_path)
+    try:
+        init_db()
+        db = get_db_path()
+        tables = ["inbound_events", "drafts", "approvals", "outbox", "contacts", "lists", "registration_staging"]
+        with sqlite3.connect(db) as conn:
+            before = {table: conn.execute(f"SELECT count(*) FROM {table}").fetchone()[0] for table in tables}
+        result = _parse(wpp_opportunity_scores(
+            leads=[
+                {
+                    "lead_id": "LEAD-001",
+                    "name": "H-Ops " + raw_url,
+                    "status_pipeline": "proposta enviada",
+                    "last_interaction_days": 21,
+                    "open_tasks": 2,
+                    "context": "cliente pediu preço " + secretish + " " + raw_phone + " " + raw_thread,
+                    "target": {"type": "contact", "contact_id": "lead_hops"},
+                },
+                {
+                    "lead_id": "LEAD-002",
+                    "name": "Lead frio",
+                    "status_pipeline": "novo",
+                    "last_interaction_days": 0,
+                },
+            ],
+            limit=5,
+            min_confidence=0.55,
+        ))
+        with sqlite3.connect(db) as conn:
+            after = {table: conn.execute(f"SELECT count(*) FROM {table}").fetchone()[0] for table in tables}
+    finally:
+        reset_hermes_home_override(home_override)
+
+    assert result["ok"] is True
+    assert result["read_only"] is True
+    assert result["send_performed"] is False
+    assert result["crm_write_performed"] is False
+    assert result["provider_history_used"] is False
+    assert result["draft_created"] is False
+    assert result["approval_created"] is False
+    assert before == after
+    assert result["opportunities"][0]["lead_id"] == "LEAD-001"
+    assert result["opportunities"][0]["priority"] == "high"
+    assert result["opportunities"][0]["recommended_action"] == "draft_followup"
+    assert result["opportunities"][1]["recommended_action"] == "manual_required"
+    serialized = json.dumps(result, ensure_ascii=False)
+    assert raw_url.split("://", 1)[1].split("/", 1)[0] not in serialized
+    assert secretish not in serialized
+    assert raw_phone not in serialized
+    assert raw_thread.split("@", 1)[0] not in serialized
+    assert "@g.us" not in serialized
+
+
+def test_wpp_proactive_draft_queue_creates_local_draft_and_approval_only(tmp_path):
+    import sqlite3
+    from tools.whatsapp_ops_store import get_db_path, init_db
+    from tools.whatsapp_ops_tool import wpp_proactive_draft_queue
+
+    raw_phone = "553199998" + "765"
+    raw_url = "https" + "://unsafe.example"
+    secretish = "tok" + "en" + "=abc123"
+    home_override = set_hermes_home_override(tmp_path)
+    try:
+        init_db()
+        db = get_db_path()
+        tables = ["inbound_events", "drafts", "approvals", "outbox", "contacts", "lists", "registration_staging"]
+        with sqlite3.connect(db) as conn:
+            before = {table: conn.execute(f"SELECT count(*) FROM {table}").fetchone()[0] for table in tables}
+        result = _parse(wpp_proactive_draft_queue(
+            opportunities=[
+                {
+                    "lead_id": "LEAD-001",
+                    "target": {"type": "contact", "contact_id": "lead_hops"},
+                    "confidence": 0.82,
+                    "priority": "high",
+                    "reason": "proposta parada há 21 dias; retomar sem URL " + raw_url,
+                    "recommended_action": "draft_followup",
+                    "draft_message": "Oi! Retomando nossa conversa para marcar o próximo passo. " + secretish + " " + raw_phone,
+                },
+                {
+                    "lead_id": "LEAD-002",
+                    "confidence": 0.2,
+                    "recommended_action": "manual_required",
+                },
+            ],
+            limit=5,
+            min_confidence=0.6,
+            create_approvals=True,
+        ))
+        with sqlite3.connect(db) as conn:
+            after = {table: conn.execute(f"SELECT count(*) FROM {table}").fetchone()[0] for table in tables}
+    finally:
+        reset_hermes_home_override(home_override)
+
+    assert result["ok"] is True
+    assert result["send_performed"] is False
+    assert result["crm_write_performed"] is False
+    assert result["provider_history_used"] is False
+    assert result["telegram_notification_sent"] is False
+    assert result["drafts_created"] == 1
+    assert result["approvals_created"] == 1
+    assert after["drafts"] == before["drafts"] + 1
+    assert after["approvals"] == before["approvals"] + 1
+    assert after["outbox"] == before["outbox"]
+    assert after["inbound_events"] == before["inbound_events"]
+    created = result["items"][0]
+    skipped = result["items"][1]
+    assert created["status"] == "pending_approval"
+    assert created["draft_id"].startswith("draft_")
+    assert created["approval_id"].startswith("approval_")
+    assert skipped["status"] == "manual_required"
+    serialized = json.dumps(result, ensure_ascii=False)
+    assert raw_url.split("://", 1)[1] not in serialized
+    assert secretish not in serialized
+    assert raw_phone not in serialized
+
+
 def test_wpp_provider_history_pull_tool_disabled_is_read_only(tmp_path):
     import sqlite3
     from tools.whatsapp_ops_store import get_db_path, init_db
