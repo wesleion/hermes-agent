@@ -1383,7 +1383,7 @@ def test_wpp_ingest_system_events_do_not_create_registration_staging(tmp_path):
     assert "+5511999990000" not in serialized
 
 
-def test_wpp_opportunity_scores_rank_read_only_and_sanitized(tmp_path):
+def test_wpp_opportunity_scores_rank_read_only_sanitized_and_auditable(tmp_path):
     import sqlite3
     from tools.whatsapp_ops_store import get_db_path, init_db
     from tools.whatsapp_ops_tool import wpp_opportunity_scores
@@ -1400,7 +1400,7 @@ def test_wpp_opportunity_scores_rank_read_only_and_sanitized(tmp_path):
         with sqlite3.connect(db) as conn:
             before = {table: conn.execute(f"SELECT count(*) FROM {table}").fetchone()[0] for table in tables}
         result = _parse(wpp_opportunity_scores(
-            leads=[
+            lead_inputs=[
                 {
                     "lead_id": "LEAD-001",
                     "name": "H-Ops " + raw_url,
@@ -1418,7 +1418,8 @@ def test_wpp_opportunity_scores_rank_read_only_and_sanitized(tmp_path):
                 },
             ],
             limit=5,
-            min_confidence=0.55,
+            confidence_threshold=0.55,
+            include_evidence=True,
         ))
         with sqlite3.connect(db) as conn:
             after = {table: conn.execute(f"SELECT count(*) FROM {table}").fetchone()[0] for table in tables}
@@ -1426,17 +1427,33 @@ def test_wpp_opportunity_scores_rank_read_only_and_sanitized(tmp_path):
         reset_hermes_home_override(home_override)
 
     assert result["ok"] is True
+    assert result["generated_by"] == "deterministic_local_v1"
     assert result["read_only"] is True
+    assert result["local_store_only"] is True
     assert result["send_performed"] is False
     assert result["crm_write_performed"] is False
+    assert result["crm_written"] is False
     assert result["provider_history_used"] is False
     assert result["draft_created"] is False
     assert result["approval_created"] is False
+    assert result["approval_resolved"] is False
     assert before == after
-    assert result["opportunities"][0]["lead_id"] == "LEAD-001"
-    assert result["opportunities"][0]["priority"] == "high"
-    assert result["opportunities"][0]["recommended_action"] == "draft_followup"
-    assert result["opportunities"][1]["recommended_action"] == "manual_required"
+    assert result["counts"]["input_leads"] == 2
+    assert result["counts"]["scored"] == 2
+    first = result["opportunities"][0]
+    second = result["opportunities"][1]
+    assert first["rank"] == 1
+    assert first["lead_id"] == "LEAD-001"
+    assert first["opportunity_id"].startswith("opp_")
+    assert first["priority"] == "high"
+    assert first["manual_required"] is False
+    assert first["recommended_action"] == "draft_followup"
+    assert first["recommended_next_action"] == "draft_followup"
+    assert set(first["score_breakdown"]) >= {"pipeline", "recency", "open_tasks", "intent", "target", "data_quality"}
+    assert first["signals"]
+    assert second["manual_required"] is True
+    assert second["recommended_action"] == "manual_required"
+    assert "target_channel" in second["manual_reasons"]
     serialized = json.dumps(result, ensure_ascii=False)
     assert raw_url.split("://", 1)[1].split("/", 1)[0] not in serialized
     assert secretish not in serialized
@@ -1445,7 +1462,43 @@ def test_wpp_opportunity_scores_rank_read_only_and_sanitized(tmp_path):
     assert "@g.us" not in serialized
 
 
-def test_wpp_proactive_draft_queue_creates_local_draft_and_approval_only(tmp_path):
+def test_wpp_proactive_draft_queue_preview_default_is_read_only(tmp_path):
+    import sqlite3
+    from tools.whatsapp_ops_store import get_db_path, init_db
+    from tools.whatsapp_ops_tool import wpp_proactive_draft_queue
+
+    home_override = set_hermes_home_override(tmp_path)
+    try:
+        init_db()
+        db = get_db_path()
+        tables = ["inbound_events", "drafts", "approvals", "outbox", "contacts", "lists", "registration_staging"]
+        with sqlite3.connect(db) as conn:
+            before = {table: conn.execute(f"SELECT count(*) FROM {table}").fetchone()[0] for table in tables}
+        result = _parse(wpp_proactive_draft_queue(
+            candidates=[{
+                "candidate_id": "LEAD-001",
+                "target": {"type": "contact", "contact_id": "lead_hops"},
+                "confidence": 0.82,
+                "priority": "high",
+                "rationale": "proposta parada há 21 dias; retomar",
+                "message": "Oi! Retomando nossa conversa para marcar o próximo passo.",
+            }],
+        ))
+        with sqlite3.connect(db) as conn:
+            after = {table: conn.execute(f"SELECT count(*) FROM {table}").fetchone()[0] for table in tables}
+    finally:
+        reset_hermes_home_override(home_override)
+
+    assert result["ok"] is True
+    assert result["mode"] == "preview"
+    assert result["read_only"] is True
+    assert result["drafts_created"] == 0
+    assert result["approvals_created"] == 0
+    assert result["items"][0]["status"] == "would_create"
+    assert before == after
+
+
+def test_wpp_proactive_draft_queue_create_requires_safe_candidate(tmp_path):
     import sqlite3
     from tools.whatsapp_ops_store import get_db_path, init_db
     from tools.whatsapp_ops_tool import wpp_proactive_draft_queue
@@ -1461,23 +1514,32 @@ def test_wpp_proactive_draft_queue_creates_local_draft_and_approval_only(tmp_pat
         with sqlite3.connect(db) as conn:
             before = {table: conn.execute(f"SELECT count(*) FROM {table}").fetchone()[0] for table in tables}
         result = _parse(wpp_proactive_draft_queue(
-            opportunities=[
+            candidates=[
                 {
-                    "lead_id": "LEAD-001",
+                    "candidate_id": "LEAD-001",
                     "target": {"type": "contact", "contact_id": "lead_hops"},
                     "confidence": 0.82,
                     "priority": "high",
-                    "reason": "proposta parada há 21 dias; retomar sem URL " + raw_url,
-                    "recommended_action": "draft_followup",
-                    "draft_message": "Oi! Retomando nossa conversa para marcar o próximo passo. " + secretish + " " + raw_phone,
+                    "rationale": "proposta parada há 21 dias; retomar",
+                    "message": "Oi! Retomando nossa conversa para marcar o próximo passo.",
                 },
                 {
-                    "lead_id": "LEAD-002",
-                    "confidence": 0.2,
-                    "recommended_action": "manual_required",
+                    "candidate_id": "LEAD-UNSAFE",
+                    "target": {"type": "contact", "contact_id": "lead_unsafe"},
+                    "confidence": 0.91,
+                    "recommended_action": "draft_followup",
+                    "message": "Oi! " + secretish + " " + raw_phone,
+                    "rationale": "sem URL " + raw_url,
+                },
+                {
+                    "candidate_id": "LEAD-GROUP",
+                    "target": {"type": "group", "group_id": "grp_hops"},
+                    "confidence": 0.91,
+                    "message": "Mensagem segura mas grupo não entra no v1.",
                 },
             ],
-            limit=5,
+            mode="create",
+            max_items=5,
             min_confidence=0.6,
             create_approvals=True,
         ))
@@ -1487,7 +1549,9 @@ def test_wpp_proactive_draft_queue_creates_local_draft_and_approval_only(tmp_pat
         reset_hermes_home_override(home_override)
 
     assert result["ok"] is True
+    assert result["mode"] == "create"
     assert result["send_performed"] is False
+    assert result["approval_resolved"] is False
     assert result["crm_write_performed"] is False
     assert result["provider_history_used"] is False
     assert result["telegram_notification_sent"] is False
@@ -1498,11 +1562,16 @@ def test_wpp_proactive_draft_queue_creates_local_draft_and_approval_only(tmp_pat
     assert after["outbox"] == before["outbox"]
     assert after["inbound_events"] == before["inbound_events"]
     created = result["items"][0]
-    skipped = result["items"][1]
+    unsafe = result["items"][1]
+    group = result["items"][2]
     assert created["status"] == "pending_approval"
     assert created["draft_id"].startswith("draft_")
     assert created["approval_id"].startswith("approval_")
-    assert skipped["status"] == "manual_required"
+    assert created["message_hash"].startswith("sha256:")
+    assert unsafe["status"] == "manual_required"
+    assert "unsafe_content" in unsafe["missing_context"]
+    assert group["status"] == "manual_required"
+    assert "contact_only_v1" in group["missing_context"]
     serialized = json.dumps(result, ensure_ascii=False)
     assert raw_url.split("://", 1)[1] not in serialized
     assert secretish not in serialized
