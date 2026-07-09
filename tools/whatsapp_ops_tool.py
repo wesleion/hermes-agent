@@ -1111,6 +1111,302 @@ def wpp_conversation_summary(
     return _json(summary)
 
 
+def _commercial_safety_flags(*, draft_created: bool = False, approval_created: bool = False) -> dict[str, Any]:
+    return {
+        "read_only": not draft_created and not approval_created,
+        "send_performed": False,
+        "crm_write_performed": False,
+        "provider_history_used": False,
+        "llm_used": False,
+        "summary_persisted": False,
+        "draft_created": bool(draft_created),
+        "approval_created": bool(approval_created),
+        "sends_messages": False,
+        "writes_crm": False,
+        "fetches_provider_history": False,
+        "exposes_raw_refs": False,
+    }
+
+
+def _safe_int_value(value: Any, default: int, minimum: int, maximum: int) -> int:
+    try:
+        parsed = int(value)
+    except (TypeError, ValueError):
+        parsed = default
+    return max(minimum, min(parsed, maximum))
+
+
+def _safe_float_value(value: Any, default: float, minimum: float, maximum: float) -> float:
+    try:
+        parsed = float(value)
+    except (TypeError, ValueError):
+        parsed = default
+    return max(minimum, min(parsed, maximum))
+
+
+def _safe_commercial_text(value: Any, limit: int = 180) -> str:
+    text = str(value or "")
+    if not text:
+        return ""
+    protected: dict[str, str] = {}
+
+    def protect(match: re.Match[str]) -> str:
+        key = f"__DATE_{len(protected)}__"
+        protected[key] = match.group(0)
+        return key
+
+    text = re.sub(r"\b\d{4}-\d{2}-\d{2}(?:[T ][0-2]\d:[0-5]\d(?::[0-5]\d)?(?:Z|[+-]\d{2}:?\d{2})?)?\b", protect, text)
+    url_pattern = r"(?i)http" + r"s?://\S+"
+    text = re.sub(url_pattern, "", text)
+    text = re.sub(r"\b[^\s@]+@[^\s@]+\.[^\s@]+\b", "", text)
+    text = re.sub(r"\b\S+@(?:g\.us|lid|s\.whatsapp\.net|c\.us|whatsapp\.net)\b", "", text, flags=re.IGNORECASE)
+    text = re.sub(r"(?i)\b(?:api[_-]?key|secret|token|authorization|bearer)\s*[=:]\s*[^\s,;]+", "", text)
+    text = re.sub(r"(?<![\w-])\+?\d[\d\s().-]{7,}\d(?![\w-])", "", text)
+    for key, value_text in protected.items():
+        text = text.replace(key, value_text)
+    text = re.sub(r"\s+", " ", text).strip(" -–—;,.\n\t")
+    return text[:limit]
+
+
+def _safe_lead_id(value: Any) -> str:
+    raw = str(value or "").strip()
+    safe = re.sub(r"[^A-Za-z0-9_.:-]+", "", raw)[:80]
+    if not safe:
+        return "lead_" + hash_text(raw or "unknown")[:10]
+    if "@" in raw or re.search(r"\d{10,}", raw):
+        return "lead_" + hash_text(raw)[:10]
+    return safe
+
+
+def _safe_target_for_draft(value: Any) -> dict[str, Any] | None:
+    if not isinstance(value, dict):
+        return None
+    kind = str(value.get("type") or "contact").strip().lower()
+    if kind in {"contato", "person", "lead"}:
+        kind = "contact"
+    if kind in {"grupo", "list"}:
+        kind = "group"
+    if kind not in {"contact", "group"}:
+        return None
+    key = "group_id" if kind == "group" else "contact_id"
+    raw_id = str(value.get(key) or value.get("id") or value.get("contact_id") or value.get("group_id") or "").strip()
+    if not raw_id:
+        return None
+    url_prefix = r"(?i)http" + r"s?://"
+    if re.search(url_prefix + r"|@(?:g\.us|lid|s\.whatsapp\.net|c\.us|whatsapp\.net)", raw_id) or re.search(r"\d{10,}", raw_id):
+        return None
+    safe_id = re.sub(r"[^A-Za-z0-9_.:-]+", "", raw_id)[:80]
+    if not safe_id:
+        return None
+    return {"type": kind, key: safe_id}
+
+
+def _lead_target(value: dict[str, Any]) -> dict[str, Any] | None:
+    target = _safe_target_for_draft(value.get("target"))
+    if target:
+        return target
+    targets = value.get("targets")
+    if isinstance(targets, list) and targets:
+        return _safe_target_for_draft(targets[0])
+    return None
+
+
+def _score_lead(lead: dict[str, Any], min_confidence: float) -> dict[str, Any]:
+    lead_id = _safe_lead_id(lead.get("lead_id") or lead.get("id") or lead.get("name") or lead.get("empresa"))
+    name = _safe_commercial_text(lead.get("name") or lead.get("empresa") or lead.get("lead_name") or lead_id, 80)
+    status = _safe_commercial_text(lead.get("status_pipeline") or lead.get("status") or lead.get("stage"), 80)
+    context = _safe_commercial_text(lead.get("context") or lead.get("notes") or lead.get("last_interaction"), 180)
+    open_tasks = _safe_int_value(lead.get("open_tasks") or lead.get("tarefas_abertas") or 0, 0, 0, 20)
+    stale_days = _safe_int_value(lead.get("last_interaction_days") or lead.get("stale_days") or 0, 0, 0, 365)
+    target = _lead_target(lead)
+
+    confidence = 0.2
+    signals: list[str] = []
+    status_norm = status.casefold()
+    context_norm = context.casefold()
+    if any(term in status_norm for term in ("proposta", "negocia", "orçamento", "orcamento", "interess", "qualificado")):
+        confidence += 0.25
+        signals.append(f"pipeline: {status}" if status else "pipeline quente")
+    if stale_days >= 14:
+        confidence += 0.18
+        signals.append(f"{stale_days}d sem avanço")
+    elif stale_days >= 7:
+        confidence += 0.1
+        signals.append(f"{stale_days}d sem avanço")
+    if open_tasks:
+        confidence += min(0.16, 0.06 + 0.03 * open_tasks)
+        signals.append(f"{open_tasks} pendência(s) abertas")
+    if any(term in context_norm for term in ("preço", "preco", "proposta", "call", "marcar", "retomar", "orçamento", "orcamento")):
+        confidence += 0.1
+        signals.append("contexto indica próximo passo comercial")
+    if target:
+        confidence += 0.1
+    confidence = round(min(confidence, 0.95), 2)
+
+    missing_context: list[str] = []
+    if not target:
+        missing_context.append("target_channel")
+    if not context:
+        missing_context.append("recent_context")
+    recommended_action = "draft_followup" if confidence >= min_confidence and target else "manual_required"
+    if recommended_action == "manual_required" and confidence >= min_confidence:
+        signals.append("confiança suficiente, mas alvo/canal precisa validação manual")
+    priority = "high" if confidence >= 0.75 else "medium" if confidence >= min_confidence else "low"
+    reason = _safe_commercial_text("; ".join(signals) or "contexto insuficiente para ação automática", 220)
+    return {
+        "lead_id": lead_id,
+        "lead_name": name,
+        "priority": priority,
+        "confidence": confidence,
+        "reason": reason,
+        "missing_context": missing_context,
+        "recommended_action": recommended_action,
+        "risk_flags": [] if recommended_action != "manual_required" else ["manual_review_required"],
+        "requires_gate": ["human_approval", "allowlist", "send_flags"] if recommended_action == "draft_followup" else ["operator_review"],
+        "target": target or {"target_resolved": False},
+        "source": "provided_leads_plus_local_context",
+    }
+
+
+def wpp_opportunity_scores(
+    leads: list[dict[str, Any]] | None = None,
+    limit: int = 10,
+    min_confidence: float = 0.55,
+    target_query: str = "",
+    window_days: int = 30,
+) -> str:
+    """Rank commercial opportunities without sending, writing CRM, or fetching provider history."""
+    init_db()
+    cap = _safe_int_value(limit, 10, 1, 25)
+    threshold = _safe_float_value(min_confidence, 0.55, 0.0, 0.95)
+    input_leads = leads if isinstance(leads, list) else []
+    scored = [_score_lead(lead, threshold) for lead in input_leads if isinstance(lead, dict)]
+    scored.sort(key=lambda item: (float(item.get("confidence") or 0), item.get("priority") == "high"), reverse=True)
+    response = {
+        "ok": True,
+        "mode": "opportunity_scores",
+        "source": "provided_leads_local_deterministic",
+        "target_query_set": bool(str(target_query or "").strip()),
+        "window_days": _safe_int_value(window_days, 30, 0, 365),
+        "min_confidence": threshold,
+        "count": min(len(scored), cap),
+        "opportunities": scored[:cap],
+        **_commercial_safety_flags(draft_created=False, approval_created=False),
+    }
+    return _json(response)
+
+
+def _draft_message_for_opportunity(item: dict[str, Any], objective: str = "") -> str:
+    explicit = _safe_commercial_text(item.get("draft_message"), 500)
+    if explicit:
+        return explicit
+    lead_name = _safe_commercial_text(item.get("lead_name") or item.get("name") or item.get("lead_id"), 80) or "esse projeto"
+    goal = _safe_commercial_text(objective or item.get("objective") or "avançar no próximo passo", 120)
+    return (
+        f"Oi! Retomando nossa conversa sobre {lead_name}. "
+        f"Faz sentido alinharmos {goal} em uma conversa rápida?"
+    )[:600]
+
+
+def wpp_proactive_draft_queue(
+    opportunities: list[dict[str, Any]] | None = None,
+    limit: int = 5,
+    min_confidence: float = 0.6,
+    create_approvals: bool = True,
+    objective: str = "",
+) -> str:
+    """Create local proactive commercial drafts + local approval rows only.
+
+    This never sends WhatsApp, never writes CRM, never calls Telegram, and never
+    fetches provider history. Human approval + allowlist + send flags remain the
+    only send path after a created draft.
+    """
+    init_db()
+    cap = _safe_int_value(limit, 5, 1, 10)
+    threshold = _safe_float_value(min_confidence, 0.6, 0.0, 0.95)
+    items: list[dict[str, Any]] = []
+    drafts_created = 0
+    approvals_created = 0
+    for raw in (opportunities if isinstance(opportunities, list) else [])[:cap]:
+        if not isinstance(raw, dict):
+            continue
+        lead_id = _safe_lead_id(raw.get("lead_id") or raw.get("id") or raw.get("lead_name"))
+        confidence = _safe_float_value(raw.get("confidence"), 0.0, 0.0, 1.0)
+        target = _lead_target(raw)
+        action = str(raw.get("recommended_action") or "").strip().lower()
+        base_item = {
+            "lead_id": lead_id,
+            "confidence": round(confidence, 2),
+            "priority": _safe_commercial_text(raw.get("priority"), 20) or "low",
+            "reason": _safe_commercial_text(raw.get("reason"), 220),
+            "send_performed": False,
+            "crm_write_performed": False,
+            "provider_history_used": False,
+        }
+        if confidence < threshold or not target or action in {"manual_required", "ask_operator", "wait"}:
+            missing = []
+            if confidence < threshold:
+                missing.append("confidence_below_threshold")
+            if not target:
+                missing.append("target_channel")
+            items.append({
+                **base_item,
+                "status": "manual_required",
+                "missing_context": missing or ["operator_review"],
+                "draft_created": False,
+                "approval_created": False,
+            })
+            continue
+        message = _draft_message_for_opportunity(raw, objective=objective)
+        try:
+            draft = create_draft(targets=[target], message=message, created_by="hunter_proactive_draft_queue")
+            drafts_created += 1
+            approval: dict[str, Any] = {}
+            status = "draft"
+            if create_approvals:
+                approval = create_approval(draft["draft_id"])
+                approvals_created += 1
+                status = "pending_approval"
+            items.append({
+                **base_item,
+                "status": status,
+                "target": target,
+                "draft_id": draft["draft_id"],
+                "approval_id": approval.get("approval_id", ""),
+                "approval_status": approval.get("status", "not_created"),
+                "approval_card": {
+                    "mode": "local_only",
+                    "operator_action": "review_approve_edit_or_deny",
+                    "requires_gate": ["human_approval", "allowlist", "send_flags"],
+                    "telegram_notification_sent": False,
+                },
+                "message_preview": _safe_commercial_text(message, 160),
+                "draft_created": True,
+                "approval_created": bool(approval),
+            })
+        except Exception as exc:
+            items.append({
+                **base_item,
+                "status": "manual_required",
+                "error": _safe_commercial_text(str(exc), 120) or "draft_creation_failed",
+                "draft_created": False,
+                "approval_created": False,
+            })
+    response = {
+        "ok": True,
+        "mode": "proactive_draft_queue",
+        "count": len(items),
+        "drafts_created": drafts_created,
+        "approvals_created": approvals_created,
+        "telegram_notification_sent": False,
+        "min_confidence": threshold,
+        "items": items,
+        **_commercial_safety_flags(draft_created=bool(drafts_created), approval_created=bool(approvals_created)),
+    }
+    response["read_only"] = False if drafts_created or approvals_created else True
+    return _json(response)
+
+
 def wpp_provider_history_pull(
     thread: str = "",
     contact: str = "",
@@ -1842,6 +2138,58 @@ registry.register(
         include_evidence=bool(args.get("include_evidence", False)),
         window_days=args.get("window_days", 0),
         chunk_size=args.get("chunk_size", 25),
+    ),
+    check_fn=check_whatsapp_ops_requirements,
+    emoji="📲",
+)
+
+registry.register(
+    name="wpp_opportunity_scores",
+    toolset=TOOLSET,
+    schema=_schema(
+        "wpp_opportunity_scores",
+        "Rank Hunter commercial opportunities using provided CRM/local context. Deterministic and read-only: never sends WhatsApp, never writes CRM, never creates drafts/approvals, never calls an LLM, and never fetches provider history.",
+        {
+            "leads": {"type": "array", "items": {"type": "object"}},
+            "limit": {"type": "integer"},
+            "min_confidence": {"type": "number"},
+            "target_query": {"type": "string"},
+            "window_days": {"type": "integer"},
+        },
+        [],
+    ),
+    handler=lambda args, **kw: wpp_opportunity_scores(
+        leads=args.get("leads", []),
+        limit=args.get("limit", 10),
+        min_confidence=args.get("min_confidence", 0.55),
+        target_query=args.get("target_query", ""),
+        window_days=args.get("window_days", 30),
+    ),
+    check_fn=check_whatsapp_ops_requirements,
+    emoji="📲",
+)
+
+registry.register(
+    name="wpp_proactive_draft_queue",
+    toolset=TOOLSET,
+    schema=_schema(
+        "wpp_proactive_draft_queue",
+        "Create bounded local proactive commercial drafts plus local approval rows from scored opportunities. Never sends WhatsApp, never writes CRM, never calls Telegram by itself, never fetches provider history, and low-confidence/ambiguous targets become manual_required.",
+        {
+            "opportunities": {"type": "array", "items": {"type": "object"}},
+            "limit": {"type": "integer"},
+            "min_confidence": {"type": "number"},
+            "create_approvals": {"type": "boolean"},
+            "objective": {"type": "string"},
+        },
+        [],
+    ),
+    handler=lambda args, **kw: wpp_proactive_draft_queue(
+        opportunities=args.get("opportunities", []),
+        limit=args.get("limit", 5),
+        min_confidence=args.get("min_confidence", 0.6),
+        create_approvals=bool(args.get("create_approvals", True)),
+        objective=args.get("objective", ""),
     ),
     check_fn=check_whatsapp_ops_requirements,
     emoji="📲",
