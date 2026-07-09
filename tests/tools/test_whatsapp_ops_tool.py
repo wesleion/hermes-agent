@@ -1383,6 +1383,79 @@ def test_wpp_ingest_system_events_do_not_create_registration_staging(tmp_path):
     assert "+5511999990000" not in serialized
 
 
+def test_wpp_provider_history_pull_tool_disabled_is_read_only(tmp_path):
+    import sqlite3
+    from tools.whatsapp_ops_store import get_db_path, init_db
+    from tools.whatsapp_ops_tool import wpp_provider_history_pull
+
+    home_override = set_hermes_home_override(tmp_path)
+    try:
+        init_db()
+        db = get_db_path()
+        tables = ["inbound_events", "drafts", "approvals", "outbox", "contacts", "lists", "registration_staging"]
+        with sqlite3.connect(db) as conn:
+            before = {table: conn.execute(f"SELECT count(*) FROM {table}").fetchone()[0] for table in tables}
+        result = _parse(
+            wpp_provider_history_pull(
+                thread="provider_history_thread_synthetic",
+                config={"provider_history": {"enabled": False}, "quepasa": {"send_url": "https://quepasa.wesleion.com"}},
+            )
+        )
+        with sqlite3.connect(db) as conn:
+            after = {table: conn.execute(f"SELECT count(*) FROM {table}").fetchone()[0] for table in tables}
+    finally:
+        reset_hermes_home_override(home_override)
+
+    serialized = json.dumps(result, ensure_ascii=False)
+    assert result["ok"] is False
+    assert result["error"] == "provider_history_disabled"
+    assert result["read_only"] is True
+    assert result["provider_history_used"] is False
+    assert result["send_performed"] is False
+    assert result["summary_persisted"] is False
+    assert before == after
+    assert "provider_history_thread_synthetic" not in serialized
+    assert "@g.us" not in serialized
+
+
+def test_wpp_provider_history_pull_registered_schema_and_delegates_safely():
+    from tools.registry import registry
+    from tools.whatsapp_ops_tool import wpp_provider_history_pull
+
+    entry = registry._tools.get("wpp_provider_history_pull")
+    assert entry is not None
+    props = entry.schema["parameters"]["properties"]
+    assert {"thread", "contact", "limit", "pages", "window_days", "mode"}.issubset(props)
+    assert "read-only" in entry.schema["description"].lower()
+    assert "never sends" in entry.schema["description"].lower()
+
+    client = Mock(return_value={
+        "ok": False,
+        "error": "provider_history_unsupported",
+        "read_only": True,
+        "provider_history_used": False,
+        "send_performed": False,
+        "summary_persisted": False,
+        "target": {"thread_filter_set": True, "contact_filter_set": False},
+        "request_limits": {"limit": 100, "pages": 2},
+        "capabilities": {"history_list_supported": False},
+    })
+    result = _parse(
+        wpp_provider_history_pull(
+            thread="provider_history_thread_synthetic",
+            limit=5000,
+            pages=99,
+            config={"provider_history": {"enabled": True, "max_messages": 100, "max_pages": 2}},
+            history_client=client,
+        )
+    )
+
+    client.assert_called_once()
+    assert result["error"] == "provider_history_unsupported"
+    assert result["request_limits"] == {"limit": 100, "pages": 2}
+    assert "provider_history_thread_synthetic" not in json.dumps(result, ensure_ascii=False)
+
+
 def test_wpp_registration_staging_ignores_self_contact_from_group(tmp_path):
     from tools.whatsapp_ops_store import init_db
     from tools.whatsapp_ops_tool import wpp_actionable_queue, wpp_ingest_inbound_event, wpp_register_staging_status
