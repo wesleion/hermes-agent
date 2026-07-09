@@ -3023,7 +3023,7 @@ def get_media_transcription_status(event_id: str = "", limit: int = 20) -> dict[
     }
 
 
-_SUMMARY_MODES = {"stats", "brief", "timeline", "evidence"}
+_SUMMARY_MODES = {"stats", "brief", "timeline", "evidence", "chunks"}
 _SUMMARY_SECRET_ASSIGNMENT_RE = re.compile(
     r"(?i)\b(token|api[_-]?key|authorization|password|secret|access[_-]?token)\s*[:=]\s*[^\s,;]+"
 )
@@ -3066,6 +3066,63 @@ def _summary_window(events_asc: list[dict[str, Any]]) -> dict[str, Any]:
         "first_created_at": events_asc[0].get("created_at") or None,
         "last_created_at": events_asc[-1].get("created_at") or None,
     }
+
+
+def _filter_summary_events_by_window(
+    events_desc: list[dict[str, Any]],
+    *,
+    window_days: int,
+) -> tuple[list[dict[str, Any]], dict[str, Any]]:
+    """Filter local events by a recent-day window without provider access."""
+    info: dict[str, Any] = {
+        "requested_days": int(window_days or 0),
+        "applied": bool(window_days and int(window_days) > 0),
+        "cutoff_at": None,
+        "excluded_by_window": 0,
+    }
+    if not info["applied"]:
+        return events_desc, info
+    cutoff = datetime.now(timezone.utc) - timedelta(days=int(window_days))
+    info["cutoff_at"] = cutoff.isoformat()
+    filtered: list[dict[str, Any]] = []
+    excluded = 0
+    for event in events_desc:
+        created = _parse_iso_datetime(event.get("created_at") if isinstance(event, dict) else "")
+        if created is not None and created < cutoff:
+            excluded += 1
+            continue
+        filtered.append(event)
+    info["excluded_by_window"] = excluded
+    return filtered, info
+
+
+def _summary_chunks(events_asc: list[dict[str, Any]], chunk_size: int) -> list[dict[str, Any]]:
+    chunks: list[dict[str, Any]] = []
+    if chunk_size <= 0:
+        return chunks
+    for start in range(0, len(events_asc), chunk_size):
+        chunk_events = events_asc[start : start + chunk_size]
+        if not chunk_events:
+            continue
+        type_counts, media_counts, status_counts = _summary_counts(chunk_events)
+        highlights = [
+            str(event.get("text_preview") or "")
+            for event in chunk_events
+            if str(event.get("text_preview") or "").strip()
+        ][:2]
+        chunks.append(
+            {
+                "chunk_id": f"chunk_{len(chunks) + 1:02d}",
+                "index": len(chunks) + 1,
+                "event_count": len(chunk_events),
+                "window": _summary_window(chunk_events),
+                "type_counts": type_counts,
+                "media_counts": media_counts,
+                "status_counts": status_counts,
+                "highlights": highlights,
+            }
+        )
+    return chunks
 
 
 def _safe_media_for_summary(media: dict[str, Any]) -> dict[str, Any]:
@@ -3204,6 +3261,8 @@ def get_conversation_summary(
     mode: str = "brief",
     max_text_chars: int = 160,
     include_evidence: bool = False,
+    window_days: int = 0,
+    chunk_size: int = 25,
 ) -> dict[str, Any]:
     """Return a deterministic, read-only summary from the local inbound store.
 
@@ -3224,6 +3283,12 @@ def get_conversation_summary(
     max_text_value, max_text_clamped = _clamp_int(max_text_chars, 160, 0, 500)
     if max_text_clamped:
         warnings.append("max_text_chars_clamped")
+    window_days_value, window_days_clamped = _clamp_int(window_days, 0, 0, 365)
+    if window_days_clamped:
+        warnings.append("window_days_clamped")
+    chunk_size_value, chunk_size_clamped = _clamp_int(chunk_size, 25, 1, 50)
+    if chunk_size_clamped:
+        warnings.append("chunk_size_clamped")
 
     thread_value = str(thread or "").strip()
     contact_value = str(contact or "").strip()
@@ -3233,7 +3298,7 @@ def get_conversation_summary(
         warnings.append("unscoped_local_scan")
 
     raw_events_desc_all = lookup_inbound_events(thread=thread_value, contact=contact_value, limit=limit_value)
-    raw_events_desc = []
+    raw_events_desc_unwindowed = []
     hidden_system_events = 0
     for event in raw_events_desc_all:
         payload_obj = event.get("payload") if isinstance(event, dict) else {}
@@ -3241,9 +3306,15 @@ def get_conversation_summary(
         if _payload_message_type(payload) == "system":
             hidden_system_events += 1
             continue
-        raw_events_desc.append(event)
+        raw_events_desc_unwindowed.append(event)
+    raw_events_desc, history_window = _filter_summary_events_by_window(
+        raw_events_desc_unwindowed,
+        window_days=window_days_value,
+    )
     if hidden_system_events:
         warnings.append("system_events_hidden")
+    if history_window.get("excluded_by_window"):
+        warnings.append("history_window_applied")
     events_desc = [_summary_event(event, max_text_value) for event in raw_events_desc]
     events_asc = list(reversed(events_desc))
     if not events_desc:
@@ -3268,11 +3339,14 @@ def get_conversation_summary(
         "contact_filter_set": contact_filter_set,
         "limit": limit_value,
         "max_text_chars": max_text_value,
+        "window_days": window_days_value,
+        "chunk_size": chunk_size_value,
         "message_count": len(events_desc),
         "type_counts": type_counts,
         "media_counts": media_counts,
         "status_counts": status_counts,
         "window": _summary_window(events_asc),
+        "history_window": history_window,
         "warnings": warnings,
         "hidden_system_events": hidden_system_events,
     }
@@ -3299,6 +3373,12 @@ def get_conversation_summary(
         result["suggested_actions"] = actions
     elif mode_norm == "timeline":
         result["timeline"] = events_asc
+    elif mode_norm == "chunks":
+        chunks = _summary_chunks(events_asc, chunk_size_value)
+        result["chunk_count"] = len(chunks)
+        result["chunks"] = chunks
+        result["headline"] = _conversation_headline(len(events_desc), type_counts, media_counts)
+        result["bullets"] = _conversation_bullets(len(events_desc), events_desc, type_counts, status_counts)
     elif mode_norm == "evidence":
         result["timeline"] = events_asc
         result["evidence"] = [
