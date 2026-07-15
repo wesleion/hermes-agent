@@ -1462,6 +1462,44 @@ def test_wpp_opportunity_scores_rank_read_only_sanitized_and_auditable(tmp_path)
     assert "@g.us" not in serialized
 
 
+def test_wpp_opportunity_scores_does_not_boost_stale_lead_awaiting_reply():
+    from tools.whatsapp_ops_tool import wpp_opportunity_scores
+
+    result = _parse(
+        wpp_opportunity_scores(
+            leads=[
+                {
+                    "lead_id": "awaiting_reply",
+                    "name": "Lead aguardando resposta",
+                    "status": "observed_local",
+                    "context": "conversa bidirecional agregada",
+                    "last_interaction_days": 30,
+                    "last_direction": "outgoing",
+                    "target": {"type": "contact", "contact_id": "lead_waiting"},
+                },
+                {
+                    "lead_id": "incoming_reply",
+                    "name": "Lead com resposta recebida",
+                    "status": "observed_local",
+                    "context": "conversa bidirecional agregada",
+                    "last_interaction_days": 7,
+                    "last_direction": "incoming",
+                    "target": {"type": "contact", "contact_id": "lead_incoming"},
+                },
+            ],
+            limit=2,
+            min_confidence=0.1,
+        )
+    )
+
+    assert result["opportunities"][0]["lead_id"] == "incoming_reply"
+    waiting = next(item for item in result["opportunities"] if item["lead_id"] == "awaiting_reply")
+    assert waiting["score_breakdown"]["recency"] == 0.0
+    assert waiting["manual_required"] is True
+    assert "awaiting_reply" in waiting["manual_reasons"]
+    assert "aguardando resposta do lead" in waiting["signals"]
+
+
 def test_wpp_proactive_draft_queue_preview_default_is_read_only(tmp_path):
     import sqlite3
     from tools.whatsapp_ops_store import get_db_path, init_db
