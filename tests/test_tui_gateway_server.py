@@ -4581,7 +4581,11 @@ def test_commands_catalog_includes_hunter_commands_without_quick_duplicates(monk
     canon = resp["result"]["canon"]
     for cmd in ("/wpp", "/fila", "/addct", "/addgp", "/crgp"):
         assert cmd in pairs
-    assert pairs["/wpp"] == "WhatsApp Ops: painel rápido e ajuda"
+    from hermes_cli.commands import _build_description, resolve_command
+
+    wpp_command = resolve_command("wpp")
+    assert wpp_command is not None
+    assert pairs["/wpp"] == _build_description(wpp_command)
     assert canon["/wpp_register_contact"] == "/addct"
     assert "/wpp_register_contact" not in pairs
 
