@@ -1,6 +1,8 @@
 import json
 from unittest.mock import Mock
 
+import pytest
+
 from hermes_constants import set_hermes_home_override, reset_hermes_home_override
 
 
@@ -929,12 +931,16 @@ def test_wpp_request_approval_sends_telegram_inline_card_without_plaintext_token
     assert "telegram-secret-token" not in serialized
 
 
-def test_wpp_resolve_approval_public_tool_requires_trusted_context(tmp_path, monkeypatch):
+@pytest.mark.parametrize("trusted_context", [None, "telegram_callback"])
+def test_wpp_resolve_approval_public_tool_always_rejects(tmp_path, monkeypatch, trusted_context):
     from tools.whatsapp_ops_store import create_draft, init_db
     from tools.whatsapp_ops_tool import wpp_request_approval, wpp_resolve_approval
 
     monkeypatch.delenv("TELEGRAM_BOT_TOKEN", raising=False)
-    monkeypatch.delenv("WHATSAPP_OPS_TRUSTED_APPROVAL_CONTEXT", raising=False)
+    if trusted_context is None:
+        monkeypatch.delenv("WHATSAPP_OPS_TRUSTED_APPROVAL_CONTEXT", raising=False)
+    else:
+        monkeypatch.setenv("WHATSAPP_OPS_TRUSTED_APPROVAL_CONTEXT", trusted_context)
     token = set_hermes_home_override(tmp_path)
     try:
         init_db()
@@ -954,12 +960,12 @@ def test_wpp_resolve_approval_public_tool_requires_trusted_context(tmp_path, mon
         reset_hermes_home_override(token)
 
     assert resolved["ok"] is False
-    assert resolved["error"] == "trusted_approval_context_required"
+    assert resolved["error"] == "human_callback_required"
 
 
 def test_wpp_resolve_approval_approve_then_send_separately(tmp_path, monkeypatch):
     from tools.whatsapp_ops_store import create_approval, create_draft, init_db, resolve_approval
-    from tools.whatsapp_ops_tool import wpp_request_approval, wpp_resolve_approval, wpp_send_approved, wpp_status
+    from tools.whatsapp_ops_tool import wpp_request_approval, wpp_send_approved, wpp_status
 
     _allow_raw_contact(monkeypatch)
     send_client = Mock(return_value={"ok": True, "transport": "mock"})
@@ -972,7 +978,6 @@ def test_wpp_resolve_approval_approve_then_send_separately(tmp_path, monkeypatch
     }
 
     monkeypatch.delenv("TELEGRAM_BOT_TOKEN", raising=False)
-    monkeypatch.setenv("WHATSAPP_OPS_TRUSTED_APPROVAL_CONTEXT", "telegram_callback")
     token = set_hermes_home_override(tmp_path)
     try:
         init_db()
@@ -988,12 +993,10 @@ def test_wpp_resolve_approval_approve_then_send_separately(tmp_path, monkeypatch
                 send_client=send_client,
             )
         )
-        resolved = _parse(
-            wpp_resolve_approval(
-                approval_id=approval["approval_id"],
-                decision="approved",
-                approver_ref="telegram:12345",
-            )
+        resolved = resolve_approval(
+            approval["approval_id"],
+            decision="approved",
+            approver_ref="telegram:12345",
         )
         sent = _parse(
             wpp_send_approved(
@@ -1015,7 +1018,7 @@ def test_wpp_resolve_approval_approve_then_send_separately(tmp_path, monkeypatch
 
 def test_wpp_resolve_approval_deny_blocks_send(tmp_path, monkeypatch):
     from tools.whatsapp_ops_store import create_approval, create_draft, init_db, resolve_approval
-    from tools.whatsapp_ops_tool import wpp_request_approval, wpp_resolve_approval, wpp_send_approved, wpp_status
+    from tools.whatsapp_ops_tool import wpp_request_approval, wpp_send_approved, wpp_status
 
     send_client = Mock(return_value={"ok": True, "transport": "mock"})
     config = {
@@ -1027,7 +1030,6 @@ def test_wpp_resolve_approval_deny_blocks_send(tmp_path, monkeypatch):
     }
 
     monkeypatch.delenv("TELEGRAM_BOT_TOKEN", raising=False)
-    monkeypatch.setenv("WHATSAPP_OPS_TRUSTED_APPROVAL_CONTEXT", "telegram_callback")
     token = set_hermes_home_override(tmp_path)
     try:
         init_db()
@@ -1036,12 +1038,10 @@ def test_wpp_resolve_approval_deny_blocks_send(tmp_path, monkeypatch):
             message="Negado bloqueia",
         )
         approval = _parse(wpp_request_approval(draft["draft_id"]))
-        denied = _parse(
-            wpp_resolve_approval(
-                approval_id=approval["approval_id"],
-                decision="denied",
-                approver_ref="telegram:12345",
-            )
+        denied = resolve_approval(
+            approval["approval_id"],
+            decision="denied",
+            approver_ref="telegram:12345",
         )
         result = _parse(
             wpp_send_approved(
@@ -2019,8 +2019,8 @@ def test_wpp_sync_allowlist_tool_loads_infisical_env_safely(tmp_path, monkeypatc
 
 
 def test_wpp_create_draft_resolves_alias_and_send_guardrail_uses_synced_allowlist(tmp_path, monkeypatch):
-    from tools.whatsapp_ops_store import init_db, sync_allowlist_from_env
-    from tools.whatsapp_ops_tool import wpp_create_draft, wpp_request_approval, wpp_resolve_approval, wpp_send_approved
+    from tools.whatsapp_ops_store import init_db, resolve_approval, sync_allowlist_from_env
+    from tools.whatsapp_ops_tool import wpp_create_draft, wpp_request_approval, wpp_send_approved
 
     token = set_hermes_home_override(tmp_path)
     try:
@@ -2044,9 +2044,11 @@ def test_wpp_create_draft_resolves_alias_and_send_guardrail_uses_synced_allowlis
             message="Mensagem com alias resolvido",
         ))
         approval = _parse(wpp_request_approval(draft["draft_id"]))
-        monkeypatch.setenv("WHATSAPP_OPS_TRUSTED_APPROVAL_CONTEXT", "telegram_callback")
-        resolved = _parse(wpp_resolve_approval(approval["approval_id"], "approved", approver_ref="telegram:test"))
-        monkeypatch.delenv("WHATSAPP_OPS_TRUSTED_APPROVAL_CONTEXT", raising=False)
+        resolved = resolve_approval(
+            approval["approval_id"],
+            "approved",
+            approver_ref="telegram:test",
+        )
         send = _parse(wpp_send_approved(
             draft["draft_id"],
             config={

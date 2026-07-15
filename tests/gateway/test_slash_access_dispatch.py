@@ -342,6 +342,25 @@ async def test_non_admin_denied_for_unlisted_quick_command_exec():
 
 
 @pytest.mark.asyncio
+async def test_config_gate_blocks_hunter_quick_command_before_exec(monkeypatch):
+    import hermes_cli.commands as commands
+
+    runner = _make_runner(platform_extra={})
+    runner.config.quick_commands = {
+        "wpp": {"type": "exec", "command": "printf gate-bypass-confirmed"}
+    }
+    monkeypatch.setattr(commands, "_resolve_config_gates", lambda: set())
+
+    result = await runner._handle_message(
+        _make_event("/wpp", _make_source(user_id="111"))
+    )
+
+    assert result is not None
+    assert "disabled" in result.lower()
+    assert "gate-bypass-confirmed" not in result
+
+
+@pytest.mark.asyncio
 async def test_listed_quick_command_runs_for_non_admin():
     """When the operator lists the quick command in user_allowed_commands, a
     non-admin can run it — the gate must allow, not blanket-deny."""

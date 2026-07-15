@@ -56,7 +56,6 @@ from tools.whatsapp_ops_store import (
     register_group_local,
     request_media_transcription,
     reserve_outbox_send,
-    resolve_approval,
     resolve_conversation_target,
     _payload_from_self,
     resolve_contact,
@@ -920,17 +919,18 @@ def wpp_request_approval(draft_id: str) -> str:
 
 
 def wpp_resolve_approval(approval_id: str, decision: str, approver_ref: str = "") -> str:
-    if os.environ.get("WHATSAPP_OPS_TRUSTED_APPROVAL_CONTEXT") != "telegram_callback":
-        return _json({
-            "ok": False,
-            "approval_id": approval_id,
-            "error": "trusted_approval_context_required",
-        })
-    try:
-        resolved = resolve_approval(approval_id, decision=decision, approver_ref=approver_ref)
-    except Exception as exc:
-        return _json({"ok": False, "approval_id": approval_id, "error": str(exc)[:200]})
-    return _json(resolved)
+    """Fail closed: model-callable tools cannot resolve human approvals.
+
+    Authenticated Telegram callbacks call ``whatsapp_ops_store.resolve_approval``
+    directly after platform authorization; no process-global environment flag
+    is accepted as proof of a specific callback.
+    """
+    return _json({
+        "ok": False,
+        "approval_id": approval_id,
+        "error": "human_callback_required",
+        "message": "A aprovação deve ser resolvida por callback humano autenticado.",
+    })
 
 
 def wpp_schedule_draft(draft_id: str, send_at: str) -> str:

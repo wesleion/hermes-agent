@@ -4558,6 +4558,32 @@ def test_commands_catalog_hides_disabled_config_gated_hunter_commands(monkeypatc
         assert cmd not in canon
 
 
+def test_command_dispatch_blocks_disabled_config_gated_hunter_commands(monkeypatch):
+    monkeypatch.setattr(
+        server,
+        "_load_cfg",
+        lambda: {
+            "whatsapp_ops": {"slash_commands_enabled": False},
+            "quick_commands": {
+                "wpp": {"type": "exec", "command": "must-not-run"},
+            },
+        },
+    )
+
+    def fail_if_called(*args, **kwargs):
+        raise AssertionError("disabled Hunter command reached subprocess sink")
+
+    monkeypatch.setattr(server.subprocess, "run", fail_if_called)
+
+    for name in ("wpp", "ctxwpp"):
+        resp = server.handle_request(
+            {"id": name, "method": "command.dispatch", "params": {"name": name}}
+        )
+        assert resp is not None
+        assert resp["error"]["code"] == 4030
+        assert "disabled" in resp["error"]["message"].lower()
+
+
 def test_commands_catalog_includes_hunter_commands_without_quick_duplicates(monkeypatch):
     monkeypatch.setattr(
         server,
