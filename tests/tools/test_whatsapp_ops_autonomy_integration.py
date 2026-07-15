@@ -201,6 +201,48 @@ def test_autonomous_local_approval_requires_its_own_action_allowlist(tmp_path):
     assert drafts == 0
 
 
+def test_safe_auto_config_cannot_be_bypassed_with_operator_context(tmp_path):
+    from tools.whatsapp_ops_store import get_db_path, init_db
+    from tools.whatsapp_ops_tool import wpp_opportunity_scores, wpp_proactive_draft_queue
+
+    token = set_hermes_home_override(tmp_path)
+    try:
+        init_db()
+        db = get_db_path()
+        scored = _parse(
+            wpp_opportunity_scores(
+                leads=_candidates(count=5),
+                limit=50,
+                execution_context="operator",
+                config=_autonomy_config(max_items=2),
+            )
+        )
+        blocked = _parse(
+            wpp_proactive_draft_queue(
+                candidates=_candidates(count=3),
+                mode="create",
+                create_approvals=False,
+                execution_context="operator",
+                config=_autonomy_config(actions=["opportunity.score", "draft.preview"]),
+            )
+        )
+        with sqlite3.connect(db) as conn:
+            drafts = conn.execute("SELECT count(*) FROM drafts").fetchone()[0]
+    finally:
+        reset_hermes_home_override(token)
+
+    assert scored["ok"] is True
+    assert scored["execution_context"] == "operator"
+    assert scored["autonomy"]["mode"] == "safe_auto"
+    assert scored["limit"] == 2
+    assert scored["count"] == 2
+    assert blocked["ok"] is False
+    assert blocked["error"] == "autonomy_denied"
+    assert "action_not_allowlisted" in blocked["autonomy"]["reasons"]
+    assert blocked["drafts_created"] == 0
+    assert drafts == 0
+
+
 def test_tool_schemas_expose_only_bounded_execution_context():
     from tools.registry import registry
     import tools.whatsapp_ops_tool  # noqa: F401
