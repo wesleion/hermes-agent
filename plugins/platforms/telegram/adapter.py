@@ -5886,7 +5886,16 @@ class TelegramAdapter(BasePlatformAdapter):
                 return
 
             if not resolved.get("ok"):
-                await query.answer(text=str(resolved.get("error") or "Approval not resolved")[:80])
+                error = str(resolved.get("error") or "Approval not resolved")
+                await query.answer(text=error[:80])
+                if error in {"approval_not_pending", "approval_not_found"}:
+                    try:
+                        await query.edit_message_reply_markup(reply_markup=None)
+                    except Exception:
+                        logger.warning(
+                            "Failed to remove stale WhatsApp approval controls",
+                            exc_info=True,
+                        )
                 return
 
             label = "✅ WhatsApp draft approved" if decision == "approved" else "❌ WhatsApp draft denied"
