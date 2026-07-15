@@ -454,23 +454,17 @@ def should_bypass_active_session(command_name: str | None) -> bool:
     return resolve_command(command_name) is not None if command_name else False
 
 
-def _resolve_config_gates() -> set[str]:
-    """Return canonical names of commands whose ``gateway_config_gate`` is truthy.
+def _resolve_config_gates_from_config(cfg: dict[str, Any] | None) -> set[str]:
+    """Resolve config-gated command names from an already loaded config.
 
-    Reads ``config.yaml`` and walks the dot-separated key path for each
-    config-gated command.  Returns an empty set on any error so callers
-    degrade gracefully.
+    Keeping this traversal pure lets gateway/TUI surfaces share the registry
+    semantics without re-reading global config, and makes injected configs
+    deterministic in tests.
     """
-    gated = [c for c in COMMAND_REGISTRY if c.gateway_config_gate]
-    if not gated:
-        return set()
-    try:
-        from hermes_cli.config import read_raw_config
-        cfg = read_raw_config()
-    except Exception:
-        return set()
     result: set[str] = set()
-    for cmd in gated:
+    for cmd in COMMAND_REGISTRY:
+        if not cmd.gateway_config_gate:
+            continue
         val: Any = cfg
         for key in cmd.gateway_config_gate.split("."):
             if isinstance(val, dict):
@@ -481,6 +475,22 @@ def _resolve_config_gates() -> set[str]:
         if is_truthy_value(val, default=False):
             result.add(cmd.name)
     return result
+
+
+def _resolve_config_gates() -> set[str]:
+    """Return canonical names of commands whose config gate is truthy.
+
+    Reads ``config.yaml`` once and delegates traversal to the pure resolver.
+    Returns an empty set on read errors so callers degrade gracefully.
+    """
+    if not any(c.gateway_config_gate for c in COMMAND_REGISTRY):
+        return set()
+    try:
+        from hermes_cli.config import read_raw_config
+        cfg = read_raw_config()
+    except Exception:
+        return set()
+    return _resolve_config_gates_from_config(cfg)
 
 
 def _is_gateway_available(cmd: CommandDef, config_overrides: set[str] | None = None) -> bool:
