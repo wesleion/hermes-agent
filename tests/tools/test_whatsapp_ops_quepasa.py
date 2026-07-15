@@ -72,6 +72,64 @@ def test_quepasa_client_fails_closed_without_api_key(monkeypatch):
     urlopen.assert_not_called()
 
 
+def test_quepasa_presence_fails_closed_when_send_disabled():
+    from tools.whatsapp_ops_quepasa import send_presence_via_quepasa
+
+    with patch("urllib.request.urlopen") as urlopen:
+        result = send_presence_via_quepasa(
+            payload={"targets": [{"type": "contact", "contact_id": "5511999990000@s.whatsapp.net"}]},
+            config={"quepasa": {"send_enabled": False}},
+        )
+
+    assert result == {"ok": False, "error": "quepasa_send_disabled"}
+    urlopen.assert_not_called()
+
+
+def test_quepasa_presence_posts_exact_endpoint_and_sanitizes_result(monkeypatch):
+    from tools.whatsapp_ops_quepasa import send_presence_via_quepasa
+
+    monkeypatch.setenv("WHATSAPP_OPS_QUEPASA_API_KEY", "secret-token")
+    captured = {}
+
+    def fake_urlopen(req, timeout):
+        captured["req"] = req
+        captured["timeout"] = timeout
+        return _FakeResponse(
+            '{"success":true,"status":"presence-set","message":{"chatId":"5511999990000@s.whatsapp.net","secret":"provider-secret"}}'
+        )
+
+    payload = {
+        "targets": [{"type": "contact", "contact_id": "5511999990000@s.whatsapp.net"}],
+        "presence_type": "text",
+        "duration_ms": 1200,
+    }
+    with patch("urllib.request.urlopen", fake_urlopen):
+        result = send_presence_via_quepasa(
+            payload=payload,
+            config={"quepasa": {"send_enabled": True, "send_url": "https://quepasa.example.invalid/send"}},
+        )
+
+    serialized = json.dumps(result, ensure_ascii=False)
+    assert result == {
+        "ok": True,
+        "transport": "quepasa_direct_presence",
+        "status": 200,
+        "provider_status": "presence-set",
+    }
+    assert captured["timeout"] == 15
+    assert captured["req"].get_method() == "POST"
+    assert captured["req"].full_url == "https://quepasa.example.invalid/chat/presence"
+    assert captured["req"].get_header("X-quepasa-token") == "secret-token"
+    assert _request_body(captured["req"]) == {
+        "chatid": "5511999990000@s.whatsapp.net",
+        "type": "text",
+        "duration": 1200,
+    }
+    assert "5511999990000" not in serialized
+    assert "provider-secret" not in serialized
+    assert "secret-token" not in serialized
+
+
 def test_provider_history_pull_fails_closed_when_disabled(monkeypatch):
     from tools.whatsapp_ops_quepasa import pull_history_via_quepasa
 
