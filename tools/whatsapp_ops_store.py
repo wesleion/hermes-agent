@@ -223,6 +223,16 @@ def init_db() -> Path:
                 created_at TEXT NOT NULL,
                 updated_at TEXT NOT NULL
             );
+            CREATE TABLE IF NOT EXISTS crm_append_log (
+                id TEXT PRIMARY KEY,
+                idempotency_key TEXT NOT NULL UNIQUE,
+                event_id TEXT NOT NULL,
+                status TEXT NOT NULL CHECK(status IN ('reserved', 'appended', 'failed_unknown')),
+                last_reason TEXT,
+                created_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL,
+                appended_at TEXT
+            );
             CREATE TABLE IF NOT EXISTS inbound_events (
                 id TEXT PRIMARY KEY,
                 source_event_id_hash TEXT NOT NULL UNIQUE,
@@ -2226,6 +2236,119 @@ def reserve_outbox_send(draft_id: str, idempotency_key: str) -> bool:
             return True
         except sqlite3.IntegrityError:
             return False
+
+
+def reserve_crm_append(idempotency_key: str, event_id: str) -> dict[str, Any]:
+    """Atomically reserve one append-only CRM event.
+
+    Existing reservations are never overwritten. Callers must treat both
+    ``reserved`` and ``failed_unknown`` duplicates as uncertain external state
+    and must not retry the Google append blindly.
+    """
+    init_db()
+    now = utc_now()
+    with _connect() as conn:
+        try:
+            conn.execute(
+                """
+                INSERT INTO crm_append_log (
+                    id, idempotency_key, event_id, status, last_reason,
+                    created_at, updated_at, appended_at
+                ) VALUES (?, ?, ?, 'reserved', NULL, ?, ?, NULL)
+                """,
+                (
+                    "crm_append_" + uuid.uuid4().hex[:12],
+                    str(idempotency_key),
+                    str(event_id),
+                    now,
+                    now,
+                ),
+            )
+            return {"reserved": True, "status": "reserved"}
+        except sqlite3.IntegrityError:
+            row = conn.execute(
+                "SELECT status FROM crm_append_log WHERE idempotency_key=?",
+                (str(idempotency_key),),
+            ).fetchone()
+            return {
+                "reserved": False,
+                "status": str(row["status"] if row is not None else "failed_unknown"),
+            }
+
+
+def mark_crm_append_result(idempotency_key: str, *, status: str, reason: str) -> None:
+    """Finalize a CRM reservation without storing provider payloads or PII."""
+    if status not in {"appended", "failed_unknown"}:
+        raise ValueError("crm_append_status_invalid")
+    init_db()
+    now = utc_now()
+    safe_reason = re.sub(r"[^a-z0-9_.-]+", "_", str(reason or "unknown").lower())[:80]
+    with _connect() as conn:
+        conn.execute(
+            """
+            UPDATE crm_append_log
+            SET status=?, last_reason=?, updated_at=?, appended_at=?
+            WHERE idempotency_key=? AND status='reserved'
+            """,
+            (
+                status,
+                safe_reason,
+                now,
+                now if status == "appended" else None,
+                str(idempotency_key),
+            ),
+        )
+
+
+def record_crm_audit(
+    event_type: str,
+    *,
+    event_id: str,
+    reason: str,
+    status: str,
+    error_class: str = "",
+) -> None:
+    """Record a narrow, sanitized CRM audit event.
+
+    The signature intentionally accepts no arbitrary payload, spreadsheet
+    coordinates, target, message, or credential fields.
+    """
+    allowed_events = {
+        "crm_append_succeeded",
+        "crm_append_failed",
+        "crm_append_blocked",
+    }
+    if event_type not in allowed_events:
+        raise ValueError("crm_audit_event_invalid")
+
+    def safe_token(value: Any, *, fallback: str) -> str:
+        token = re.sub(r"[^A-Za-z0-9_.:-]+", "_", str(value or ""))[:128]
+        return token or fallback
+
+    safe_event_id = safe_token(event_id, fallback="crm_event_unknown")
+    safe_reason = safe_token(reason, fallback="unknown")
+    safe_status = safe_token(status, fallback="unknown")
+    metadata = {"reason": safe_reason, "status": safe_status}
+    if error_class:
+        metadata["error_class"] = safe_token(error_class, fallback="Error")
+    now = utc_now()
+    with _connect() as conn:
+        conn.execute(
+            """
+            INSERT INTO audit_log (
+                id, event_type, entity_type, entity_id, actor_ref_hash,
+                safe_summary, metadata_redacted_json, created_at
+            ) VALUES (?, ?, 'crm_append', ?, NULL, ?, ?, ?)
+            """,
+            (
+                "audit_" + uuid.uuid4().hex[:12],
+                event_type,
+                safe_event_id,
+                f"{event_type}:{safe_reason}",
+                json.dumps(metadata, sort_keys=True),
+                now,
+            ),
+        )
 
 
 def _sanitize_payload(value: Any) -> Any:

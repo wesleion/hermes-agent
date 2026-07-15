@@ -16,6 +16,8 @@ import urllib.request
 from typing import Any, Callable
 
 from tools.registry import registry
+from tools.whatsapp_ops_autonomy import autonomy_status, evaluate_autonomy
+from tools.whatsapp_ops_crm import append_approved_send_event, default_crm_config
 from tools.whatsapp_ops_policy import evaluate_send_guardrails
 from tools.whatsapp_ops_quepasa import pull_history_via_quepasa
 
@@ -78,6 +80,21 @@ def _default_config() -> dict[str, Any]:
         "approval": {"required": True, "timeout_minutes": 60, "telegram": {}},
         "allowlists": {"contacts": [], "groups": []},
         "quepasa": {"backend": "n8n_or_http", "send_enabled": False},
+        "autonomy": {
+            "mode": "assist",
+            "allowed_areas": ["commercial_discovery", "commercial_drafts", "local_context"],
+            "allowed_actions": [
+                "conversation.read_local",
+                "queue.inspect",
+                "opportunity.score",
+                "draft.preview",
+                "draft.create_local",
+                "approval.request_local",
+            ],
+            "max_items_per_run": 2,
+            "min_confidence": 0.75,
+        },
+        "crm": default_crm_config(),
         "provider_history": {"enabled": False, "backend": "quepasa_direct", "max_messages": 250, "max_pages": 3},
         "inbound_coalesce": {"enabled": False, "window_seconds": 60, "quorum": 2},
         "humanized_send": {
@@ -838,6 +855,7 @@ def wpp_send_approved(
     send_client: Callable[[dict[str, Any], dict[str, Any]], dict[str, Any]] | None = None,
     sleep_fn: Callable[[float], None] | None = None,
     presence_client: Callable[[dict[str, Any], dict[str, Any]], dict[str, Any]] | None = None,
+    crm_client: Callable[[dict[str, Any], dict[str, Any]], dict[str, Any]] | None = None,
 ) -> str:
     """Send an explicitly human-approved draft only if guardrails allow it."""
     init_db()
@@ -896,14 +914,51 @@ def wpp_send_approved(
         if is_group_create
         else _send_humanized_or_single(client, payload, cfg, sleep_fn=sleep_fn, presence_client=presence)
     )
+    send_ok = bool(send_result.get("ok"))
+    crm_enabled = isinstance(cfg.get("crm"), dict) and cfg["crm"].get("enabled") is True
     if idempotency_key:
-        if bool(send_result.get("ok")):
+        if send_ok:
             mark_outbox_result(draft_id, idempotency_key, "sent")
             update_draft_status(draft_id, "sent")
         else:
             mark_outbox_result(draft_id, idempotency_key, "failed", str(send_result.get("error", "send_failed")))
             update_draft_status(draft_id, "failed")
-    return _json({"ok": bool(send_result.get("ok")), "draft_id": draft_id, "send_result": send_result})
+    if send_ok:
+        try:
+            crm_result = append_approved_send_event(
+                draft=draft or {},
+                approval=approval or {},
+                send_result=send_result,
+                config=cfg,
+                client=crm_client,
+            )
+        except Exception as exc:  # CRM can never roll back a confirmed send
+            error_class = re.sub(r"[^A-Za-z0-9_]+", "", type(exc).__name__)[:80] or "Error"
+            crm_result = {
+                "enabled": crm_enabled,
+                "attempted": True,
+                "result": "failed_unknown",
+                "reason": "crm_internal_exception",
+                "write_performed": False,
+                "error_class": error_class,
+            }
+    else:
+        crm_result = {
+            "enabled": crm_enabled,
+            "attempted": False,
+            "result": "not_attempted",
+            "reason": "send_not_completed",
+            "write_performed": False,
+        }
+    crm_written = crm_result.get("result") == "appended" and crm_result.get("write_performed") is True
+    return _json({
+        "ok": send_ok,
+        "draft_id": draft_id,
+        "send_result": send_result,
+        "crm": crm_result,
+        "crm_write_performed": crm_written,
+        "crm_written": crm_written,
+    })
 
 
 def wpp_request_approval(draft_id: str) -> str:
@@ -969,6 +1024,12 @@ def wpp_status(draft_id: str) -> str:
     if media_summary:
         response["media"] = media_summary
     return _json(response)
+
+
+def wpp_autonomy_status(config: dict[str, Any] | None = None) -> str:
+    """Return the effective sanitized autonomy policy; read-only and side-effect free."""
+    cfg = _runtime_config() if config is None else _deep_merge(_default_config(), config)
+    return _json(autonomy_status(cfg))
 
 
 def wpp_resolve_contact(nome_ou_numero: str) -> str:
@@ -1324,11 +1385,44 @@ def wpp_opportunity_scores(
     contact: str = "",
     window_days: int = 30,
     include_evidence: bool = False,
+    execution_context: str = "operator",
+    config: dict[str, Any] | None = None,
 ) -> str:
     """Rank commercial opportunities without sending, writing CRM, or fetching provider history."""
-    init_db()
+    context = str(execution_context or "operator").strip().lower()
+    if context not in {"operator", "autonomous"}:
+        return _json({
+            "ok": False,
+            "error": "execution_context_invalid",
+            "execution_context": context,
+            "count": 0,
+            "opportunities": [],
+            **_commercial_safety_flags(draft_created=False, approval_created=False),
+        })
     cap = _safe_int_value(limit, 10, 1, 50)
     threshold = _safe_float_value(confidence_threshold if confidence_threshold is not None else min_confidence, 0.55, 0.0, 1.0)
+    autonomy_decision = None
+    if context == "autonomous":
+        cfg = _runtime_config() if config is None else _deep_merge(_default_config(), config)
+        autonomy_decision = evaluate_autonomy(
+            cfg,
+            action="opportunity.score",
+            area="commercial_discovery",
+            requested_items=cap,
+        )
+        if not autonomy_decision.allowed:
+            return _json({
+                "ok": False,
+                "error": "autonomy_denied",
+                "execution_context": context,
+                "autonomy": autonomy_decision.as_dict(),
+                "limit": 0,
+                "count": 0,
+                "opportunities": [],
+                **_commercial_safety_flags(draft_created=False, approval_created=False),
+            })
+        cap = min(cap, autonomy_decision.effective_items)
+        threshold = max(threshold, autonomy_decision.min_confidence)
     input_leads = lead_inputs if isinstance(lead_inputs, list) else leads if isinstance(leads, list) else []
     scored = [_score_lead(lead, threshold, include_evidence=include_evidence) for lead in input_leads if isinstance(lead, dict)]
     scored.sort(key=lambda item: (float(item.get("confidence") or 0), item.get("priority") == "high"), reverse=True)
@@ -1338,6 +1432,7 @@ def wpp_opportunity_scores(
     response = {
         "ok": True,
         "mode": "opportunity_scores",
+        "execution_context": context,
         "source": "provided_leads_local_deterministic",
         "generated_by": "deterministic_local_v1",
         "target_query_set": bool(str(target_query or "").strip()),
@@ -1359,6 +1454,8 @@ def wpp_opportunity_scores(
         "warnings": [],
         **_commercial_safety_flags(draft_created=False, approval_created=False),
     }
+    if autonomy_decision is not None:
+        response["autonomy"] = autonomy_decision.as_dict()
     return _json(response)
 
 
@@ -1387,6 +1484,8 @@ def wpp_proactive_draft_queue(
     create_approvals: bool = True,
     objective: str = "",
     mode: str = "preview",
+    execution_context: str = "operator",
+    config: dict[str, Any] | None = None,
 ) -> str:
     """Preview or create local proactive commercial drafts + approval rows.
 
@@ -1395,11 +1494,53 @@ def wpp_proactive_draft_queue(
     calls Telegram by itself, and never fetches provider history. Human approval
     + allowlist + send flags remain the only send path after a created draft.
     """
-    init_db()
+    context = str(execution_context or "operator").strip().lower()
+    if context not in {"operator", "autonomous"}:
+        return _json({
+            "ok": False,
+            "error": "execution_context_invalid",
+            "execution_context": context,
+            "drafts_created": 0,
+            "approvals_created": 0,
+            "items": [],
+            **_commercial_safety_flags(draft_created=False, approval_created=False),
+        })
     cap = _safe_int_value(max_items if max_items is not None else limit, 5, 1, 5)
     threshold = _safe_float_value(min_confidence, 0.6, 0.0, 1.0)
     normalized_mode = str(mode or "preview").strip().lower()
     create_mode = normalized_mode == "create"
+    autonomy_decision = None
+    if context == "autonomous":
+        cfg = _runtime_config() if config is None else _deep_merge(_default_config(), config)
+        action = "draft.create_local" if create_mode else "draft.preview"
+        autonomy_decision = evaluate_autonomy(
+            cfg,
+            action=action,
+            area="commercial_drafts",
+            requested_items=cap,
+        )
+        if autonomy_decision.allowed and create_mode and create_approvals:
+            approval_decision = evaluate_autonomy(
+                cfg,
+                action="approval.request_local",
+                area="commercial_drafts",
+                requested_items=cap,
+            )
+            if not approval_decision.allowed:
+                autonomy_decision = approval_decision
+        if not autonomy_decision.allowed:
+            return _json({
+                "ok": False,
+                "error": "autonomy_denied",
+                "execution_context": context,
+                "autonomy": autonomy_decision.as_dict(),
+                "drafts_created": 0,
+                "approvals_created": 0,
+                "items": [],
+                **_commercial_safety_flags(draft_created=False, approval_created=False),
+            })
+        cap = min(cap, autonomy_decision.effective_items)
+        threshold = max(threshold, autonomy_decision.min_confidence)
     source_items = candidates if isinstance(candidates, list) else opportunities if isinstance(opportunities, list) else []
     items: list[dict[str, Any]] = []
     drafts_created = 0
@@ -1518,6 +1659,7 @@ def wpp_proactive_draft_queue(
         "ok": True,
         "tool": "wpp_proactive_draft_queue",
         "mode": "create" if create_mode else "preview",
+        "execution_context": context,
         "count": len(items),
         "requested_count": len(source_items),
         "created_count": drafts_created,
@@ -1532,6 +1674,8 @@ def wpp_proactive_draft_queue(
         "warnings": [],
         **_commercial_safety_flags(draft_created=bool(drafts_created), approval_created=bool(approvals_created)),
     }
+    if autonomy_decision is not None:
+        response["autonomy"] = autonomy_decision.as_dict()
     response["read_only"] = False if drafts_created or approvals_created else True
     return _json(response)
 
@@ -2273,6 +2417,20 @@ registry.register(
 )
 
 registry.register(
+    name="wpp_autonomy_status",
+    toolset=TOOLSET,
+    schema=_schema(
+        "wpp_autonomy_status",
+        "Read-only sanitized status of the effective WhatsApp Ops autonomy policy. Never sends, resolves approvals, writes CRM/local state, changes runtime, or activates schedules.",
+        {},
+        [],
+    ),
+    handler=lambda args, **kw: wpp_autonomy_status(),
+    check_fn=check_whatsapp_ops_requirements,
+    emoji="📲",
+)
+
+registry.register(
     name="wpp_opportunity_scores",
     toolset=TOOLSET,
     schema=_schema(
@@ -2290,6 +2448,7 @@ registry.register(
             "target_query": {"type": "string"},
             "window_days": {"type": "integer"},
             "include_evidence": {"type": "boolean"},
+            "execution_context": {"type": "string", "enum": ["operator", "autonomous"]},
         },
         [],
     ),
@@ -2305,6 +2464,7 @@ registry.register(
         contact=args.get("contact", ""),
         window_days=args.get("window_days", 30),
         include_evidence=bool(args.get("include_evidence", False)),
+        execution_context=args.get("execution_context", "operator"),
     ),
     check_fn=check_whatsapp_ops_requirements,
     emoji="📲",
@@ -2325,6 +2485,7 @@ registry.register(
             "min_confidence": {"type": "number"},
             "create_approvals": {"type": "boolean"},
             "objective": {"type": "string"},
+            "execution_context": {"type": "string", "enum": ["operator", "autonomous"]},
         },
         [],
     ),
@@ -2337,6 +2498,7 @@ registry.register(
         min_confidence=args.get("min_confidence", 0.6),
         create_approvals=bool(args.get("create_approvals", True)),
         objective=args.get("objective", ""),
+        execution_context=args.get("execution_context", "operator"),
     ),
     check_fn=check_whatsapp_ops_requirements,
     emoji="📲",
