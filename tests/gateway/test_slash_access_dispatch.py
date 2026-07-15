@@ -361,6 +361,60 @@ async def test_config_gate_blocks_hunter_quick_command_before_exec(monkeypatch):
 
 
 @pytest.mark.asyncio
+async def test_config_gate_rechecked_after_hook_rewrites_to_hunter_command(monkeypatch):
+    import hermes_cli.commands as commands
+
+    runner = _make_runner(platform_extra={})
+    runner.hooks.emit_collect = AsyncMock(
+        return_value=[
+            {
+                "decision": "rewrite",
+                "command_name": "crgp",
+                "raw_args": "Piloto Seguro",
+            }
+        ]
+    )
+    runner._handle_wpp_create_group_command = AsyncMock(return_value="SINK_REACHED")
+    monkeypatch.setattr(commands, "_resolve_config_gates", lambda: set())
+
+    result = await runner._handle_message(
+        _make_event("/help", _make_source(user_id="111"))
+    )
+
+    assert result is not None
+    assert "disabled" in result.lower()
+    runner._handle_wpp_create_group_command.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_slash_access_rechecked_after_hook_rewrite():
+    runner = _make_runner(
+        platform_extra={
+            "allow_admin_from": ["111"],
+            "user_allowed_commands": [],
+        }
+    )
+    runner.hooks.emit_collect = AsyncMock(
+        return_value=[
+            {
+                "decision": "rewrite",
+                "command_name": "restart",
+                "raw_args": "",
+            }
+        ]
+    )
+    runner._handle_restart_command = AsyncMock(return_value="SINK_REACHED")
+
+    result = await runner._handle_message(
+        _make_event("/help", _make_source(user_id="999"))
+    )
+
+    assert result is not None
+    assert "admin-only" in result
+    runner._handle_restart_command.assert_not_awaited()
+
+
+@pytest.mark.asyncio
 async def test_listed_quick_command_runs_for_non_admin():
     """When the operator lists the quick command in user_allowed_commands, a
     non-admin can run it — the gate must allow, not blanket-deny."""
