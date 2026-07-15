@@ -5737,7 +5737,18 @@ class TelegramAdapter(BasePlatformAdapter):
                     reply_markup=None,
                 )
             except Exception:
-                pass
+                logger.warning(
+                    "WhatsApp approval completed but status-card edit failed; "
+                    "attempting to remove stale controls",
+                    exc_info=True,
+                )
+                try:
+                    await query.edit_message_reply_markup(reply_markup=None)
+                except Exception:
+                    logger.warning(
+                        "Failed to remove stale WhatsApp approval controls",
+                        exc_info=True,
+                    )
             return
 
         # --- Exec approval callbacks (ea:choice:id) ---

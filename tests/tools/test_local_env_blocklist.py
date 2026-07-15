@@ -323,6 +323,33 @@ class TestBlocklistCoverage:
         }
         assert must_block.issubset(_HERMES_PROVIDER_ENV_BLOCKLIST)
 
+    def test_hunter_managed_secrets_are_in_blocklist(self):
+        must_block = {
+            "WHATSAPP_OPS_QUEPASA_API_KEY",
+            "WHATSAPP_OPS_WEBHOOK_SECRET",
+            "WHATSAPP_OPS_TRUSTED_APPROVAL_CONTEXT",
+            "HUNTER_CRM_GOOGLE_SERVICE_ACCOUNT_JSON",
+        }
+        assert must_block.issubset(_HERMES_PROVIDER_ENV_BLOCKLIST)
+
+    def test_hunter_managed_secrets_are_removed_from_child_env(self, monkeypatch):
+        from tools.environments.local import _sanitize_subprocess_env
+
+        monkeypatch.setattr(
+            "tools.env_passthrough.is_env_passthrough",
+            lambda _name: True,
+        )
+        secrets = {
+            "WHATSAPP_OPS_QUEPASA_API_KEY": "quepasa-secret",
+            "WHATSAPP_OPS_WEBHOOK_SECRET": "webhook-secret",
+            "WHATSAPP_OPS_TRUSTED_APPROVAL_CONTEXT": "telegram_callback",
+            "HUNTER_CRM_GOOGLE_SERVICE_ACCOUNT_JSON": "service-account-json",
+        }
+        sanitized = _sanitize_subprocess_env({**secrets, "SAFE_MARKER": "kept"})
+
+        assert not secrets.keys() & sanitized.keys()
+        assert sanitized["SAFE_MARKER"] == "kept"
+
     def test_registry_vars_are_in_blocklist(self):
         """Every api_key_env_var and base_url_env_var from PROVIDER_REGISTRY
         must appear in the blocklist — ensures no drift.

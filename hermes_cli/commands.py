@@ -493,6 +493,26 @@ def _resolve_config_gates() -> set[str]:
     return _resolve_config_gates_from_config(cfg)
 
 
+def is_config_gated_command_enabled(
+    name: str,
+    cfg: dict[str, Any] | None = None,
+) -> bool:
+    """Return whether *name* may execute under its gateway config gate.
+
+    Unknown and ungated commands remain executable. Config-gated commands
+    fail closed when their key is absent, false, or unreadable.
+    """
+    cmd = resolve_command(name)
+    if cmd is None or not getattr(cmd, "gateway_config_gate", None):
+        return True
+    enabled = (
+        _resolve_config_gates_from_config(cfg)
+        if cfg is not None
+        else _resolve_config_gates()
+    )
+    return cmd.name in enabled
+
+
 def _is_gateway_available(cmd: CommandDef, config_overrides: set[str] | None = None) -> bool:
     """Check if *cmd* should appear in gateway surfaces (help, menus, mappings).
 

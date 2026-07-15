@@ -9732,6 +9732,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
 
         from hermes_cli.commands import (
             GATEWAY_KNOWN_COMMANDS,
+            is_config_gated_command_enabled,
             is_gateway_known_command,
             resolve_command as _resolve_cmd,
         )
@@ -9762,6 +9763,9 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                         command = target_command.split()[0] if target_command else target_command
                         _cmd_def = _resolve_cmd(command) if command else None
                         canonical = _cmd_def.name if _cmd_def else command
+
+        if _cmd_def and not is_config_gated_command_enabled(canonical):
+            return f"⛔ Command /{canonical} is disabled by configuration."
 
         # Per-platform slash command access control. Only kicks in when the
         # operator has set ``allow_admin_from`` for the source's scope (DM

@@ -513,6 +513,38 @@ class TestTelegramApprovalCallback:
         assert "Envio executado via QuePasa/direct" in edit_kwargs["text"]
 
     @pytest.mark.asyncio
+    async def test_whatsapp_ops_callback_clears_keyboard_when_status_edit_fails(self):
+        adapter = _make_adapter()
+
+        query = AsyncMock()
+        query.data = "wpp:a:approval-123"
+        query.message = MagicMock()
+        query.message.chat_id = 12345
+        query.message.chat.type = "private"
+        query.from_user = MagicMock()
+        query.from_user.id = "12345"
+        query.from_user.first_name = "Alice"
+        query.answer = AsyncMock()
+        query.edit_message_text = AsyncMock(side_effect=RuntimeError("edit failed"))
+        query.edit_message_reply_markup = AsyncMock()
+
+        update = MagicMock()
+        update.callback_query = query
+        context = MagicMock()
+        resolved = {"ok": True, "draft_id": "draft-9", "status": "approved"}
+        execution = {"ok": True, "send_result": {"ok": True, "transport": "mock"}}
+
+        with patch.dict(os.environ, {"TELEGRAM_ALLOWED_USERS": "*"}, clear=False):
+            with patch("tools.whatsapp_ops_store.resolve_approval", return_value=resolved):
+                with patch(
+                    "tools.whatsapp_ops_tool.wpp_send_approved",
+                    return_value=json.dumps(execution),
+                ):
+                    await adapter._handle_callback_query(update, context)
+
+        query.edit_message_reply_markup.assert_awaited_once_with(reply_markup=None)
+
+    @pytest.mark.asyncio
     async def test_whatsapp_ops_approval_callback_rejects_unauthorized_user(self):
         adapter = _make_adapter()
         runner = _AuthRunner(authorized=False)
