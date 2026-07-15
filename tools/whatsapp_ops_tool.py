@@ -1027,9 +1027,20 @@ def wpp_status(draft_id: str) -> str:
 
 
 def wpp_autonomy_status(config: dict[str, Any] | None = None) -> str:
-    """Return the effective sanitized autonomy policy; read-only and side-effect free."""
+    """Return the effective sanitized autonomy posture without side effects."""
     cfg = _runtime_config() if config is None else _deep_merge(_default_config(), config)
     return _json(autonomy_status(cfg))
+
+
+def _effective_autonomy_config(config: dict[str, Any] | None) -> dict[str, Any]:
+    return _runtime_config() if config is None else _deep_merge(_default_config(), config)
+
+
+def _autonomy_policy_required(execution_context: str, config: dict[str, Any]) -> bool:
+    raw = config.get("autonomy")
+    autonomy_cfg = raw if isinstance(raw, dict) else {}
+    configured_mode = str(autonomy_cfg.get("mode") or "assist").strip().lower()
+    return execution_context == "autonomous" or configured_mode == "safe_auto"
 
 
 def wpp_resolve_contact(nome_ou_numero: str) -> str:
@@ -1408,10 +1419,10 @@ def wpp_opportunity_scores(
     cap = _safe_int_value(limit, 10, 1, 50)
     threshold = _safe_float_value(confidence_threshold if confidence_threshold is not None else min_confidence, 0.55, 0.0, 1.0)
     autonomy_decision = None
-    if context == "autonomous":
-        cfg = _runtime_config() if config is None else _deep_merge(_default_config(), config)
+    autonomy_cfg = _effective_autonomy_config(config)
+    if _autonomy_policy_required(context, autonomy_cfg):
         autonomy_decision = evaluate_autonomy(
-            cfg,
+            autonomy_cfg,
             action="opportunity.score",
             area="commercial_discovery",
             requested_items=cap,
@@ -1515,19 +1526,20 @@ def wpp_proactive_draft_queue(
     threshold = _safe_float_value(min_confidence, 0.6, 0.0, 1.0)
     normalized_mode = str(mode or "preview").strip().lower()
     create_mode = normalized_mode == "create"
+    source_items = candidates if isinstance(candidates, list) else opportunities if isinstance(opportunities, list) else []
     autonomy_decision = None
-    if context == "autonomous":
-        cfg = _runtime_config() if config is None else _deep_merge(_default_config(), config)
+    autonomy_cfg = _effective_autonomy_config(config)
+    if _autonomy_policy_required(context, autonomy_cfg):
         action = "draft.create_local" if create_mode else "draft.preview"
         autonomy_decision = evaluate_autonomy(
-            cfg,
+            autonomy_cfg,
             action=action,
             area="commercial_drafts",
             requested_items=cap,
         )
         if autonomy_decision.allowed and create_mode and create_approvals:
             approval_decision = evaluate_autonomy(
-                cfg,
+                autonomy_cfg,
                 action="approval.request_local",
                 area="commercial_drafts",
                 requested_items=cap,
@@ -1547,7 +1559,6 @@ def wpp_proactive_draft_queue(
             })
         cap = min(cap, autonomy_decision.effective_items)
         threshold = max(threshold, autonomy_decision.min_confidence)
-    source_items = candidates if isinstance(candidates, list) else opportunities if isinstance(opportunities, list) else []
     items: list[dict[str, Any]] = []
     drafts_created = 0
     approvals_created = 0
