@@ -511,6 +511,7 @@ class TestTelegramApprovalCallback:
         assert "HTML" in repr(edit_kwargs["parse_mode"])
         assert "draft-9" in edit_kwargs["text"]
         assert "Envio executado via QuePasa/direct" in edit_kwargs["text"]
+        assert edit_kwargs["reply_markup"] is None
 
     @pytest.mark.asyncio
     async def test_whatsapp_ops_callback_clears_keyboard_when_status_edit_fails(self):
@@ -543,6 +544,57 @@ class TestTelegramApprovalCallback:
                     await adapter._handle_callback_query(update, context)
 
         query.edit_message_reply_markup.assert_awaited_once_with(reply_markup=None)
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        ("resolution_error", "remove_fails", "clears_keyboard"),
+        [
+            ("approval_not_pending", False, True),
+            ("approval_not_found", False, True),
+            ("approval_not_pending", True, True),
+            ("store_unavailable", False, False),
+        ],
+    )
+    async def test_whatsapp_ops_resolution_error_keyboard_contract(
+        self, resolution_error, remove_fails, clears_keyboard, caplog
+    ):
+        adapter = _make_adapter()
+
+        query = AsyncMock()
+        query.data = "wpp:a:approval-123"
+        query.message = MagicMock()
+        query.message.chat_id = 12345
+        query.message.chat.type = "private"
+        query.from_user = MagicMock()
+        query.from_user.id = "12345"
+        query.from_user.first_name = "Alice"
+        query.answer = AsyncMock()
+        query.edit_message_text = AsyncMock()
+        query.edit_message_reply_markup = AsyncMock(
+            side_effect=RuntimeError("edit failed") if remove_fails else None
+        )
+
+        update = MagicMock()
+        update.callback_query = query
+        context = MagicMock()
+        resolved = {"ok": False, "error": resolution_error}
+
+        with patch.dict(os.environ, {"TELEGRAM_ALLOWED_USERS": "*"}, clear=False):
+            with patch(
+                "tools.whatsapp_ops_store.resolve_approval", return_value=resolved
+            ):
+                with patch("tools.whatsapp_ops_tool.wpp_send_approved") as mock_send:
+                    await adapter._handle_callback_query(update, context)
+
+        query.answer.assert_awaited_once_with(text=resolution_error)
+        if clears_keyboard:
+            query.edit_message_reply_markup.assert_awaited_once_with(reply_markup=None)
+        else:
+            query.edit_message_reply_markup.assert_not_awaited()
+        query.edit_message_text.assert_not_awaited()
+        mock_send.assert_not_called()
+        if remove_fails:
+            assert "Failed to remove stale WhatsApp approval controls" in caplog.text
 
     @pytest.mark.asyncio
     async def test_whatsapp_ops_approval_callback_rejects_unauthorized_user(self):
