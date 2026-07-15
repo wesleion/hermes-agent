@@ -60,6 +60,21 @@ def _normalize_document_send_url(raw_url: str) -> str:
     return _normalize_endpoint_url(raw_url, "/senddocument")
 
 
+def _normalize_presence_url(raw_url: str) -> str:
+    """Resolve `/chat/presence` from either a QuePasa base or send endpoint."""
+    raw_url = str(raw_url or "").strip()
+    parsed = urllib.parse.urlsplit(raw_url)
+    if parsed.scheme not in {"http", "https"} or not parsed.netloc:
+        return ""
+    path = parsed.path.rstrip("/")
+    for suffix in ("/swagger/index.html", "/swagger/doc.json", "/swagger", "/senddocument", "/send"):
+        if path.endswith(suffix):
+            path = path[: -len(suffix)]
+            break
+    normalized_path = f"{path}/chat/presence" if path else "/chat/presence"
+    return urllib.parse.urlunsplit((parsed.scheme, parsed.netloc, normalized_path, "", ""))
+
+
 def _normalize_swagger_doc_url(raw_url: str) -> str:
     raw_url = str(raw_url or "").strip()
     parsed = urllib.parse.urlsplit(raw_url)
@@ -385,6 +400,58 @@ def _post_text(send_url: str, api_key: str, chat_id: str, text: str) -> dict[str
     return _post_message(send_url, api_key, chat_id, text)
 
 
+def _post_presence(
+    presence_url: str,
+    api_key: str,
+    chat_id: str,
+    presence_type: str,
+    duration_ms: int,
+) -> dict[str, Any]:
+    body = json.dumps(
+        {"chatid": chat_id, "type": presence_type, "duration": duration_ms},
+        ensure_ascii=False,
+    ).encode("utf-8")
+    req = urllib.request.Request(
+        presence_url,
+        data=body,
+        headers={"Content-Type": "application/json", "X-QUEPASA-TOKEN": api_key},
+        method="POST",
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=15) as resp:
+            parsed = _parse_json_body(resp.read(4096))
+            status = int(getattr(resp, "status", 200) or 200)
+    except urllib.error.HTTPError as exc:
+        return {
+            "ok": False,
+            "transport": "quepasa_direct_presence",
+            "error": "http_error",
+            "status": int(exc.code),
+        }
+    except Exception:  # pragma: no cover - defensive transport boundary
+        return {
+            "ok": False,
+            "transport": "quepasa_direct_presence",
+            "error": "transport_error",
+        }
+
+    if parsed.get("success") is not True:
+        return {
+            "ok": False,
+            "transport": "quepasa_direct_presence",
+            "error": "quepasa_success_false",
+            "status": status,
+        }
+    raw_status = str(parsed.get("status") or "").strip().lower()
+    safe_status = raw_status if raw_status in {"ok", "sent", "success", "presence-set", "presence_set"} else "ok"
+    return {
+        "ok": True,
+        "transport": "quepasa_direct_presence",
+        "status": status,
+        "provider_status": safe_status,
+    }
+
+
 def _resolve_lid_participant(raw_url: str, api_key: str, participant: str) -> str:
     """Resolve a QuePasa LID JID to the phone string accepted by /groups/create.
 
@@ -473,6 +540,46 @@ def _quepasa_base_url(config: dict[str, Any]) -> str:
 
 def _quepasa_api_key() -> str:
     return os.getenv("WHATSAPP_OPS_QUEPASA_API_KEY", "")
+
+
+def send_presence_via_quepasa(payload: dict[str, Any], config: dict[str, Any]) -> dict[str, Any]:
+    """Best-effort typing/presence call; never exposes target or provider body."""
+    quepasa_raw = (config or {}).get("quepasa")
+    quepasa = quepasa_raw if isinstance(quepasa_raw, dict) else {}
+    if not _truthy(quepasa.get("send_enabled", False)):
+        return {"ok": False, "error": "quepasa_send_disabled"}
+
+    presence_url = _normalize_presence_url(_quepasa_base_url(config))
+    if not presence_url:
+        return {"ok": False, "error": "quepasa_presence_url_missing"}
+    api_key = _quepasa_api_key()
+    if not api_key:
+        return {"ok": False, "error": "quepasa_api_key_missing"}
+
+    targets = (payload or {}).get("targets") or []
+    if not isinstance(targets, list) or not targets:
+        return {"ok": False, "error": "payload_invalid"}
+    presence_type = str((payload or {}).get("presence_type") or "text").strip().lower()
+    if presence_type not in {"text", "audio", "paused"}:
+        return {"ok": False, "error": "presence_type_invalid"}
+    duration_ms = _safe_int((payload or {}).get("duration_ms"), 1000, 100, 60_000)
+
+    results: list[dict[str, Any]] = []
+    for target in targets:
+        chat_id = _target_chat_id(target)
+        if not chat_id:
+            return {"ok": False, "error": "target_invalid"}
+        result = _post_presence(presence_url, api_key, chat_id, presence_type, duration_ms)
+        results.append(result)
+        if not result.get("ok"):
+            return result
+    if len(results) == 1:
+        return results[0]
+    return {
+        "ok": True,
+        "transport": "quepasa_direct_presence",
+        "presence_count": len(results),
+    }
 
 
 def send_via_quepasa(payload: dict[str, Any], config: dict[str, Any]) -> dict[str, Any]:

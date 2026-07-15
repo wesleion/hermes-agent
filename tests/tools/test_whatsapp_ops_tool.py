@@ -2334,6 +2334,44 @@ def test_wpp_resolve_and_list_contacts_use_sanitized_synthetic_seed(tmp_path):
     assert "99990000" not in json.dumps(listed)
 
 
+def test_wpp_send_approved_default_quepasa_client_imports_presence_symbol(tmp_path, monkeypatch):
+    from tools import whatsapp_ops_quepasa as quepasa
+    from tools.whatsapp_ops_store import create_approval, create_draft, init_db, resolve_approval
+    from tools.whatsapp_ops_tool import wpp_send_approved
+
+    _allow_raw_contact(monkeypatch)
+    send_client = Mock(return_value={"ok": True, "transport": "quepasa_direct"})
+    presence_client = Mock(return_value={"ok": True, "transport": "quepasa_direct_presence"})
+    monkeypatch.setattr(quepasa, "send_via_quepasa", send_client)
+    monkeypatch.setattr(quepasa, "send_presence_via_quepasa", presence_client)
+    config = {
+        "send_enabled": True,
+        "kill_switch": False,
+        "approval": {"required": True, "timeout_minutes": 60},
+        "allowlists": {"contacts": ["c_1"], "groups": []},
+        "quepasa": {"send_enabled": True},
+        "humanized_send": {"enabled": False},
+    }
+
+    token = set_hermes_home_override(tmp_path)
+    try:
+        init_db()
+        draft = create_draft(
+            targets=[{"type": "contact", "contact_id": "c_1"}],
+            message="Envio default QuePasa mockado",
+        )
+        approval = create_approval(draft["draft_id"])
+        resolve_approval(approval["approval_id"], "approved", approver_ref="human:test")
+        result = _parse(wpp_send_approved(draft["draft_id"], config=config))
+    finally:
+        reset_hermes_home_override(token)
+
+    assert result["ok"] is True
+    assert result["send_result"]["transport"] == "quepasa_direct"
+    send_client.assert_called_once()
+    presence_client.assert_not_called()
+
+
 def _crm_enabled_send_config():
     return {
         "send_enabled": True,
