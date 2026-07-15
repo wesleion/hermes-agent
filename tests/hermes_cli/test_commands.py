@@ -19,6 +19,7 @@ from hermes_cli.commands import (
     _clamp_command_names,
     _clamp_telegram_names,
     _sanitize_telegram_name,
+    is_config_gated_command_enabled,
     discord_skill_commands,
     gateway_help_lines,
     resolve_command,
@@ -181,6 +182,16 @@ class TestGatewayKnownCommands:
             if cmd.gateway_config_gate:
                 assert cmd.name in GATEWAY_KNOWN_COMMANDS, \
                     f"config-gated command '{cmd.name}' should be in GATEWAY_KNOWN_COMMANDS"
+
+    def test_config_gated_command_execution_follows_truthy_config(self):
+        assert not is_config_gated_command_enabled("wpp", {})
+        assert not is_config_gated_command_enabled(
+            "wpp", {"whatsapp_ops": {"slash_commands_enabled": False}}
+        )
+        assert is_config_gated_command_enabled(
+            "wpp", {"whatsapp_ops": {"slash_commands_enabled": True}}
+        )
+        assert is_config_gated_command_enabled("status", {})
 
     def test_includes_gateway_commands(self):
         for cmd in COMMAND_REGISTRY:

@@ -220,6 +220,15 @@ _AWS_SDK_CREDENTIAL_ENV_VARS = frozenset({
     "AWS_BEARER_TOKEN_BEDROCK",
 })
 
+# Hunter-managed authentication/approval material. These values are stripped
+# unconditionally across spawn surfaces; env_passthrough cannot re-enable them.
+_HUNTER_INTERNAL_SECRET_ENV_VARS = frozenset({
+    "WHATSAPP_OPS_QUEPASA_API_KEY",
+    "WHATSAPP_OPS_WEBHOOK_SECRET",
+    "WHATSAPP_OPS_TRUSTED_APPROVAL_CONTEXT",
+    "HUNTER_CRM_GOOGLE_SERVICE_ACCOUNT_JSON",
+})
+
 
 def _build_provider_env_blocklist() -> frozenset:
     """Derive the blocklist from provider, tool, and gateway config."""
@@ -288,6 +297,9 @@ def _build_provider_env_blocklist() -> frozenset:
         "WHATSAPP_ENABLED",
         "WHATSAPP_MODE",
         "WHATSAPP_ALLOWED_USERS",
+        # Hunter/WhatsApp Ops secrets are Hermes-managed credentials and must
+        # never reach arbitrary quick-command/terminal subprocesses.
+        *_HUNTER_INTERNAL_SECRET_ENV_VARS,
         "SIGNAL_HTTP_URL",
         "SIGNAL_ACCOUNT",
         "SIGNAL_ALLOWED_USERS",
@@ -349,8 +361,13 @@ def _is_hermes_internal_secret(key: str) -> bool:
 
     ``_HERMES_PROVIDER_ENV_BLOCKLIST`` is name-based and derived from the
     provider/tool registries, but the gateway and CLI also inject secrets into
-    ``os.environ`` at runtime under names no static registry knows about:
+    ``os.environ`` at runtime under names no static registry knows about, plus
+    a small exact set of Hunter credentials that must remain non-forwardable:
 
+    - ``WHATSAPP_OPS_QUEPASA_API_KEY``, ``WHATSAPP_OPS_WEBHOOK_SECRET``,
+      ``WHATSAPP_OPS_TRUSTED_APPROVAL_CONTEXT``, and
+      ``HUNTER_CRM_GOOGLE_SERVICE_ACCOUNT_JSON`` — transport, webhook, approval,
+      and CRM credentials/context that arbitrary child processes never need.
     - ``AUXILIARY_<TASK>_API_KEY`` / ``AUXILIARY_<TASK>_BASE_URL`` — per-task
       side-LLM credentials bridged from ``config.yaml[auxiliary]`` by
       ``gateway/run.py`` and ``cli.py`` (vision, web_extract, approval,
@@ -378,6 +395,8 @@ def _is_hermes_internal_secret(key: str) -> bool:
     a model-driving CLI legitimately needs matches these patterns.
     """
     upper = key.upper()
+    if upper in _HUNTER_INTERNAL_SECRET_ENV_VARS:
+        return True
     if upper.startswith("AUXILIARY_") and (
         upper.endswith("_API_KEY") or upper.endswith("_BASE_URL")
     ):

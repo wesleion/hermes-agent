@@ -12366,6 +12366,12 @@ def _(rid, params: dict) -> dict:
     if resolved != name:
         name = resolved
     session = _sessions.get(params.get("session_id", ""))
+    cfg = _load_cfg()
+
+    from hermes_cli.commands import is_config_gated_command_enabled
+
+    if not is_config_gated_command_enabled(name, cfg):
+        return _err(rid, 4030, f"Command /{name} is disabled by configuration")
 
     if name == "ctxwpp":
         from hermes_cli.whatsapp_ops_commands import render_thread_context_command
@@ -12375,7 +12381,7 @@ def _(rid, params: dict) -> dict:
             {"type": "builtin", "output": render_thread_context_command(arg)},
         )
 
-    qcmds = _load_cfg().get("quick_commands", {})
+    qcmds = cfg.get("quick_commands", {})
     if name in qcmds:
         qc = qcmds[name]
         if qc.get("type") == "exec":
