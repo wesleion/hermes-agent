@@ -1308,6 +1308,44 @@ def test_slash_exec_rejects_skill_commands(server):
     assert "skill command" in resp["error"]["message"]
 
 
+@pytest.mark.parametrize("cmd", ["wpp", "wpp_register_contact Alice"])
+def test_slash_exec_blocks_disabled_config_gated_commands_before_worker(
+    server, monkeypatch, cmd
+):
+    class Worker:
+        def __init__(self):
+            self.calls = []
+
+        def run(self, command):
+            self.calls.append(command)
+            return "SINK_REACHED"
+
+    sid = "test-session"
+    worker = Worker()
+    server._sessions[sid] = {
+        "session_key": sid,
+        "agent": None,
+        "slash_worker": worker,
+    }
+    monkeypatch.setattr(
+        server,
+        "_load_cfg",
+        lambda: {"whatsapp_ops": {"slash_commands_enabled": False}},
+    )
+
+    resp = server.handle_request(
+        {
+            "id": "r-gated-slash",
+            "method": "slash.exec",
+            "params": {"command": cmd, "session_id": sid},
+        }
+    )
+
+    assert resp["error"]["code"] == 4030
+    assert "disabled by configuration" in resp["error"]["message"]
+    assert worker.calls == []
+
+
 def test_slash_exec_routes_custom_skill_bundle_away_from_worker(server):
     """slash.exec expands any custom bundle through command.dispatch."""
     sid = "test-session"

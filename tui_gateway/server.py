@@ -13273,6 +13273,19 @@ def _(rid, params: dict) -> dict:
     _cmd_base = (_cmd_parts[0] if _cmd_parts else "").lower()
     _cmd_arg = _cmd_parts[1] if len(_cmd_parts) > 1 else ""
 
+    from hermes_cli.commands import (
+        is_config_gated_command_enabled,
+        resolve_command,
+    )
+
+    _cmd_def = resolve_command(_cmd_base)
+    if _cmd_def and not is_config_gated_command_enabled(_cmd_def.name, _load_cfg()):
+        return _err(
+            rid,
+            4030,
+            f"command /{_cmd_def.name} is disabled by configuration",
+        )
+
     if _cmd_base in _PENDING_INPUT_COMMANDS:
         # Route directly to command.dispatch instead of returning an error
         # that requires the frontend to retry.  Some TUI clients fail the
@@ -13297,11 +13310,10 @@ def _(rid, params: dict) -> dict:
 
     try:
         from agent.skill_bundles import resolve_bundle_command_key
-        from hermes_cli.commands import resolve_command
 
         _bundle_key = (
             resolve_bundle_command_key(_cmd_base)
-            if resolve_command(_cmd_base) is None
+            if _cmd_def is None
             else None
         )
         if _bundle_key is not None:

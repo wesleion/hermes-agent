@@ -9831,6 +9831,12 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     command = event.get_command()
                     _cmd_def = _resolve_cmd(command) if command else None
                     canonical = _cmd_def.name if _cmd_def else command
+                    if _cmd_def and not is_config_gated_command_enabled(canonical):
+                        return f"⛔ Command /{canonical} is disabled by configuration."
+                    if command and canonical and is_gateway_known_command(canonical):
+                        _denied = self._check_slash_access(source, canonical)
+                        if _denied is not None:
+                            return _denied
                     break
 
         if canonical == "new":
