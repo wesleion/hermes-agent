@@ -1300,6 +1300,8 @@ def _score_lead(lead: dict[str, Any], min_confidence: float, rank: int = 0, incl
     context = _safe_commercial_text(lead.get("context") or lead.get("notes") or lead.get("last_interaction"), 180)
     open_tasks = _safe_int_value(lead.get("open_tasks") or lead.get("tarefas_abertas") or 0, 0, 0, 20)
     stale_days = _safe_int_value(lead.get("last_interaction_days") or lead.get("stale_days") or 0, 0, 0, 365)
+    last_direction = str(lead.get("last_direction") or lead.get("direction") or "").strip().casefold()
+    awaiting_reply = last_direction in {"outgoing", "from_me", "fromme", "sent_by_us"}
     target = _lead_target(lead)
 
     breakdown = {
@@ -1317,7 +1319,9 @@ def _score_lead(lead: dict[str, Any], min_confidence: float, rank: int = 0, incl
     if any(term in status_norm for term in ("proposta", "negocia", "orçamento", "orcamento", "interess", "qualificado")):
         breakdown["pipeline"] = 0.25
         signals.append(f"pipeline: {status}" if status else "pipeline quente")
-    if stale_days >= 14:
+    if awaiting_reply:
+        signals.append("aguardando resposta do lead")
+    elif stale_days >= 14:
         breakdown["recency"] = 0.18
         signals.append(f"{stale_days}d sem avanço")
     elif stale_days >= 7:
@@ -1340,6 +1344,8 @@ def _score_lead(lead: dict[str, Any], min_confidence: float, rank: int = 0, incl
         missing_context.append("target_channel")
     if not context:
         missing_context.append("recent_context")
+    if awaiting_reply:
+        missing_context.append("awaiting_reply")
     manual_required = confidence < min_confidence or bool(missing_context)
     recommended_action = "manual_required" if manual_required else "draft_followup"
     if manual_required and confidence >= min_confidence:
