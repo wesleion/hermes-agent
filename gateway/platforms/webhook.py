@@ -167,6 +167,14 @@ class WebhookAdapter(BasePlatformAdapter):
         self._static_routes: Dict[str, dict] = config.extra.get("routes", {})
         self._dynamic_routes: Dict[str, dict] = {}
         self._dynamic_routes_mtime: float = 0.0
+        # Per-HERMES_HOME cache for multiplexed listeners. The legacy fields
+        # above remain the active-home view for compatibility, but request
+        # dispatch uses the route table returned by _reload_dynamic_routes()
+        # so concurrent/alternating profiles never consult another home's
+        # routes or mtime gate.
+        self._dynamic_routes_by_home: Dict[
+            str, tuple[Optional[tuple[int, int]], Dict[str, dict]]
+        ] = {}
         self._routes: Dict[str, dict] = dict(self._static_routes)
         self._runner = None
         # Routes already warned about legacy V1 body-only signatures
@@ -218,42 +226,43 @@ class WebhookAdapter(BasePlatformAdapter):
     # ------------------------------------------------------------------
 
     async def connect(self, *, is_reconnect: bool = False) -> bool:
-        # Load agent-created subscriptions before validating
-        self._reload_dynamic_routes()
+        # The primary shared listener still starts outside GatewayRunner's
+        # per-secondary adapter scope. Enter the default profile scope here so
+        # multiplex fail-closed secret resolution also works during startup.
+        with self._request_profile_scope(None):
+            routes = self._reload_dynamic_routes()
 
-        # Validate routes at startup — secret is required per route
-        for name, route in self._routes.items():
-            secret = self._resolve_route_secret(route)
-            if not secret:
-                raise ValueError(
-                    f"[webhook] Route '{name}' has no HMAC secret. "
-                    f"Set 'secret' on the route or globally. "
-                    f"For testing without auth, set secret to '{_INSECURE_NO_AUTH}'."
-                )
-
-            # Safety rail: refuse to start if INSECURE_NO_AUTH is combined with a
-            # non-loopback bind. The escape hatch is for local testing only;
-            # serving an unauthenticated route on a public interface is a
-            # deployment-grade footgun we'd rather crash early than ship.
-            if secret == _INSECURE_NO_AUTH and not _is_loopback_host(self._host):
-                raise ValueError(
-                    f"[webhook] Route '{name}' uses INSECURE_NO_AUTH secret "
-                    f"but is bound to non-loopback host '{self._host}'. "
-                    f"INSECURE_NO_AUTH is for local testing only. "
-                    f"Refusing to start to prevent accidental exposure."
-                )
-            # deliver_only routes bypass the agent — the POST body becomes a
-            # direct push notification via the configured delivery target.
-            # Validate up-front so misconfiguration surfaces at startup rather
-            # than on the first webhook POST.
-            if route.get("deliver_only"):
-                deliver = route.get("deliver", "log")
-                if not deliver or deliver == "log":
+            # Validate the default profile's startup routes. Secondary profiles'
+            # dynamic routes are loaded and validated lazily under their own
+            # request scope on the shared listener.
+            for name, route in routes.items():
+                secret = self._resolve_route_secret(route)
+                if not secret:
                     raise ValueError(
-                        f"[webhook] Route '{name}' has deliver_only=true but "
-                        f"deliver is '{deliver}'. Direct delivery requires a "
-                        f"real target (telegram, discord, slack, github_comment, etc.)."
+                        f"[webhook] Route '{name}' has no HMAC secret. "
+                        f"Set 'secret' on the route or globally. "
+                        f"For testing without auth, set secret to '{_INSECURE_NO_AUTH}'."
                     )
+
+                # Safety rail: refuse to start if INSECURE_NO_AUTH is combined with a
+                # non-loopback bind. The escape hatch is for local testing only.
+                if secret == _INSECURE_NO_AUTH and not _is_loopback_host(self._host):
+                    raise ValueError(
+                        f"[webhook] Route '{name}' uses INSECURE_NO_AUTH secret "
+                        f"but is bound to non-loopback host '{self._host}'. "
+                        f"INSECURE_NO_AUTH is for local testing only. "
+                        f"Refusing to start to prevent accidental exposure."
+                    )
+                # deliver_only routes bypass the agent — validate the target at
+                # startup so misconfiguration fails before the first POST.
+                if route.get("deliver_only"):
+                    deliver = route.get("deliver", "log")
+                    if not deliver or deliver == "log":
+                        raise ValueError(
+                            f"[webhook] Route '{name}' has deliver_only=true but "
+                            f"deliver is '{deliver}'. Direct delivery requires a "
+                            f"real target (telegram, discord, slack, github_comment, etc.)."
+                        )
 
         # client_max_size makes aiohttp enforce the cap on every read path,
         # including Transfer-Encoding: chunked bodies that carry no
@@ -306,7 +315,7 @@ class WebhookAdapter(BasePlatformAdapter):
             return False
         self._mark_connected()
 
-        route_names = ", ".join(self._routes.keys()) or "(none configured)"
+        route_names = ", ".join(routes.keys()) or "(none configured)"
         logger.info(
             "[webhook] Listening on %s:%d — routes: %s",
             self._host or "* (all interfaces, IPv4+IPv6)",
@@ -459,64 +468,93 @@ class WebhookAdapter(BasePlatformAdapter):
         """GET /health — simple health check."""
         return web.json_response({"status": "ok", "platform": "webhook"})
 
-    def _reload_dynamic_routes(self) -> None:
-        """Reload agent-created subscriptions from disk if the file changed."""
+    def _reload_dynamic_routes(self) -> Dict[str, dict]:
+        """Return routes for the active HERMES_HOME, reloading when changed.
+
+        Each multiplexed profile owns a separate subscriptions file. Cache by
+        resolved home path — never by one adapter-global mtime — so an A→B→A
+        request sequence cannot reuse another profile's route table even when
+        file mtimes are equal or decrease.
+        """
         from hermes_constants import get_hermes_home
+
         hermes_home = get_hermes_home()
+        home_key = str(hermes_home.expanduser().resolve())
         subs_path = hermes_home / _DYNAMIC_ROUTES_FILENAME
+        cached = self._dynamic_routes_by_home.get(home_key)
+
         if not subs_path.exists():
-            if self._dynamic_routes:
-                self._dynamic_routes = {}
-                self._routes = dict(self._static_routes)
-                logger.debug("[webhook] Dynamic subscriptions file removed, cleared dynamic routes")
-            return
+            dynamic_routes = cached[1] if cached and cached[0] is None else {}
+            self._dynamic_routes_by_home[home_key] = (None, dynamic_routes)
+            self._dynamic_routes = dynamic_routes
+            self._dynamic_routes_mtime = 0.0
+            self._routes = {**dynamic_routes, **self._static_routes}
+            return self._routes
+
         try:
-            mtime = subs_path.stat().st_mtime
-            if mtime <= self._dynamic_routes_mtime:
-                return  # No change
-            data = json.loads(subs_path.read_text(encoding="utf-8"))
-            if not isinstance(data, dict):
-                return
-            # Merge: static routes take precedence over dynamic ones.
-            # Reject any dynamic route whose effective secret is empty —
-            # an empty secret would cause _handle_webhook to skip HMAC
-            # validation entirely, letting unauthenticated callers in.
-            new_dynamic: Dict[str, dict] = {}
-            for k, v in data.items():
-                if k in self._static_routes:
-                    continue
-                effective_secret = self._resolve_route_secret(v)
-                if not effective_secret:
-                    logger.warning(
-                        "[webhook] Dynamic route '%s' skipped: 'secret' is "
-                        "missing or empty. Set a valid HMAC secret, or use "
-                        "'%s' to explicitly disable auth (testing only).",
-                        k,
-                        _INSECURE_NO_AUTH,
-                    )
-                    continue
-                if (
-                    effective_secret == _INSECURE_NO_AUTH
-                    and not _is_loopback_host(self._host)
-                ):
-                    logger.warning(
-                        "[webhook] Dynamic route '%s' skipped: INSECURE_NO_AUTH "
-                        "is only allowed on loopback hosts. Current host: '%s'.",
-                        k,
-                        self._host,
-                    )
-                    continue
-                new_dynamic[k] = v
-            self._dynamic_routes = new_dynamic
-            self._routes = {**self._dynamic_routes, **self._static_routes}
-            self._dynamic_routes_mtime = mtime
-            logger.info(
-                "[webhook] Reloaded %d dynamic route(s): %s",
-                len(self._dynamic_routes),
-                ", ".join(self._dynamic_routes.keys()) or "(none)",
-            )
+            stat = subs_path.stat()
+            marker = (stat.st_mtime_ns, stat.st_size)
+            if cached and cached[0] == marker:
+                dynamic_routes = cached[1]
+            else:
+                data = json.loads(subs_path.read_text(encoding="utf-8"))
+                if not isinstance(data, dict):
+                    raise ValueError("dynamic subscriptions root must be an object")
+
+                # Merge: static routes take precedence over dynamic ones.
+                # Reject any dynamic route whose effective secret is empty —
+                # an empty secret would let request validation fail open.
+                dynamic_routes: Dict[str, dict] = {}
+                for k, v in data.items():
+                    if k in self._static_routes or not isinstance(v, dict):
+                        continue
+                    effective_secret = self._resolve_route_secret(v)
+                    if not effective_secret:
+                        logger.warning(
+                            "[webhook] Dynamic route '%s' skipped for home %s: "
+                            "HMAC secret is missing or empty",
+                            k,
+                            home_key,
+                        )
+                        continue
+                    if (
+                        effective_secret == _INSECURE_NO_AUTH
+                        and not _is_loopback_host(self._host)
+                    ):
+                        logger.warning(
+                            "[webhook] Dynamic route '%s' skipped for home %s: "
+                            "INSECURE_NO_AUTH requires loopback bind",
+                            k,
+                            home_key,
+                        )
+                        continue
+                    dynamic_routes[k] = v
+                self._dynamic_routes_by_home[home_key] = (marker, dynamic_routes)
+                logger.info(
+                    "[webhook] Reloaded %d dynamic route(s) for home %s: %s",
+                    len(dynamic_routes),
+                    home_key,
+                    ", ".join(dynamic_routes.keys()) or "(none)",
+                )
+
+            self._dynamic_routes = dynamic_routes
+            self._dynamic_routes_mtime = stat.st_mtime
+            self._routes = {**dynamic_routes, **self._static_routes}
+            return self._routes
         except Exception as e:
-            logger.error("[webhook] Failed to reload dynamic routes: %s", e)
+            # Fail closed per profile. A parse/read failure may retain only that
+            # same home's last known-good routes; it must never expose whichever
+            # profile happened to be active immediately before this request.
+            logger.error(
+                "[webhook] Failed to reload dynamic routes for home %s: %s",
+                home_key,
+                e,
+            )
+            dynamic_routes = cached[1] if cached else {}
+            self._dynamic_routes = dynamic_routes
+            self._dynamic_routes_mtime = 0.0
+            self._routes = {**dynamic_routes, **self._static_routes}
+            return self._routes
 
     def _resolve_request_profile(self, request: "web.Request"):
         """Resolve + validate the /p/<profile>/ URL prefix on a webhook request.
@@ -584,8 +622,8 @@ class WebhookAdapter(BasePlatformAdapter):
         # ingest/agent turn so a shared multiplex listener cannot borrow another
         # profile's home or credentials.
         with self._request_profile_scope(profile):
-            self._reload_dynamic_routes()
-            route_config = self._routes.get(route_name)
+            routes = self._reload_dynamic_routes()
+            route_config = routes.get(route_name)
 
         if not route_config:
             return web.json_response(

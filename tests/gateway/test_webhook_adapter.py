@@ -22,6 +22,7 @@ import json
 import socket
 import time
 from collections import deque
+from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
@@ -1015,6 +1016,45 @@ class TestHTTPHandling:
             mock_site_inst.start.assert_awaited_once()
 
         await adapter.disconnect()
+
+    @pytest.mark.asyncio
+    async def test_connect_multiplex_resolves_default_profile_secret_env(
+        self, tmp_path, monkeypatch
+    ):
+        """The shared primary listener must enter secret scope before validation."""
+        from agent.secret_scope import set_multiplex_active
+
+        secret_env = "WEBHOOK_MULTIPLEX_CONNECT_TEST_SECRET"
+        monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+        monkeypatch.delenv(secret_env, raising=False)
+        (tmp_path / ".env").write_text(
+            f"{secret_env}=profile-owned-connect-secret\n", encoding="utf-8"
+        )
+        adapter = _make_adapter(
+            routes={"r1": {"secret_env": secret_env, "prompt": "x"}},
+            host="127.0.0.1",
+            port=0,
+        )
+        adapter.gateway_runner = SimpleNamespace(
+            config=SimpleNamespace(multiplex_profiles=True)
+        )
+
+        set_multiplex_active(True)
+        try:
+            with patch("gateway.platforms.webhook.web.AppRunner") as mock_runner_cls, \
+                 patch("gateway.platforms.webhook.web.TCPSite") as mock_site_cls:
+                mock_runner = AsyncMock()
+                mock_runner_cls.return_value = mock_runner
+                mock_site = AsyncMock()
+                mock_site_cls.return_value = mock_site
+
+                assert await adapter.connect() is True
+                assert adapter.is_connected
+                mock_runner.setup.assert_awaited_once()
+                mock_site.start.assert_awaited_once()
+        finally:
+            set_multiplex_active(False)
+            await adapter.disconnect()
 
     @pytest.mark.asyncio
     async def test_disconnect_cleans_up(self):

@@ -10,6 +10,7 @@ from __future__ import annotations
 import hashlib
 import hmac
 import json
+import os
 from types import SimpleNamespace
 from unittest.mock import AsyncMock
 
@@ -18,7 +19,7 @@ from aiohttp import web
 from aiohttp.test_utils import TestClient, TestServer
 
 from gateway.config import PlatformConfig
-from gateway.platforms.webhook import WebhookAdapter
+from gateway.platforms.webhook import WebhookAdapter, _DYNAMIC_ROUTES_FILENAME
 from tools.whatsapp_ops_tool import wpp_inbound_lookup
 
 
@@ -50,7 +51,7 @@ def _make_adapter(
             "port": 0,
             "rate_limit": 10,
             "max_body_bytes": max_body_bytes,
-            "routes": routes or {ROUTE: default_route},
+            "routes": routes if routes is not None else {ROUTE: default_route},
         },
     )
     adapter = WebhookAdapter(config)
@@ -90,15 +91,16 @@ async def _post(
     *,
     signature: str | None = None,
     profile: str | None = None,
+    route_name: str = ROUTE,
 ):
     body = json.dumps(payload).encode()
     headers = {}
     if signature is not None:
         headers["X-Webhook-Signature"] = signature
     path = (
-        f"/p/{profile}/webhooks/{ROUTE}"
+        f"/p/{profile}/webhooks/{route_name}"
         if profile
-        else f"/webhooks/{ROUTE}"
+        else f"/webhooks/{route_name}"
     )
     server = TestServer(_create_app(adapter))
     async with TestClient(server) as client:
@@ -268,6 +270,86 @@ async def test_quepasa_multiplex_scopes_secret_and_store_to_profile(
         reset_hermes_home_override(token)
     assert len(profile_events) == 1
     assert profile_events[0]["event_id"] == data["event_id"]
+    adapter.handle_message.assert_not_called()
+    adapter._direct_deliver.assert_not_called()
+
+
+async def test_quepasa_multiplex_dynamic_routes_are_isolated_a_b_a(
+    tmp_path, monkeypatch
+):
+    from agent import secret_scope
+    import hermes_cli.profiles as profiles
+
+    default_home = tmp_path / "default"
+    profile_a = default_home / "profiles" / "alpha"
+    profile_b = default_home / "profiles" / "beta"
+    profile_a.mkdir(parents=True)
+    profile_b.mkdir(parents=True)
+    route_a = {
+        "route-a": {
+            "kind": "quepasa_inbound",
+            "events": [],
+            "secret": "alpha-inline-secret",
+        }
+    }
+    route_b = {
+        "route-b": {
+            "kind": "quepasa_inbound",
+            "events": [],
+            "secret": "bravo-inline-secret",
+        }
+    }
+    file_a = profile_a / _DYNAMIC_ROUTES_FILENAME
+    file_b = profile_b / _DYNAMIC_ROUTES_FILENAME
+    file_a.write_text(json.dumps(route_a), encoding="utf-8")
+    file_b.write_text(json.dumps(route_b), encoding="utf-8")
+    # Deliberately equal mtimes reproduce the adapter-global cache bug.
+    shared_mtime_ns = 1_700_000_000_000_000_000
+    os.utime(file_a, ns=(shared_mtime_ns, shared_mtime_ns))
+    os.utime(file_b, ns=(shared_mtime_ns, shared_mtime_ns))
+
+    homes = {"alpha": profile_a, "beta": profile_b}
+    monkeypatch.setenv("HERMES_HOME", str(default_home))
+    monkeypatch.setattr(
+        profiles,
+        "profiles_to_serve",
+        lambda multiplex: list(homes.items()),
+    )
+    monkeypatch.setattr(profiles, "get_profile_dir", lambda name: homes[name])
+    adapter = _make_adapter(routes={})
+    adapter.gateway_runner = SimpleNamespace(
+        config=SimpleNamespace(multiplex_profiles=True)
+    )
+
+    async def post(profile, route_name, secret, event_id):
+        payload = _payload(event_id)
+        body = json.dumps(payload).encode()
+        return await _post(
+            adapter,
+            payload,
+            signature=_signature(body, secret),
+            profile=profile,
+            route_name=route_name,
+        )
+
+    secret_scope.set_multiplex_active(True)
+    try:
+        a1, _ = await post("alpha", "route-a", "alpha-inline-secret", "msg_a_1")
+        b_foreign, _ = await post(
+            "beta", "route-a", "alpha-inline-secret", "msg_b_foreign"
+        )
+        b1, _ = await post("beta", "route-b", "bravo-inline-secret", "msg_b_1")
+        a_foreign, _ = await post(
+            "alpha", "route-b", "bravo-inline-secret", "msg_a_foreign"
+        )
+        a2, _ = await post("alpha", "route-a", "alpha-inline-secret", "msg_a_2")
+    finally:
+        secret_scope.set_multiplex_active(False)
+
+    assert (a1, b_foreign, b1, a_foreign, a2) == (200, 404, 200, 404, 200)
+    cache = adapter._dynamic_routes_by_home
+    assert set(cache[str(profile_a.resolve())][1]) == {"route-a"}
+    assert set(cache[str(profile_b.resolve())][1]) == {"route-b"}
     adapter.handle_message.assert_not_called()
     adapter._direct_deliver.assert_not_called()
 
