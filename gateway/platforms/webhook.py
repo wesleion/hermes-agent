@@ -43,6 +43,7 @@ import subprocess
 import sys
 import time
 from collections import deque
+from contextlib import nullcontext
 from typing import Any, Deque, Dict, List, Optional
 
 try:
@@ -438,7 +439,16 @@ class WebhookAdapter(BasePlatformAdapter):
         """
         secret_env = str(route.get("secret_env") or "").strip()
         if secret_env:
-            return os.getenv(secret_env, "")
+            from agent.secret_scope import UnscopedSecretError, get_secret
+
+            try:
+                return str(get_secret(secret_env, "") or "")
+            except UnscopedSecretError:
+                logger.error(
+                    "[webhook] Refusing unscoped secret read for env %s in multiplex mode",
+                    secret_env,
+                )
+                return ""
         return str(route.get("secret", self._global_secret) or "")
 
     # ------------------------------------------------------------------
@@ -537,20 +547,45 @@ class WebhookAdapter(BasePlatformAdapter):
             return _PROFILE_REJECTED
         return profile
 
+    def _request_profile_scope(self, profile: Optional[str]):
+        """Return the runtime/secret scope for one multiplexed webhook request.
+
+        The shared listener receives requests for every served profile. HMAC
+        lookup and local persistence must therefore run under the routed
+        profile's HERMES_HOME and isolated secret mapping. Single-profile
+        gateways keep the legacy process environment and home unchanged.
+        """
+        runner = self.gateway_runner
+        cfg = getattr(runner, "config", None)
+        if not getattr(cfg, "multiplex_profiles", False):
+            return nullcontext()
+
+        from gateway.run import _profile_runtime_scope
+        from hermes_cli.profiles import get_profile_dir
+        from hermes_constants import get_hermes_home
+
+        profile_home = get_profile_dir(profile) if profile else get_hermes_home()
+        return _profile_runtime_scope(profile_home)
+
     async def _handle_webhook(self, request: "web.Request") -> "web.Response":
         """POST /webhooks/{route_name} — receive and process a webhook event."""
-        # Hot-reload dynamic subscriptions on each request (mtime-gated, cheap)
-        self._reload_dynamic_routes()
-
         route_name = request.match_info.get("route_name", "")
-        route_config = self._routes.get(route_name)
 
-        # Multi-profile: resolve + validate the /p/<profile>/ prefix if present.
+        # Multi-profile: resolve + validate the /p/<profile>/ prefix before any
+        # profile-owned config or credential access.
         profile = self._resolve_request_profile(request)
         if profile is _PROFILE_REJECTED:
             return web.json_response(
                 {"error": "Unknown or unconfigured profile"}, status=404
             )
+
+        # Dynamic subscriptions and secret_env values are profile-owned. Load
+        # the route table under the same runtime scope used by the eventual
+        # ingest/agent turn so a shared multiplex listener cannot borrow another
+        # profile's home or credentials.
+        with self._request_profile_scope(profile):
+            self._reload_dynamic_routes()
+            route_config = self._routes.get(route_name)
 
         if not route_config:
             return web.json_response(
@@ -599,7 +634,8 @@ class WebhookAdapter(BasePlatformAdapter):
         # INSECURE_NO_AUTH mode). Missing/empty secrets must fail closed here,
         # not only during connect(), so direct handler reuse cannot turn a
         # network webhook route into an unauthenticated agent-dispatch surface.
-        secret = self._resolve_route_secret(route_config)
+        with self._request_profile_scope(profile):
+            secret = self._resolve_route_secret(route_config)
         if not secret:
             logger.error(
                 "[webhook] Route %s has no HMAC secret; refusing request",
@@ -647,7 +683,8 @@ class WebhookAdapter(BasePlatformAdapter):
         # into the local WhatsApp Ops store and must not trigger any outbound
         # transport or LLM run by themselves.
         if self._is_quepasa_inbound_route(route_config):
-            return await self._handle_quepasa_inbound(route_name, payload)
+            with self._request_profile_scope(profile):
+                return await self._handle_quepasa_inbound(route_name, payload)
 
         # Check event type filter
         event_type = (

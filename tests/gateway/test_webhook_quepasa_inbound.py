@@ -10,6 +10,7 @@ from __future__ import annotations
 import hashlib
 import hmac
 import json
+from types import SimpleNamespace
 from unittest.mock import AsyncMock
 
 import pytest
@@ -61,6 +62,9 @@ def _make_adapter(
 def _create_app(adapter: WebhookAdapter) -> web.Application:
     app = web.Application()
     app.router.add_post("/webhooks/{route_name}", adapter._handle_webhook)
+    app.router.add_post(
+        "/p/{profile}/webhooks/{route_name}", adapter._handle_webhook
+    )
     return app
 
 
@@ -80,14 +84,25 @@ def _payload(event_id: str = "msg_synth_001") -> dict:
     }
 
 
-async def _post(adapter: WebhookAdapter, payload: dict, *, signature: str | None = None):
+async def _post(
+    adapter: WebhookAdapter,
+    payload: dict,
+    *,
+    signature: str | None = None,
+    profile: str | None = None,
+):
     body = json.dumps(payload).encode()
     headers = {}
     if signature is not None:
         headers["X-Webhook-Signature"] = signature
+    path = (
+        f"/p/{profile}/webhooks/{ROUTE}"
+        if profile
+        else f"/webhooks/{ROUTE}"
+    )
     server = TestServer(_create_app(adapter))
     async with TestClient(server) as client:
-        resp = await client.post(f"/webhooks/{ROUTE}", data=body, headers=headers)
+        resp = await client.post(path, data=body, headers=headers)
         try:
             data = await resp.json()
         except Exception:
@@ -185,6 +200,74 @@ async def test_quepasa_inbound_route_accepts_secret_from_env(tmp_path, monkeypat
 
     assert status == 200
     assert data["status"] == "ingested"
+    adapter.handle_message.assert_not_called()
+    adapter._direct_deliver.assert_not_called()
+
+
+async def test_quepasa_multiplex_scopes_secret_and_store_to_profile(
+    tmp_path, monkeypatch
+):
+    from agent import secret_scope
+    import hermes_cli.profiles as profiles
+    from hermes_constants import (
+        reset_hermes_home_override,
+        set_hermes_home_override,
+    )
+
+    default_home = tmp_path / "default"
+    profile_home = default_home / "profiles" / "alpha"
+    profile_home.mkdir(parents=True)
+    profile_secret = "alpha-quepasa-secret"
+    global_secret = "foreign-global-secret"
+    (profile_home / ".env").write_text(
+        f"WHATSAPP_OPS_WEBHOOK_SECRET={profile_secret}\n",
+        encoding="utf-8",
+    )
+    monkeypatch.setenv("HERMES_HOME", str(default_home))
+    monkeypatch.setenv("WHATSAPP_OPS_WEBHOOK_SECRET", global_secret)
+    monkeypatch.setattr(
+        profiles,
+        "profiles_to_serve",
+        lambda multiplex: [("alpha", profile_home)],
+    )
+    monkeypatch.setattr(profiles, "get_profile_dir", lambda _name: profile_home)
+
+    adapter = _make_adapter(use_secret_env=True)
+    adapter.gateway_runner = SimpleNamespace(
+        config=SimpleNamespace(multiplex_profiles=True)
+    )
+    body_payload = _payload("msg_profile_scope_001")
+    body = json.dumps(body_payload).encode()
+
+    secret_scope.set_multiplex_active(True)
+    try:
+        foreign_status, _ = await _post(
+            adapter,
+            body_payload,
+            signature=_signature(body, global_secret),
+            profile="alpha",
+        )
+        profile_status, data = await _post(
+            adapter,
+            body_payload,
+            signature=_signature(body, profile_secret),
+            profile="alpha",
+        )
+    finally:
+        secret_scope.set_multiplex_active(False)
+
+    assert foreign_status == 401
+    assert profile_status == 200
+    assert data["status"] == "ingested"
+    assert json.loads(wpp_inbound_lookup(limit=5))["events"] == []
+
+    token = set_hermes_home_override(str(profile_home))
+    try:
+        profile_events = json.loads(wpp_inbound_lookup(limit=5))["events"]
+    finally:
+        reset_hermes_home_override(token)
+    assert len(profile_events) == 1
+    assert profile_events[0]["event_id"] == data["event_id"]
     adapter.handle_message.assert_not_called()
     adapter._direct_deliver.assert_not_called()
 

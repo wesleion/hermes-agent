@@ -533,6 +533,26 @@ async def test_running_agent_fastpath_status_always_works():
     assert "⛔" not in (result or "")
 
 
+@pytest.mark.asyncio
+async def test_running_agent_fastpath_blocks_config_disabled_crgp(monkeypatch):
+    """A busy agent must not bypass the WhatsApp Ops command feature gate."""
+    import hermes_cli.commands as commands
+
+    runner = _make_runner(platform_extra={})
+    src = _make_source(user_id="111")
+    sk = build_session_key(src)
+    runner._running_agents[sk] = MagicMock()
+    runner._running_agents_ts[sk] = 0
+    runner._handle_wpp_create_group_command = AsyncMock(return_value="SINK_REACHED")
+    monkeypatch.setattr(commands, "_resolve_config_gates", lambda: set())
+
+    result = await runner._handle_message(_make_event("/crgp Piloto Seguro", src))
+
+    assert result is not None
+    assert "disabled" in result.lower()
+    runner._handle_wpp_create_group_command.assert_not_awaited()
+
+
 # ---------------------------------------------------------------------------
 # Alias resolution — /h aliases to /help; the gate must canonicalize before
 # checking access. /hist (history alias) is a real one to exercise.

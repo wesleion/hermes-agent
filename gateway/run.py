@@ -9620,10 +9620,24 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             # Resolve the command once for all early-intercept checks below.
             from hermes_cli.commands import (
                 ACTIVE_SESSION_BYPASS_COMMANDS as _DEDICATED_HANDLERS,
+                is_config_gated_command_enabled as _is_config_gated_command_enabled_inner,
                 resolve_command as _resolve_cmd_inner,
             )
             _evt_cmd = event.get_command()
             _cmd_def_inner = _resolve_cmd_inner(_evt_cmd) if _evt_cmd else None
+
+            # Config-gated commands must fail before every running-agent
+            # fast-path handler. Without this mirror of the cold-path gate,
+            # /crgp could reach the create-group approval sink while
+            # whatsapp_ops.slash_commands_enabled was false simply because an
+            # agent happened to be busy.
+            if (
+                _cmd_def_inner
+                and not _is_config_gated_command_enabled_inner(_cmd_def_inner.name)
+            ):
+                return (
+                    f"⛔ Command /{_cmd_def_inner.name} is disabled by configuration."
+                )
 
             # Slash command access control on the running-agent fast-path.
             # Mirrors the cold-path gate further below so non-admin users
