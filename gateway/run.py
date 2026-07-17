@@ -9626,13 +9626,16 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             _evt_cmd = event.get_command()
             _cmd_def_inner = _resolve_cmd_inner(_evt_cmd) if _evt_cmd else None
 
-            # Config-gated commands must fail before every running-agent
-            # fast-path handler. Without this mirror of the cold-path gate,
-            # /crgp could reach the create-group approval sink while
+            # Config-gated commands that can reach running-agent handlers must
+            # fail before those handlers. Without this mirror of the cold-path
+            # gate, /crgp could reach the create-group approval sink while
             # whatsapp_ops.slash_commands_enabled was false simply because an
-            # agent happened to be busy.
+            # agent happened to be busy. /verbose is the intentional exception:
+            # it is a safe in-flight display toggle whose existing contract
+            # keeps it reachable even when its discovery/menu gate is disabled.
             if (
                 _cmd_def_inner
+                and _cmd_def_inner.name != "verbose"
                 and not _is_config_gated_command_enabled_inner(_cmd_def_inner.name)
             ):
                 return (
