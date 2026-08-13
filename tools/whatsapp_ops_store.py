@@ -171,6 +171,32 @@ def init_db() -> Path:
                 created_at TEXT NOT NULL,
                 UNIQUE(alias_norm, contact_id)
             );
+            CREATE TABLE IF NOT EXISTS contact_channels (
+                id TEXT PRIMARY KEY,
+                contact_id TEXT NOT NULL REFERENCES contacts(id),
+                channel_type TEXT NOT NULL CHECK(channel_type = 'whatsapp'),
+                address_hash TEXT NOT NULL,
+                address_ref_enc TEXT NOT NULL,
+                is_active INTEGER NOT NULL DEFAULT 1 CHECK(is_active IN (0, 1)),
+                is_primary INTEGER NOT NULL DEFAULT 0 CHECK(is_primary IN (0, 1)),
+                validation_status TEXT NOT NULL
+                    CHECK(validation_status IN ('unvalidated', 'validated', 'invalid')),
+                allow_send INTEGER NOT NULL DEFAULT 0 CHECK(allow_send IN (0, 1)),
+                authorized_at TEXT,
+                revoked_at TEXT,
+                context_key_hash TEXT,
+                source TEXT NOT NULL,
+                created_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL,
+                UNIQUE(channel_type, address_hash)
+            );
+            CREATE UNIQUE INDEX IF NOT EXISTS uq_contact_channels_active_primary_whatsapp
+            ON contact_channels(contact_id)
+            WHERE channel_type='whatsapp' AND is_active=1 AND is_primary=1;
+            CREATE TABLE IF NOT EXISTS whatsapp_ops_schema_migrations (
+                id TEXT PRIMARY KEY,
+                applied_at TEXT NOT NULL
+            );
             CREATE TABLE IF NOT EXISTS lists (
                 id TEXT PRIMARY KEY,
                 name TEXT NOT NULL,
@@ -288,6 +314,8 @@ def init_db() -> Path:
         )
         _ensure_draft_columns(conn)
         _ensure_list_columns(conn)
+        _ensure_contact_channel_columns(conn)
+        _migrate_legacy_contact_channels(conn)
         _ensure_registration_staging_columns(conn)
         _backfill_registration_staging_metadata(conn)
     return db_path
@@ -317,6 +345,78 @@ def _ensure_list_columns(conn: sqlite3.Connection) -> None:
     columns = {row["name"] for row in conn.execute("PRAGMA table_info(lists)")}
     if "target_ref_enc" not in columns:
         conn.execute("ALTER TABLE lists ADD COLUMN target_ref_enc TEXT")
+
+
+def _ensure_contact_channel_columns(conn: sqlite3.Connection) -> None:
+    """Upgrade pre-Gate-B channel candidates without destructive DDL."""
+    columns = {row["name"] for row in conn.execute("PRAGMA table_info(contact_channels)")}
+    for name, ddl in {
+        "authorized_at": "authorized_at TEXT",
+        "revoked_at": "revoked_at TEXT",
+    }.items():
+        if name not in columns:
+            conn.execute(f"ALTER TABLE contact_channels ADD COLUMN {ddl}")
+
+
+def _migrate_legacy_contact_channels(conn: sqlite3.Connection) -> None:
+    """Project legacy single-number contacts once, preserving old authority.
+
+    This is the only path allowed to copy legacy ``whitelisted`` authority into
+    a channel. The migration marker prevents future contact updates from
+    silently creating or reauthorizing channels.
+    """
+    migration_id = "2026-08-13-contact-channels-v1"
+    applied = conn.execute(
+        "SELECT 1 FROM whatsapp_ops_schema_migrations WHERE id=?", (migration_id,)
+    ).fetchone()
+    if applied is not None:
+        return
+    rows = conn.execute(
+        "SELECT * FROM contacts WHERE COALESCE(phone_e164_enc, '') <> '' ORDER BY id"
+    ).fetchall()
+    for row in rows:
+        raw_ref = str(row["phone_e164_enc"] or "").strip()
+        try:
+            canonical = _normalize_whatsapp_address(raw_ref)
+        except ValueError:
+            continue
+        address_hash = hash_text(canonical)
+        existing = conn.execute(
+            "SELECT contact_id FROM contact_channels "
+            "WHERE channel_type='whatsapp' AND address_hash=?",
+            (address_hash,),
+        ).fetchone()
+        if existing is not None:
+            if str(existing["contact_id"]) != str(row["id"]):
+                raise ValueError("contact channel ownership conflict")
+            continue
+        created_at = str(row["created_at"])
+        legacy_authorized = bool(row["whitelisted"])
+        conn.execute(
+            """
+            INSERT INTO contact_channels (
+                id, contact_id, channel_type, address_hash, address_ref_enc,
+                is_active, is_primary, validation_status, allow_send,
+                authorized_at, revoked_at, context_key_hash, source,
+                created_at, updated_at
+            ) VALUES (?, ?, 'whatsapp', ?, ?, 1, 1, 'validated', ?, ?, NULL, NULL,
+                      'legacy_contacts', ?, ?)
+            """,
+            (
+                "channel_" + hash_text("whatsapp:" + canonical)[:20],
+                str(row["id"]),
+                address_hash,
+                raw_ref,
+                1 if legacy_authorized else 0,
+                created_at if legacy_authorized else None,
+                created_at,
+                str(row["updated_at"]),
+            ),
+        )
+    conn.execute(
+        "INSERT INTO whatsapp_ops_schema_migrations (id, applied_at) VALUES (?, ?)",
+        (migration_id, utc_now()),
+    )
 
 
 
@@ -437,6 +537,42 @@ def _safe_contact(row: dict[str, Any]) -> dict[str, Any]:
         "phone_masked": _safe_existing_phone_mask(row.get("phone_e164_enc")),
         "whitelisted": bool(row.get("whitelisted")),
         "policy_group": row.get("policy_group"),
+    }
+
+
+def _normalize_whatsapp_address(value: Any) -> str:
+    """Return one canonical E.164-like WhatsApp address for identity hashing."""
+    if type(value) is not str:
+        raise ValueError("valid WhatsApp address is required")
+    raw = value.strip()
+    jid = re.fullmatch(
+        r"([0-9]{8,15})@(s\.whatsapp\.net|c\.us|whatsapp\.net)",
+        raw.casefold(),
+    )
+    if jid is not None:
+        digits = jid.group(1)
+    else:
+        if "@" in raw or re.fullmatch(r"\+?[0-9\s().-]+", raw) is None:
+            raise ValueError("valid WhatsApp address is required")
+        digits = _phone_digits(raw)
+    if not (8 <= len(digits) <= 15) or digits.startswith("0"):
+        raise ValueError("valid WhatsApp address is required")
+    return "+" + digits
+
+
+def _safe_contact_channel(row: dict[str, Any]) -> dict[str, Any]:
+    canonical = _normalize_whatsapp_address(str(row.get("address_ref_enc") or ""))
+    return {
+        "channel_id": str(row["id"]),
+        "contact_id": _safe_contact_id(str(row["contact_id"])),
+        "channel_type": str(row["channel_type"]),
+        "address_masked": "***" + canonical[-4:],
+        "is_active": bool(row["is_active"]),
+        "is_primary": bool(row["is_primary"]),
+        "validation_status": str(row["validation_status"]),
+        "allow_send": bool(row["allow_send"]),
+        "authorized_at": row.get("authorized_at"),
+        "revoked_at": row.get("revoked_at"),
     }
 
 
@@ -1138,23 +1274,33 @@ def upsert_contact(
     policy_group: str | None = None,
     metadata: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
+    """Upsert descriptive person data without granting send authority.
+
+    ``whitelisted`` remains in the signature for legacy callers, but ordinary
+    contact updates never elevate it. Channel authorization is the only grant
+    path and maintains the legacy projection explicitly.
+    """
     init_db()
     if not contact_id or not display_name:
         raise ValueError("contact_id and display_name are required")
+    if type(phone_e164) is not str:
+        raise ValueError("valid WhatsApp address is required")
     now = utc_now()
     phone_digits = _trusted_phone_digits(phone_e164)
+    phone_hash = hash_text(phone_digits) if phone_digits else None
+    masked_phone = _safe_existing_phone_mask(phone_e164)
+    phone_value = phone_e164.strip() if phone_digits or masked_phone else None
     with _connect() as conn:
         conn.execute(
             """
             INSERT INTO contacts (
                 id, display_name, phone_e164_hash, phone_e164_enc, whitelisted,
                 policy_group, metadata_json, created_at, updated_at
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+            ) VALUES (?, ?, ?, ?, 0, ?, ?, ?, ?)
             ON CONFLICT(id) DO UPDATE SET
                 display_name=excluded.display_name,
-                phone_e164_hash=excluded.phone_e164_hash,
-                phone_e164_enc=excluded.phone_e164_enc,
-                whitelisted=excluded.whitelisted,
+                phone_e164_hash=COALESCE(excluded.phone_e164_hash, contacts.phone_e164_hash),
+                phone_e164_enc=COALESCE(excluded.phone_e164_enc, contacts.phone_e164_enc),
                 policy_group=excluded.policy_group,
                 metadata_json=excluded.metadata_json,
                 updated_at=excluded.updated_at
@@ -1162,16 +1308,18 @@ def upsert_contact(
             (
                 contact_id,
                 display_name,
-                hash_text(phone_digits) if phone_digits else None,
-                phone_e164,
-                1 if whitelisted else 0,
+                phone_hash,
+                phone_value,
                 policy_group,
                 json.dumps(metadata or {}, ensure_ascii=False, sort_keys=True),
                 now,
                 now,
             ),
         )
-        alias_values = {_normalize(display_name), *( _normalize(alias) for alias in (aliases or []) )}
+        alias_values = {
+            _normalize(display_name),
+            *(_normalize(alias) for alias in (aliases or [])),
+        }
         if phone_digits:
             alias_values.add(phone_digits)
         for alias_norm in sorted(a for a in alias_values if a):
@@ -1182,12 +1330,348 @@ def upsert_contact(
                 """,
                 ("alias_" + uuid.uuid4().hex[:12], contact_id, alias_norm, now),
             )
+        stored = conn.execute("SELECT * FROM contacts WHERE id=?", (contact_id,)).fetchone()
+    return _safe_contact(dict(stored))
+
+
+def upsert_channel(
+    *,
+    contact_id: str,
+    address: str,
+    channel_type: str = "whatsapp",
+    is_active: bool = True,
+    is_primary: bool = False,
+    validation_status: str = "unvalidated",
+    context_key: str = "",
+    source: str = "manual",
+) -> dict[str, Any]:
+    """Upsert channel identity/lifecycle without granting or restoring send."""
+    init_db()
+    if type(contact_id) is not str or not contact_id.strip():
+        raise ValueError("contact channel owner is required")
+    if any(type(flag) is not bool for flag in (is_active, is_primary)):
+        raise ValueError("contact channel flags must be boolean")
+    if type(context_key) is not str or type(source) is not str:
+        raise ValueError("invalid contact channel metadata")
+    if channel_type != "whatsapp":
+        raise ValueError("unsupported contact channel type")
+    if validation_status not in {"unvalidated", "validated", "invalid"}:
+        raise ValueError("invalid contact channel validation status")
+    canonical = _normalize_whatsapp_address(address)
+    address_hash = hash_text(canonical)
+    raw_ref = address.strip() if "@" in address else canonical
+    now = utc_now()
+    with _connect() as conn:
+        owner = conn.execute(
+            "SELECT id FROM contacts WHERE id=?", (contact_id,)
+        ).fetchone()
+        if owner is None:
+            raise ValueError("contact channel owner does not exist")
+        existing = conn.execute(
+            "SELECT * FROM contact_channels WHERE channel_type=? AND address_hash=?",
+            (channel_type, address_hash),
+        ).fetchone()
+        if existing is not None and str(existing["contact_id"]) != contact_id:
+            raise ValueError("contact channel ownership conflict")
+        existing_id = str(existing["id"]) if existing is not None else ""
+        was_revoked = bool(existing is not None and existing["revoked_at"])
+        effective_active = False if was_revoked else bool(is_active)
+        effective_primary = bool(is_primary)
+        if effective_active and effective_primary:
+            conflict = conn.execute(
+                "SELECT id FROM contact_channels WHERE contact_id=? "
+                "AND channel_type='whatsapp' AND is_active=1 AND is_primary=1 AND id<>?",
+                (contact_id, existing_id),
+            ).fetchone()
+            if conflict is not None:
+                raise ValueError("active primary contact channel conflict")
+        if existing is None:
+            channel_id = "channel_" + hash_text("whatsapp:" + canonical)[:20]
+            revoked_at = now if not effective_active else None
+            conn.execute(
+                """
+                INSERT INTO contact_channels (
+                    id, contact_id, channel_type, address_hash, address_ref_enc,
+                    is_active, is_primary, validation_status, allow_send,
+                    authorized_at, revoked_at, context_key_hash, source,
+                    created_at, updated_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, 0, NULL, ?, ?, ?, ?, ?)
+                """,
+                (
+                    channel_id,
+                    contact_id,
+                    channel_type,
+                    address_hash,
+                    raw_ref,
+                    int(effective_active),
+                    int(effective_primary),
+                    validation_status,
+                    revoked_at,
+                    hash_text(context_key) if context_key else None,
+                    str(source or "manual")[:80],
+                    now,
+                    now,
+                ),
+            )
+        else:
+            channel_id = existing_id
+            revoked_at = existing["revoked_at"] or (now if not effective_active else None)
+            allow_send = bool(existing["allow_send"] and effective_active and not revoked_at)
+            conn.execute(
+                """
+                UPDATE contact_channels
+                SET address_ref_enc=?, is_active=?, is_primary=?, validation_status=?,
+                    allow_send=?, revoked_at=?, context_key_hash=?, source=?, updated_at=?
+                WHERE id=?
+                """,
+                (
+                    raw_ref,
+                    int(effective_active),
+                    int(effective_primary),
+                    validation_status,
+                    int(allow_send),
+                    revoked_at,
+                    hash_text(context_key) if context_key else existing["context_key_hash"],
+                    str(source or existing["source"])[:80],
+                    now,
+                    channel_id,
+                ),
+            )
+        row = conn.execute(
+            "SELECT * FROM contact_channels WHERE id=?", (channel_id,)
+        ).fetchone()
+    return _safe_contact_channel(dict(row))
+
+
+def authorize_channel(channel_id: str) -> dict[str, Any]:
+    """Explicitly authorize one exact active, validated, non-revoked channel."""
+    init_db()
+    now = utc_now()
+    with _connect() as conn:
+        row = conn.execute(
+            "SELECT * FROM contact_channels WHERE id=?", (str(channel_id),)
+        ).fetchone()
+        if row is None:
+            raise ValueError("contact channel does not exist")
+        if row["revoked_at"] or not bool(row["is_active"]):
+            raise ValueError("contact channel is inactive or revoked")
+        if str(row["validation_status"]) != "validated":
+            raise ValueError("contact channel must be validated")
+        conn.execute(
+            "UPDATE contact_channels SET allow_send=1, authorized_at=?, updated_at=? WHERE id=?",
+            (now, now, str(channel_id)),
+        )
+        conn.execute(
+            "UPDATE contacts SET whitelisted=1, updated_at=? WHERE id=?",
+            (now, str(row["contact_id"])),
+        )
+        updated = conn.execute(
+            "SELECT * FROM contact_channels WHERE id=?", (str(channel_id),)
+        ).fetchone()
+    return _safe_contact_channel(dict(updated))
+
+
+def revoke_channel(channel_id: str) -> dict[str, Any]:
+    """Logically revoke one channel; ordinary upsert cannot reactivate it."""
+    init_db()
+    now = utc_now()
+    with _connect() as conn:
+        row = conn.execute(
+            "SELECT * FROM contact_channels WHERE id=?", (str(channel_id),)
+        ).fetchone()
+        if row is None:
+            raise ValueError("contact channel does not exist")
+        revoked_at = row["revoked_at"] or now
+        conn.execute(
+            "UPDATE contact_channels SET is_active=0, allow_send=0, revoked_at=?, updated_at=? WHERE id=?",
+            (revoked_at, now, str(channel_id)),
+        )
+        remaining = conn.execute(
+            "SELECT 1 FROM contact_channels WHERE contact_id=? AND is_active=1 "
+            "AND validation_status='validated' AND allow_send=1 AND revoked_at IS NULL LIMIT 1",
+            (str(row["contact_id"]),),
+        ).fetchone()
+        if remaining is None:
+            conn.execute(
+                "UPDATE contacts SET whitelisted=0, updated_at=? WHERE id=?",
+                (now, str(row["contact_id"])),
+            )
+        updated = conn.execute(
+            "SELECT * FROM contact_channels WHERE id=?", (str(channel_id),)
+        ).fetchone()
+    return _safe_contact_channel(dict(updated))
+
+
+def get_contact_channel(channel_id: str) -> dict[str, Any] | None:
+    init_db()
+    with _connect() as conn:
+        row = conn.execute(
+            "SELECT * FROM contact_channels WHERE id=?", (str(channel_id),)
+        ).fetchone()
+    return _safe_contact_channel(dict(row)) if row is not None else None
+
+
+def list_contact_channels(
+    contact_id: str, *, include_inactive: bool = False
+) -> list[dict[str, Any]]:
+    init_db()
+    with _connect() as conn:
+        if include_inactive:
+            rows = conn.execute(
+                "SELECT * FROM contact_channels WHERE contact_id=? "
+                "ORDER BY is_active DESC, is_primary DESC, created_at ASC, id ASC",
+                (str(contact_id),),
+            ).fetchall()
+        else:
+            rows = conn.execute(
+                "SELECT * FROM contact_channels WHERE contact_id=? AND is_active=1 "
+                "ORDER BY is_primary DESC, created_at ASC, id ASC",
+                (str(contact_id),),
+            ).fetchall()
+    return [_safe_contact_channel(dict(row)) for row in rows]
+
+
+def get_transport_contact_ref(query: str, *, channel_id: str = "") -> str:
+    """Resolve only one exact active, validated, authorized, allowlisted channel."""
+    init_db()
+    needle = str(query or "").strip()
+    if not needle:
+        return ""
+    needle_norm = _normalize(needle)
+    needle_digits = _phone_digits(needle)
+    with _connect() as conn:
+        contacts = conn.execute(
+            """
+            SELECT DISTINCT c.id
+            FROM contacts c
+            LEFT JOIN contact_aliases a ON a.contact_id=c.id
+            WHERE c.whitelisted=1 AND (
+                c.id=? OR a.alias_norm=? OR lower(c.display_name)=?
+                OR (? != '' AND c.phone_e164_hash=?)
+            )
+            LIMIT 2
+            """,
+            (
+                needle,
+                needle_norm,
+                needle_norm,
+                needle_digits,
+                hash_text(needle_digits) if needle_digits else "",
+            ),
+        ).fetchall()
+        if len(contacts) != 1:
+            return ""
+        sql = (
+            "SELECT address_ref_enc FROM contact_channels "
+            "WHERE contact_id=? AND is_active=1 AND validation_status='validated' "
+            "AND allow_send=1 AND revoked_at IS NULL"
+        )
+        params: list[Any] = [str(contacts[0]["id"])]
+        if channel_id:
+            sql += " AND id=?"
+            params.append(str(channel_id))
+        sql += " LIMIT 2"
+        channels = conn.execute(sql, tuple(params)).fetchall()
+    if len(channels) != 1:
+        return ""
+    return str(channels[0]["address_ref_enc"] or "").strip()
+
+
+def preview_crm_identity_sync(
+    *,
+    contact_rows: list[dict[str, Any]],
+    channel_rows: list[dict[str, Any]] | None = None,
+    limit: int = 200,
+) -> dict[str, Any]:
+    """Build a bounded, sanitized identity preview without any local/CRM write."""
+    if not isinstance(contact_rows, list) or not isinstance(channel_rows or [], list):
+        return {"ok": False, "error": "crm_identity_rows_invalid"}
+    bounded_limit = max(1, min(int(limit or 200), 500))
+    contacts_in = contact_rows[:bounded_limit]
+    channels_in = (channel_rows or [])[:bounded_limit]
+    truncated = len(contact_rows) > bounded_limit or len(channel_rows or []) > bounded_limit
+    invalid_count = duplicate_count = ambiguous_count = 0
+    contact_proposals: list[dict[str, Any]] = []
+    channel_proposals: list[dict[str, Any]] = []
+    known_contacts: set[str] = set()
+    candidates: list[dict[str, Any]] = []
+    for row in contacts_in:
+        if not isinstance(row, dict):
+            invalid_count += 1
+            continue
+        contact_id = str(row.get("contact_id") or row.get("id") or "").strip()
+        display_name = _clean_registration_text(
+            row.get("display_name") or row.get("name"), limit=80
+        )
+        if not contact_id or not display_name:
+            invalid_count += 1
+            continue
+        safe_contact_id = _safe_contact_id(contact_id)
+        known_contacts.add(contact_id)
+        contact_proposals.append(
+            {"contact_id": safe_contact_id, "display_name": display_name}
+        )
+        legacy_address = str(
+            row.get("phone") or row.get("phone_e164") or row.get("address") or ""
+        ).strip()
+        if legacy_address:
+            candidates.append(
+                {
+                    "contact_id": contact_id,
+                    "address": legacy_address,
+                    "is_primary": True,
+                    "source": "crm_legacy_phone",
+                }
+            )
+    candidates.extend(row for row in channels_in if isinstance(row, dict))
+    invalid_count += sum(1 for row in channels_in if not isinstance(row, dict))
+    seen_addresses: set[str] = set()
+    primary_by_contact: dict[str, set[str]] = {}
+    for row in candidates:
+        contact_id = str(row.get("contact_id") or row.get("person_id") or "").strip()
+        address = str(row.get("address") or row.get("phone") or row.get("phone_e164") or "").strip()
+        if not contact_id or contact_id not in known_contacts or not address:
+            invalid_count += 1
+            continue
+        try:
+            canonical = _normalize_whatsapp_address(address)
+        except ValueError:
+            invalid_count += 1
+            continue
+        address_hash = hash_text(canonical)
+        if address_hash in seen_addresses:
+            duplicate_count += 1
+            continue
+        seen_addresses.add(address_hash)
+        is_primary = bool(row.get("is_primary", False))
+        if is_primary:
+            primary_by_contact.setdefault(contact_id, set()).add(address_hash)
+        channel_proposals.append(
+            {
+                "channel_id": "channel_" + hash_text("whatsapp:" + canonical)[:20],
+                "contact_id": _safe_contact_id(contact_id),
+                "channel_type": "whatsapp",
+                "address_masked": "***" + canonical[-4:],
+                "is_primary": is_primary,
+                "validation_status": "unvalidated",
+                "allow_send": False,
+                "source": str(row.get("source") or "crm_channel")[:40],
+            }
+        )
+    ambiguous_count = sum(1 for values in primary_by_contact.values() if len(values) > 1)
     return {
-        "contact_id": contact_id,
-        "display_name": display_name,
-        "phone_masked": _safe_existing_phone_mask(phone_e164),
-        "whitelisted": bool(whitelisted),
-        "policy_group": policy_group,
+        "ok": True,
+        "source": "crm_rows",
+        "contact_proposals": contact_proposals,
+        "channel_proposals": channel_proposals,
+        "valid_count": len(channel_proposals),
+        "invalid_count": invalid_count,
+        "duplicate_count": duplicate_count,
+        "ambiguous_count": ambiguous_count,
+        "truncated": truncated,
+        "crm_write_performed": False,
+        "local_write_performed": False,
+        "allow_send_changes": 0,
     }
 
 
@@ -1240,36 +1724,6 @@ def list_contacts(filter_text: str = "", limit: int = 50) -> list[dict[str, Any]
         else:
             rows = conn.execute("SELECT * FROM contacts ORDER BY display_name ASC LIMIT ?", (limit,)).fetchall()
     return [_safe_contact(dict(row)) for row in rows]
-
-
-def get_transport_contact_ref(query: str) -> str:
-    """Return raw provider ref for an allowlisted contact, for transport only."""
-    init_db()
-    needle = str(query or "").strip()
-    if not needle:
-        return ""
-    needle_norm = _normalize(needle)
-    needle_digits = _phone_digits(needle)
-    with _connect() as conn:
-        rows = conn.execute(
-            """
-            SELECT DISTINCT c.*
-            FROM contacts c
-            LEFT JOIN contact_aliases a ON a.contact_id = c.id
-            WHERE c.whitelisted = 1
-              AND (
-                c.id = ?
-                OR a.alias_norm = ?
-                OR lower(c.display_name) = ?
-                OR (? != '' AND c.phone_e164_hash = ?)
-              )
-            LIMIT 2
-            """,
-            (needle, needle_norm, needle_norm, needle_digits, hash_text(needle_digits) if needle_digits else ""),
-        ).fetchall()
-    if len(rows) != 1:
-        return ""
-    return str(dict(rows[0]).get("phone_e164_enc") or "").strip()
 
 
 def get_transport_group_ref(query: str) -> str:
@@ -1377,10 +1831,18 @@ def import_contact_list_local(
             display_name=display,
             phone_e164=raw_ref,
             aliases=[alias],
-            whitelisted=bool(allow_send),
             policy_group=policy_group,
             metadata=metadata,
         )
+        channel = upsert_channel(
+            contact_id=contact_id,
+            address=raw_ref,
+            is_primary=True,
+            validation_status="validated",
+            source=source,
+        )
+        if allow_send:
+            authorize_channel(channel["channel_id"])
         with _connect() as conn:
             conn.execute(
                 "INSERT OR IGNORE INTO list_members (list_id, contact_id, created_at) VALUES (?, ?, ?)",
@@ -1495,11 +1957,23 @@ def register_contact_local(
             display_name=display,
             phone_e164=raw_ref,
             aliases=[alias],
-            whitelisted=allow_send,
             policy_group=policy_group,
             metadata=metadata,
         )
+        channel = upsert_channel(
+            contact_id=contact_id,
+            address=raw_ref,
+            is_primary=True,
+            validation_status="validated",
+            source="local_registration",
+        )
+        if allow_send:
+            authorize_channel(channel["channel_id"])
+        result = resolve_contact(contact_id).get("match") or result
     except ValueError as exc:
+        if "valid WhatsApp address" in str(exc) and not allow_send:
+            result = resolve_contact(contact_id).get("match") or result
+            return {"ok": True, **result}
         return {"ok": False, "error": str(exc)[:200]}
     return {"ok": True, **result}
 
@@ -1842,7 +2316,19 @@ def _contact_id_from_target(target_ref: str) -> str:
     return "contact_" + hash_text(target_ref)[:16]
 
 
-def _sync_contact_item(item: dict[str, Any]) -> bool:
+def _contact_id_for_unique_alias(alias: str) -> str:
+    alias_norm = _normalize(alias)
+    if not alias_norm:
+        return ""
+    with _connect() as conn:
+        rows = conn.execute(
+            "SELECT DISTINCT contact_id FROM contact_aliases WHERE alias_norm=? LIMIT 2",
+            (alias_norm,),
+        ).fetchall()
+    return str(rows[0]["contact_id"]) if len(rows) == 1 else ""
+
+
+def _sync_contact_item(item: dict[str, Any], *, source: str = "env") -> bool:
     alias = str(item.get("alias") or "").strip()
     target_ref = str(item.get("target_ref") or "").strip()
     kind = str(item.get("kind") or "contact").strip().lower()
@@ -1852,21 +2338,76 @@ def _sync_contact_item(item: dict[str, Any]) -> bool:
         raise ValueError("allowlist_entry_invalid")
     display_name = str(item.get("display_name") or alias).strip() or alias
     metadata = {
-        "source": "env",
+        "source": source,
         "target_ref_hash": hash_text(target_ref),
         "allow_receive": bool(item.get("allow_receive", True)),
         "allow_send": bool(item.get("allow_send", False)),
     }
+    contact_id = (
+        str(item.get("contact_id") or "").strip()
+        or _contact_id_for_unique_alias(alias)
+        or _contact_id_from_target(target_ref)
+    )
     upsert_contact(
-        contact_id=_contact_id_from_target(target_ref),
+        contact_id=contact_id,
         display_name=display_name,
         phone_e164=target_ref,
         aliases=[alias],
-        whitelisted=bool(item.get("allow_send", False)),
         policy_group=item.get("policy_group"),
         metadata=metadata,
     )
+    try:
+        channel = upsert_channel(
+            contact_id=contact_id,
+            address=target_ref,
+            is_primary=True,
+            validation_status="validated",
+            source=source,
+        )
+    except ValueError as exc:
+        # Provider-only identifiers such as @lid remain valid receive-only
+        # person aliases, but are never promoted into a sendable phone channel.
+        if "valid WhatsApp address" not in str(exc):
+            raise
+        if bool(item.get("allow_send", False)):
+            # Preserve the explicit legacy parent allowlist projection for
+            # diagnostics/policy, while channel resolution still blocks send.
+            now = utc_now()
+            with _connect() as conn:
+                conn.execute(
+                    "UPDATE contacts SET whitelisted=1, updated_at=? WHERE id=?",
+                    (now, contact_id),
+                )
+        return True
+    if bool(item.get("allow_send", False)):
+        authorize_channel(channel["channel_id"])
     return True
+
+
+def sync_contact_allowlist_items(
+    items: list[dict[str, Any]], *, source: str = "runtime_config"
+) -> dict[str, Any]:
+    """Materialize explicit non-CRM allowlist entries into local channel authority."""
+    init_db()
+    if not isinstance(items, list):
+        return {"ok": False, "error": "allowlist_json_invalid"}
+    synced = 0
+    try:
+        for raw_item in items:
+            if not isinstance(raw_item, dict):
+                raise ValueError("allowlist_entry_invalid")
+            item = dict(raw_item)
+            target_ref = str(item.get("target_ref") or "").strip()
+            if not item.get("alias") and target_ref:
+                item["alias"] = (
+                    str(item.get("contact_id") or "").strip()
+                    or _contact_id_from_target(target_ref)
+                )
+            if _sync_contact_item(item, source=source):
+                synced += 1
+    except ValueError as exc:
+        return {"ok": False, "error": str(exc)}
+    return {"ok": True, "source": source, "contacts_synced": synced}
 
 
 def _sync_group_item(item: dict[str, Any]) -> bool:

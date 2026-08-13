@@ -54,6 +54,7 @@ from tools.whatsapp_ops_store import (
     mark_outbox_blocked,
     mark_outbox_result,
     peek_staging,
+    preview_crm_identity_sync,
     register_contact_local,
     register_group_local,
     request_media_transcription,
@@ -62,6 +63,7 @@ from tools.whatsapp_ops_store import (
     _payload_from_self,
     resolve_contact,
     stage_raw_ref,
+    sync_contact_allowlist_items,
     sync_allowlist_from_env,
     update_draft_status,
 )
@@ -215,6 +217,23 @@ def _config_with_runtime_allowlist(cfg: dict[str, Any]) -> dict[str, Any]:
     return merged
 
 
+def _materialize_contact_authority(cfg: dict[str, Any]) -> dict[str, Any]:
+    """Load explicit env/config allowlists into the local channel authority."""
+    env_result = sync_contact_allowlist_items(_raw_contact_entries(), source="env")
+    if not env_result.get("ok"):
+        return env_result
+    config_result = sync_contact_allowlist_items(
+        _raw_contact_entries_from_config(cfg), source="runtime_config"
+    )
+    if not config_result.get("ok"):
+        return config_result
+    return {
+        "ok": True,
+        "contacts_synced": int(env_result.get("contacts_synced") or 0)
+        + int(config_result.get("contacts_synced") or 0),
+    }
+
+
 def _approval_for_policy(approval: dict[str, Any] | None) -> dict[str, Any] | None:
     if approval is None:
         return None
@@ -363,39 +382,8 @@ def _digits(value: str) -> str:
 
 
 def _resolve_raw_contact_ref(query: str, cfg: dict[str, Any] | None = None) -> str:
-    """Resolve an operator alias to a raw provider ref for transport only.
-
-    Raw refs are sourced from env/Infisical-rendered allowlists and are never
-    returned to model/user output. Empty string means fail closed.
-    """
-    needle = str(query or "").strip()
-    if not needle:
-        return ""
-    needle_norm = needle.casefold()
-    needle_digits = _digits(needle)
-    matches: list[str] = []
-    for item in [*_raw_contact_entries(), *_raw_contact_entries_from_config(cfg)]:
-        kind = str(item.get("kind") or "contact").strip().lower()
-        if kind not in {"contact", "dm"}:
-            continue
-        raw_ref = str(item.get("target_ref") or item.get("ref") or item.get("contact_ref") or "").strip()
-        if not raw_ref:
-            continue
-        candidates = {
-            str(item.get("alias") or "").strip().casefold(),
-            str(item.get("display_name") or "").strip().casefold(),
-            str(item.get("contact_id") or "").strip().casefold(),
-            ("contact_" + hash_text(raw_ref)[:16]).casefold(),
-            raw_ref.casefold(),
-        }
-        raw_digits = _digits(raw_ref)
-        if needle_norm in candidates or (needle_digits and needle_digits == raw_digits):
-            if bool(item.get("allow_send", False)):
-                matches.append(raw_ref)
-    unique = list(dict.fromkeys(matches))
-    if len(unique) == 1:
-        return unique[0]
-    return get_transport_contact_ref(needle)
+    """Resolve through the local channel authority only; empty means fail closed."""
+    return get_transport_contact_ref(str(query or "").strip())
 
 
 def _resolve_raw_group_ref(query: str, cfg: dict[str, Any] | None = None) -> str:
@@ -434,10 +422,16 @@ def _provider_targets_for_transport(targets: list[dict[str, Any]], cfg: dict[str
             return [], "payload_invalid"
         target_type = str(target.get("type") or "").strip().lower()
         if target_type == "contact":
+            channel_id = str(target.get("channel_id") or "").strip()
             raw_ref = _resolve_raw_contact_ref(
                 str(target.get("contact_id") or target.get("alias") or target.get("name") or target.get("ref") or ""),
                 cfg,
             )
+            if channel_id:
+                raw_ref = get_transport_contact_ref(
+                    str(target.get("contact_id") or target.get("alias") or target.get("name") or target.get("ref") or ""),
+                    channel_id=channel_id,
+                )
             if not raw_ref:
                 return [], "target_ref_unresolved"
             provider_targets.append({"type": "contact", "contact_id": raw_ref})
@@ -859,7 +853,17 @@ def wpp_send_approved(
 ) -> str:
     """Send an explicitly human-approved draft only if guardrails allow it."""
     init_db()
-    cfg = _config_with_runtime_allowlist(config if config is not None else _runtime_config())
+    base_cfg = config if config is not None else _runtime_config()
+    authority = _materialize_contact_authority(base_cfg)
+    if not authority.get("ok"):
+        return _json(
+            {
+                "ok": False,
+                "draft_id": draft_id,
+                "reasons": ["contact_authority_sync_failed"],
+            }
+        )
+    cfg = _config_with_runtime_allowlist(base_cfg)
     draft = get_draft(draft_id)
     approval = get_valid_approval(draft_id, approval_token)
     policy_draft = _draft_for_policy(draft)
@@ -1049,6 +1053,21 @@ def wpp_resolve_contact(nome_ou_numero: str) -> str:
 
 def wpp_list_contacts(filtro: str = "") -> str:
     return _json({"ok": True, "filter": str(filtro)[:80], "contacts": list_contacts(filtro)})
+
+
+def wpp_crm_sync_preview(
+    contacts: list[dict[str, Any]],
+    channels: list[dict[str, Any]] | None = None,
+    limit: int = 100,
+) -> str:
+    """Preview sanitized CRM person/channel proposals without any I/O or writes."""
+    return _json(
+        preview_crm_identity_sync(
+            contact_rows=contacts if isinstance(contacts, list) else [],
+            channel_rows=channels if isinstance(channels, list) else [],
+            limit=limit,
+        )
+    )
 
 
 def wpp_import_contact_list(
@@ -2124,6 +2143,28 @@ registry.register(
         [],
     ),
     handler=lambda args, **kw: wpp_list_contacts(args.get("filtro", "")),
+    check_fn=check_whatsapp_ops_requirements,
+    emoji="📲",
+)
+
+registry.register(
+    name="wpp_crm_sync_preview",
+    toolset=TOOLSET,
+    schema=_schema(
+        "wpp_crm_sync_preview",
+        "Preview sanitized CRM person/channel proposals from supplied rows. Read-only: never calls CRM, never writes SQLite, and every proposed channel has allow_send=false.",
+        {
+            "contacts": {"type": "array", "items": {"type": "object"}},
+            "channels": {"type": "array", "items": {"type": "object"}},
+            "limit": {"type": "integer"},
+        },
+        ["contacts"],
+    ),
+    handler=lambda args, **kw: wpp_crm_sync_preview(
+        contacts=args.get("contacts", []),
+        channels=args.get("channels", []),
+        limit=args.get("limit", 100),
+    ),
     check_fn=check_whatsapp_ops_requirements,
     emoji="📲",
 )
