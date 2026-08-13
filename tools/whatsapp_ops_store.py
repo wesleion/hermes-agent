@@ -279,6 +279,12 @@ def init_db() -> Path:
                 media_type TEXT NOT NULL,
                 media_metadata_json TEXT,
                 safety_flags_json TEXT NOT NULL,
+                transcript_text TEXT,
+                transcript_sha256 TEXT,
+                transcript_truncated INTEGER NOT NULL DEFAULT 0,
+                detected_language TEXT,
+                duration_seconds REAL,
+                model TEXT,
                 created_at TEXT NOT NULL,
                 updated_at TEXT NOT NULL
             );
@@ -315,6 +321,7 @@ def init_db() -> Path:
         _ensure_draft_columns(conn)
         _ensure_list_columns(conn)
         _ensure_contact_channel_columns(conn)
+        _ensure_media_transcription_columns(conn)
         _migrate_legacy_contact_channels(conn)
         _ensure_registration_staging_columns(conn)
         _backfill_registration_staging_metadata(conn)
@@ -356,6 +363,22 @@ def _ensure_contact_channel_columns(conn: sqlite3.Connection) -> None:
     }.items():
         if name not in columns:
             conn.execute(f"ALTER TABLE contact_channels ADD COLUMN {ddl}")
+
+
+def _ensure_media_transcription_columns(conn: sqlite3.Connection) -> None:
+    """Add private transcript fields without rebuilding or exposing old rows."""
+    columns = {row["name"] for row in conn.execute("PRAGMA table_info(media_transcriptions)")}
+    additions = {
+        "transcript_text": "transcript_text TEXT",
+        "transcript_sha256": "transcript_sha256 TEXT",
+        "transcript_truncated": "transcript_truncated INTEGER NOT NULL DEFAULT 0",
+        "detected_language": "detected_language TEXT",
+        "duration_seconds": "duration_seconds REAL",
+        "model": "model TEXT",
+    }
+    for name, ddl in additions.items():
+        if name not in columns:
+            conn.execute(f"ALTER TABLE media_transcriptions ADD COLUMN {ddl}")
 
 
 def _migrate_legacy_contact_channels(conn: sqlite3.Connection) -> None:
@@ -3684,6 +3707,228 @@ def get_media_transcription_status(event_id: str = "", limit: int = 20) -> dict[
         "count": len(rows),
         "statuses": [_media_transcription_row_to_status(row) for row in rows],
         **_transcription_safety_flags(),
+    }
+
+
+def get_inbound_transcription_eligibility(event_id: str) -> dict[str, Any]:
+    """Return sanitized local media eligibility before any acquisition occurs."""
+    init_db()
+    safe_event_id = _safe_inbound_event_id(event_id)
+    if not safe_event_id:
+        return {"ok": False, "status": "invalid_event_id", "eligible": False}
+    with _connect() as conn:
+        row = conn.execute(
+            "SELECT payload_redacted_json FROM inbound_events WHERE id=?",
+            (safe_event_id,),
+        ).fetchone()
+    if row is None:
+        return {"ok": False, "status": "not_found", "eligible": False}
+    try:
+        payload = json.loads(row["payload_redacted_json"] or "{}")
+    except json.JSONDecodeError:
+        payload = {}
+    eligible, media_type, _ = _transcribable_media_from_payload(
+        payload if isinstance(payload, dict) else {}
+    )
+    return {
+        "ok": True,
+        "status": "eligible" if eligible else "no_transcribable_media",
+        "eligible": bool(eligible),
+        "media_type": media_type,
+    }
+
+
+def persist_media_transcription(
+    *,
+    event_id: str,
+    transcript_text: str,
+    transcript_sha256: str,
+    transcript_truncated: bool,
+    detected_language: str,
+    duration_seconds: float,
+    provider: str,
+    model: str,
+) -> dict[str, Any]:
+    """Persist one bounded local transcript without returning its text."""
+    init_db()
+    safe_event_id = _safe_inbound_event_id(event_id)
+    if not safe_event_id:
+        return {"ok": False, "status": "invalid_event_id"}
+    if type(transcript_text) is not str:
+        return {"ok": False, "status": "transcript_invalid"}
+    bounded_text = transcript_text[:4_000]
+    was_truncated = bool(transcript_truncated or len(transcript_text) > 4_000)
+    actual_sha = hash_text(bounded_text)
+    if str(transcript_sha256 or "").lower() != actual_sha:
+        return {"ok": False, "status": "transcript_hash_mismatch"}
+    language = _safe_language(detected_language)
+    provider_token = _safe_short_token(provider, "local_faster_whisper")
+    model_token = _safe_short_token(model, "small")
+    try:
+        duration = float(duration_seconds)
+    except (TypeError, ValueError):
+        duration = 0.0
+    if duration < 0 or duration != duration or duration == float("inf"):
+        duration = 0.0
+    now = utc_now()
+    flags = _transcription_safety_flags()
+    flags.update(
+        {
+            "transcription_performed": True,
+            "download_performed": True,
+            "stt_provider_called": True,
+            "transcript_persisted": True,
+        }
+    )
+    with _connect() as conn:
+        event = conn.execute(
+            "SELECT payload_redacted_json FROM inbound_events WHERE id=?",
+            (safe_event_id,),
+        ).fetchone()
+        if event is None:
+            return {"ok": False, "status": "not_found"}
+        try:
+            payload = json.loads(event["payload_redacted_json"] or "{}")
+        except json.JSONDecodeError:
+            payload = {}
+        is_transcribable, media_type, media = _transcribable_media_from_payload(
+            payload if isinstance(payload, dict) else {}
+        )
+        if not is_transcribable:
+            return {"ok": False, "status": "no_transcribable_media"}
+        existing = conn.execute(
+            "SELECT id, created_at FROM media_transcriptions WHERE event_id=?",
+            (safe_event_id,),
+        ).fetchone()
+        status_id = str(existing["id"]) if existing else "transcription_" + uuid.uuid4().hex[:12]
+        created_at = str(existing["created_at"]) if existing else now
+        conn.execute(
+            """
+            INSERT INTO media_transcriptions (
+                id, event_id, status, reason, mode, language, provider,
+                media_type, media_metadata_json, safety_flags_json,
+                transcript_text, transcript_sha256, transcript_truncated,
+                detected_language, duration_seconds, model, created_at, updated_at
+            ) VALUES (?, ?, 'completed', 'completed_local', 'on_request', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            ON CONFLICT(event_id) DO UPDATE SET
+                status='completed', reason='completed_local', mode='on_request',
+                language=excluded.language, provider=excluded.provider,
+                media_type=excluded.media_type,
+                media_metadata_json=excluded.media_metadata_json,
+                safety_flags_json=excluded.safety_flags_json,
+                transcript_text=excluded.transcript_text,
+                transcript_sha256=excluded.transcript_sha256,
+                transcript_truncated=excluded.transcript_truncated,
+                detected_language=excluded.detected_language,
+                duration_seconds=excluded.duration_seconds,
+                model=excluded.model,
+                updated_at=excluded.updated_at
+            """,
+            (
+                status_id,
+                safe_event_id,
+                language,
+                provider_token,
+                media_type,
+                json.dumps(media, ensure_ascii=False, sort_keys=True),
+                json.dumps(flags, ensure_ascii=False, sort_keys=True),
+                bounded_text,
+                actual_sha,
+                int(was_truncated),
+                language,
+                duration,
+                model_token,
+                created_at,
+                now,
+            ),
+        )
+    return {
+        "ok": True,
+        "status": "completed",
+        "event_id": safe_event_id,
+        "status_id": status_id,
+        "transcript_sha256": actual_sha,
+        "transcript_chars": len(bounded_text),
+        "transcript_truncated": was_truncated,
+        "transcript_persisted": True,
+        "send_performed": False,
+        "crm_write_performed": False,
+        "provider_history_used": False,
+    }
+
+
+def get_media_transcript(event_id: str) -> dict[str, Any]:
+    """Read transcript text only for one exact internal inbound event id."""
+    init_db()
+    safe_event_id = _safe_inbound_event_id(event_id)
+    if not safe_event_id:
+        return {"ok": False, "status": "invalid_event_id", "transcript": ""}
+    with _connect() as conn:
+        row = conn.execute(
+            """
+            SELECT event_id, status, transcript_text, transcript_sha256,
+                   transcript_truncated, detected_language, duration_seconds,
+                   provider, model, updated_at
+            FROM media_transcriptions
+            WHERE event_id=? AND status='completed' AND transcript_text IS NOT NULL
+            """,
+            (safe_event_id,),
+        ).fetchone()
+    if row is None:
+        return {"ok": False, "status": "not_found", "event_id": safe_event_id, "transcript": ""}
+    return {
+        "ok": True,
+        "status": "completed",
+        "event_id": row["event_id"],
+        "transcript": str(row["transcript_text"] or ""),
+        "transcript_sha256": str(row["transcript_sha256"] or ""),
+        "transcript_truncated": bool(row["transcript_truncated"]),
+        "detected_language": str(row["detected_language"] or ""),
+        "duration_seconds": float(row["duration_seconds"] or 0.0),
+        "provider": str(row["provider"] or ""),
+        "model": str(row["model"] or ""),
+        "updated_at": row["updated_at"],
+        "explicit_read": True,
+        "local_store_only": True,
+        "retention_policy": "manual_explicit_purge",
+        "backup_contains_plaintext_transcript": True,
+    }
+
+
+def purge_media_transcript(event_id: str) -> dict[str, Any]:
+    """Explicitly purge transcript content while retaining sanitized audit status."""
+    init_db()
+    safe_event_id = _safe_inbound_event_id(event_id)
+    if not safe_event_id:
+        return {"ok": False, "status": "invalid_event_id", "purged": False}
+    now = utc_now()
+    with _connect() as conn:
+        row = conn.execute(
+            "SELECT id, transcript_text FROM media_transcriptions WHERE event_id=?",
+            (safe_event_id,),
+        ).fetchone()
+        if row is None:
+            return {"ok": False, "status": "not_found", "purged": False}
+        had_transcript = row["transcript_text"] is not None
+        flags = _transcription_safety_flags()
+        conn.execute(
+            """
+            UPDATE media_transcriptions
+            SET status='purged', reason='explicit_purge',
+                transcript_text=NULL, transcript_sha256=NULL,
+                transcript_truncated=0, detected_language=NULL,
+                duration_seconds=NULL, model=NULL,
+                safety_flags_json=?, updated_at=?
+            WHERE event_id=?
+            """,
+            (json.dumps(flags, ensure_ascii=False, sort_keys=True), now, safe_event_id),
+        )
+    return {
+        "ok": True,
+        "status": "purged",
+        "event_id": safe_event_id,
+        "purged": bool(had_transcript),
+        "retention_policy": "manual_explicit_purge",
     }
 
 

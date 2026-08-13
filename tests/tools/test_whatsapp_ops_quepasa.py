@@ -1,7 +1,10 @@
 import io
 import json
+import urllib.error
 from email.message import Message
 from unittest.mock import patch
+
+import pytest
 
 
 class _FakeResponse:
@@ -70,6 +73,90 @@ def test_quepasa_client_fails_closed_without_api_key(monkeypatch):
 
     assert result == {"ok": False, "error": "quepasa_api_key_missing"}
     urlopen.assert_not_called()
+
+
+def test_quepasa_download_uses_exact_endpoint_header_and_cap(monkeypatch):
+    from tools.whatsapp_ops_quepasa import download_media_via_quepasa
+
+    monkeypatch.setenv(
+        "WHATSAPP_OPS_QUEPASA_SEND_URL", "https://quepasa.example.invalid/send"
+    )
+    monkeypatch.setenv("WHATSAPP_OPS_QUEPASA_API_KEY", "secret-token")
+    captured = {}
+
+    class Response:
+        status = 200
+        headers = {"Content-Type": "audio/ogg"}
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_args):
+            return False
+
+        def read(self, size):
+            captured["read_size"] = size
+            return b"OggSsynthetic"
+
+    def fake_urlopen(req, timeout):
+        captured["req"] = req
+        captured["timeout"] = timeout
+        return Response()
+
+    with patch("urllib.request.urlopen", fake_urlopen):
+        data, content_type = download_media_via_quepasa(
+            "provider-synthetic-id", max_bytes=1024
+        )
+
+    assert data == b"OggSsynthetic"
+    assert content_type == "audio/ogg"
+    assert captured["timeout"] == 30
+    assert captured["read_size"] == 1025
+    assert captured["req"].get_method() == "GET"
+    assert (
+        captured["req"].full_url
+        == "https://quepasa.example.invalid/download?messageid=provider-synthetic-id&cache=false"
+    )
+    assert captured["req"].get_header("X-quepasa-token") == "secret-token"
+
+
+def test_quepasa_download_errors_are_sanitized_and_size_is_bounded(monkeypatch):
+    from tools.whatsapp_ops_quepasa import download_media_via_quepasa
+
+    monkeypatch.setenv(
+        "WHATSAPP_OPS_QUEPASA_SEND_URL", "https://private.example.invalid/send"
+    )
+    monkeypatch.setenv("WHATSAPP_OPS_QUEPASA_API_KEY", "private-secret-token")
+
+    with patch(
+        "urllib.request.urlopen",
+        side_effect=urllib.error.URLError(
+            "private-secret-token https://private.example.invalid provider-private-id"
+        ),
+    ):
+        with pytest.raises(RuntimeError) as error:
+            download_media_via_quepasa("provider-private-id", max_bytes=10)
+
+    serialized = str(error.value)
+    assert serialized == "quepasa_download_error"
+    assert "private" not in serialized
+
+    class Oversized:
+        status = 200
+        headers = {"Content-Type": "audio/ogg"}
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_args):
+            return False
+
+        def read(self, size):
+            return b"x" * size
+
+    with patch("urllib.request.urlopen", return_value=Oversized()):
+        with pytest.raises(ValueError, match="quepasa_download_too_large"):
+            download_media_via_quepasa("provider-private-id", max_bytes=10)
 
 
 def test_quepasa_presence_fails_closed_when_send_disabled():

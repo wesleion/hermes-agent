@@ -34,6 +34,7 @@ from tools.whatsapp_ops_store import (
     get_conversation_summary,
     get_inbound_burst_status,
     get_media_transcription_status,
+    get_media_transcript,
     get_thread_context,
     get_transport_contact_ref,
     get_transport_group_ref,
@@ -1774,6 +1775,11 @@ def wpp_media_transcription_status(event_id: str = "", limit: int = 20) -> str:
     return _json(get_media_transcription_status(event_id=str(event_id or ""), limit=limit))
 
 
+def wpp_read_media_transcript(event_id: str) -> str:
+    """Explicitly read one local transcript by exact internal event id."""
+    return _json(get_media_transcript(str(event_id or "")))
+
+
 def wpp_cockpit_overview(limit: int = 10) -> str:
     cfg = _runtime_config()
     overview = get_cockpit_overview(limit=limit)
@@ -2628,6 +2634,20 @@ registry.register(
     handler=lambda args, **kw: wpp_media_transcription_status(
         event_id=args.get("event_id", ""), limit=args.get("limit", 20)
     ),
+    check_fn=check_whatsapp_ops_requirements,
+    emoji="📲",
+)
+
+registry.register(
+    name="wpp_read_media_transcript",
+    toolset=TOOLSET,
+    schema=_schema(
+        "wpp_read_media_transcript",
+        "Explicitly read the locally persisted transcript for one exact internal inbound_* event id. This is the only transcript-content read surface; generic status, queue, cockpit, and list tools never return transcript text.",
+        {"event_id": {"type": "string"}},
+        ["event_id"],
+    ),
+    handler=lambda args, **kw: wpp_read_media_transcript(args.get("event_id", "")),
     check_fn=check_whatsapp_ops_requirements,
     emoji="📲",
 )

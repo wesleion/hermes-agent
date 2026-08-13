@@ -56,6 +56,29 @@ def _normalize_group_create_url(raw_url: str) -> str:
     return _normalize_endpoint_url(raw_url, "/groups/create")
 
 
+def _normalize_download_url(raw_url: str, message_id: str) -> str:
+    """Resolve the binary `/download` endpoint without leaking query values."""
+    raw_url = str(raw_url or "").strip()
+    parsed = urllib.parse.urlsplit(raw_url)
+    if parsed.scheme not in {"http", "https"} or not parsed.netloc:
+        return ""
+    path = parsed.path.rstrip("/")
+    for suffix in (
+        "/swagger/index.html",
+        "/swagger/doc.json",
+        "/swagger",
+        "/senddocument",
+        "/send",
+        "/download",
+    ):
+        if path.endswith(suffix):
+            path = path[: -len(suffix)]
+            break
+    endpoint = f"{path}/download" if path else "/download"
+    query = urllib.parse.urlencode({"messageid": str(message_id), "cache": "false"})
+    return urllib.parse.urlunsplit((parsed.scheme, parsed.netloc, endpoint, query, ""))
+
+
 def _normalize_document_send_url(raw_url: str) -> str:
     return _normalize_endpoint_url(raw_url, "/senddocument")
 
@@ -540,6 +563,45 @@ def _quepasa_base_url(config: dict[str, Any]) -> str:
 
 def _quepasa_api_key() -> str:
     return os.getenv("WHATSAPP_OPS_QUEPASA_API_KEY", "")
+
+
+def download_media_via_quepasa(
+    provider_message_id: str, *, max_bytes: int = 25 * 1024 * 1024
+) -> tuple[bytes, str]:
+    """Download one inbound media blob with a hard cap and sanitized failures."""
+    message_id = str(provider_message_id or "").strip()
+    if not message_id:
+        raise ValueError("provider_message_id_missing")
+    try:
+        cap = max(1, min(int(max_bytes), 25 * 1024 * 1024))
+    except (TypeError, ValueError):
+        cap = 25 * 1024 * 1024
+    raw_url = _quepasa_base_url({})
+    api_key = _quepasa_api_key()
+    download_url = _normalize_download_url(raw_url, message_id)
+    if not download_url or not api_key:
+        raise RuntimeError("quepasa_download_not_configured")
+    request = urllib.request.Request(
+        download_url,
+        headers={
+            "Accept": "application/octet-stream",
+            "X-QUEPASA-TOKEN": api_key,
+        },
+        method="GET",
+    )
+    try:
+        with urllib.request.urlopen(request, timeout=30) as response:
+            content_type = str(response.headers.get("Content-Type") or "")[:120]
+            data = response.read(cap + 1)
+    except urllib.error.HTTPError as exc:
+        raise RuntimeError(f"quepasa_download_http_{int(exc.code)}") from None
+    except Exception as exc:
+        raise RuntimeError("quepasa_download_error") from exc
+    if len(data) > cap:
+        raise ValueError("quepasa_download_too_large")
+    if not data:
+        raise ValueError("quepasa_download_empty")
+    return data, content_type
 
 
 def send_presence_via_quepasa(payload: dict[str, Any], config: dict[str, Any]) -> dict[str, Any]:

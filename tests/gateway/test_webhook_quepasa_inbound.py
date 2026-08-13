@@ -13,6 +13,7 @@ import json
 import os
 from types import SimpleNamespace
 from unittest.mock import AsyncMock
+from unittest.mock import Mock
 
 import pytest
 from aiohttp import web
@@ -159,6 +160,76 @@ async def test_quepasa_inbound_route_ingests_without_agent_or_delivery(tmp_path,
     assert "synthetic-secret-that-must-not-leak" not in serialized
     assert "s.whatsapp.net" not in serialized
     assert "<redacted>" in serialized
+
+
+async def test_quepasa_inbound_default_does_not_run_stt_pipeline(tmp_path, monkeypatch):
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    import tools.whatsapp_ops_stt as stt
+
+    pipeline = Mock(side_effect=AssertionError("default route must not run STT"))
+    monkeypatch.setattr(stt, "run_inbound_stt_pipeline", pipeline)
+    adapter = _make_adapter()
+    body_payload = _payload("msg_default_no_stt")
+    body_payload["type"] = "audio"
+    body_payload["message"] = {"audioMessage": {"mimetype": "audio/ogg"}}
+    body = json.dumps(body_payload).encode()
+
+    status, data = await _post(adapter, body_payload, signature=_signature(body))
+
+    assert status == 200
+    assert data["status"] == "ingested"
+    assert "stt" not in data
+    pipeline.assert_not_called()
+    adapter.handle_message.assert_not_called()
+    adapter._direct_deliver.assert_not_called()
+
+
+async def test_quepasa_inbound_opt_in_runs_receive_only_stt_after_ingest(tmp_path, monkeypatch):
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    import tools.whatsapp_ops_stt as stt
+
+    pipeline = Mock(
+        return_value={
+            "ok": True,
+            "status": "completed",
+            "transcript_persisted": True,
+            "send_performed": False,
+            "crm_write_performed": False,
+        }
+    )
+    monkeypatch.setattr(stt, "run_inbound_stt_pipeline", pipeline)
+    adapter = _make_adapter(
+        routes={
+            ROUTE: {
+                "kind": "quepasa_inbound",
+                "events": [],
+                "secret": SECRET,
+                "stt": {
+                    "enabled": True,
+                    "model_path": str(tmp_path / "model-small"),
+                    "language": "pt",
+                },
+            }
+        }
+    )
+    body_payload = _payload("msg_opt_in_stt")
+    body_payload["type"] = "audio"
+    body_payload["message"] = {"audioMessage": {"mimetype": "audio/ogg"}}
+    body = json.dumps(body_payload).encode()
+
+    status, data = await _post(adapter, body_payload, signature=_signature(body))
+
+    assert status == 200
+    assert data["status"] == "ingested"
+    assert data["stt"] == {"status": "completed", "transcript_persisted": True}
+    pipeline.assert_called_once()
+    call = pipeline.call_args.kwargs
+    assert call["event_id"] == data["event_id"]
+    assert call["provider_message_id"] == "msg_opt_in_stt"
+    assert call["enabled"] is True
+    assert call["language"] == "pt"
+    adapter.handle_message.assert_not_called()
+    adapter._direct_deliver.assert_not_called()
 
 
 async def test_quepasa_inbound_route_dedupes_persistently(tmp_path, monkeypatch):

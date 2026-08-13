@@ -834,7 +834,9 @@ class WebhookAdapter(BasePlatformAdapter):
         # transport or LLM run by themselves.
         if self._is_quepasa_inbound_route(route_config):
             with self._request_profile_scope(profile):
-                return await self._handle_quepasa_inbound(route_name, payload)
+                return await self._handle_quepasa_inbound(
+                    route_name, payload, route_config=route_config
+                )
 
         # Check event type filter
         event_type = (
@@ -1175,6 +1177,7 @@ class WebhookAdapter(BasePlatformAdapter):
         self,
         route_name: str,
         payload: dict,
+        route_config: Optional[dict] = None,
     ) -> "web.Response":
         """Persist a sanitized QuePasa inbound payload without agent dispatch.
 
@@ -1212,21 +1215,56 @@ class WebhookAdapter(BasePlatformAdapter):
         deduped = bool(result.get("deduped"))
         status_text = "duplicate" if deduped else "ingested"
         event_id = str(result.get("event_id") or "")
+        public_stt: dict[str, Any] | None = None
+        stt_config = (
+            route_config.get("stt")
+            if isinstance(route_config, dict) and isinstance(route_config.get("stt"), dict)
+            else {}
+        )
+        if not deduped and stt_config.get("enabled") is True:
+            try:
+                from tools.whatsapp_ops_stt import (
+                    provider_message_id_from_payload,
+                    run_inbound_stt_pipeline,
+                )
+
+                stt_result = await asyncio.to_thread(
+                    run_inbound_stt_pipeline,
+                    event_id=event_id,
+                    provider_message_id=provider_message_id_from_payload(payload),
+                    enabled=True,
+                    model_path=str(stt_config.get("model_path") or ""),
+                    model_name=str(stt_config.get("model") or "small"),
+                    language=str(stt_config.get("language") or "pt"),
+                )
+                public_stt = {
+                    "status": str(stt_result.get("status") or "error")[:64],
+                    "transcript_persisted": bool(
+                        stt_result.get("transcript_persisted")
+                    ),
+                }
+            except Exception:
+                logger.error(
+                    "[webhook] QuePasa receive-only STT failed route=%s event_id=%s",
+                    route_name,
+                    event_id,
+                )
+                public_stt = {"status": "error", "transcript_persisted": False}
         logger.info(
             "[webhook] QuePasa inbound %s route=%s event_id=%s",
             status_text,
             route_name,
             event_id,
         )
-        return web.json_response(
-            {
-                "status": status_text,
-                "route": route_name,
-                "event_id": event_id,
-                "deduped": deduped,
-            },
-            status=200,
-        )
+        response = {
+            "status": status_text,
+            "route": route_name,
+            "event_id": event_id,
+            "deduped": deduped,
+        }
+        if public_stt is not None:
+            response["stt"] = public_stt
+        return web.json_response(response, status=200)
 
     # ------------------------------------------------------------------
     # Signature validation
