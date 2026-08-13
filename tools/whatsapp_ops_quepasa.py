@@ -1,0 +1,663 @@
+"""Fail-closed direct QuePasa client for WhatsApp Ops.
+
+This module speaks QuePasa's native ``POST /send`` API.  It intentionally
+returns structured refusals and performs no network I/O unless both the profile
+transport flag and deterministic send guardrails have allowed the send.
+"""
+
+from __future__ import annotations
+
+import hashlib
+import json
+import os
+import urllib.error
+import urllib.parse
+import urllib.request
+from typing import Any
+
+
+def _truthy(value: Any) -> bool:
+    if isinstance(value, str):
+        return value.strip().lower() in {"1", "true", "yes", "on"}
+    return bool(value)
+
+
+def _redact_error(text: str) -> str:
+    redacted = str(text or "")
+    for key in ("token", "api_key", "apikey", "authorization", "secret", "x-quepasa-token"):
+        redacted = redacted.replace(key, "[redacted]").replace(key.upper(), "[redacted]")
+    return redacted[:240]
+
+
+def _normalize_endpoint_url(raw_url: str, endpoint: str) -> str:
+    raw_url = str(raw_url or "").strip()
+    endpoint = "/" + str(endpoint or "").strip("/")
+    if not raw_url or endpoint == "/":
+        return ""
+    parsed = urllib.parse.urlsplit(raw_url)
+    if parsed.scheme not in {"http", "https"} or not parsed.netloc:
+        return ""
+
+    path = parsed.path.rstrip("/")
+    if path in {"", "/swagger/index.html", "/swagger/doc.json", "/swagger"}:
+        normalized_path = endpoint
+    elif path == endpoint or path.endswith(endpoint):
+        normalized_path = path
+    else:
+        normalized_path = f"{path}{endpoint}"
+    return urllib.parse.urlunsplit((parsed.scheme, parsed.netloc, normalized_path, "", ""))
+
+
+def _normalize_send_url(raw_url: str) -> str:
+    return _normalize_endpoint_url(raw_url, "/send")
+
+
+def _normalize_group_create_url(raw_url: str) -> str:
+    return _normalize_endpoint_url(raw_url, "/groups/create")
+
+
+def _normalize_document_send_url(raw_url: str) -> str:
+    return _normalize_endpoint_url(raw_url, "/senddocument")
+
+
+def _normalize_presence_url(raw_url: str) -> str:
+    """Resolve `/chat/presence` from either a QuePasa base or send endpoint."""
+    raw_url = str(raw_url or "").strip()
+    parsed = urllib.parse.urlsplit(raw_url)
+    if parsed.scheme not in {"http", "https"} or not parsed.netloc:
+        return ""
+    path = parsed.path.rstrip("/")
+    for suffix in ("/swagger/index.html", "/swagger/doc.json", "/swagger", "/senddocument", "/send"):
+        if path.endswith(suffix):
+            path = path[: -len(suffix)]
+            break
+    normalized_path = f"{path}/chat/presence" if path else "/chat/presence"
+    return urllib.parse.urlunsplit((parsed.scheme, parsed.netloc, normalized_path, "", ""))
+
+
+def _normalize_swagger_doc_url(raw_url: str) -> str:
+    raw_url = str(raw_url or "").strip()
+    parsed = urllib.parse.urlsplit(raw_url)
+    if parsed.scheme not in {"http", "https"} or not parsed.netloc:
+        return ""
+    return urllib.parse.urlunsplit((parsed.scheme, parsed.netloc, "/swagger/doc.json", "", ""))
+
+
+def _safe_int(value: Any, default: int, minimum: int, maximum: int) -> int:
+    try:
+        parsed = int(value)
+    except (TypeError, ValueError):
+        parsed = default
+    return max(minimum, min(parsed, maximum))
+
+
+def _history_config(config: dict[str, Any]) -> dict[str, Any]:
+    raw = (config or {}).get("provider_history")
+    cfg = raw if isinstance(raw, dict) else {}
+    return {
+        "enabled": _truthy(cfg.get("enabled", False)),
+        "max_messages": _safe_int(cfg.get("max_messages", 250), 250, 1, 500),
+        "max_pages": _safe_int(cfg.get("max_pages", 3), 3, 1, 10),
+    }
+
+
+def _history_safety() -> dict[str, Any]:
+    return {
+        "read_only": True,
+        "send_performed": False,
+        "summary_persisted": False,
+        "draft_created": False,
+        "crm_write_performed": False,
+        "llm_used": False,
+        "sends_messages": False,
+        "writes_local_store": False,
+        "exposes_raw_refs": False,
+    }
+
+
+def _history_target(thread: str = "", contact: str = "") -> dict[str, Any]:
+    thread_value = str(thread or "").strip()
+    contact_value = str(contact or "").strip()
+    target: dict[str, Any] = {
+        "thread_filter_set": bool(thread_value),
+        "contact_filter_set": bool(contact_value),
+    }
+    if thread_value:
+        target["thread_ref_hash"] = _hash_ref(thread_value)
+    if contact_value:
+        target["contact_ref_hash"] = _hash_ref(contact_value)
+    return target
+
+
+def _history_base_result(
+    *,
+    thread: str = "",
+    contact: str = "",
+    limit: int = 100,
+    pages: int = 1,
+    cfg: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    history_cfg = cfg or {"max_messages": 250, "max_pages": 3}
+    return {
+        "ok": False,
+        "transport": "quepasa_direct_history",
+        "provider": "quepasa",
+        "provider_history_used": False,
+        "target": _history_target(thread=thread, contact=contact),
+        "request_limits": {
+            "limit": min(_safe_int(limit, 100, 1, 500), int(history_cfg.get("max_messages", 250))),
+            "pages": min(_safe_int(pages, 1, 1, 10), int(history_cfg.get("max_pages", 3))),
+        },
+        **_history_safety(),
+    }
+
+
+def _parse_swagger_paths(body: bytes) -> dict[str, Any]:
+    parsed = _parse_json_body(body)
+    paths = parsed.get("paths") if isinstance(parsed, dict) else None
+    return paths if isinstance(paths, dict) else {}
+
+
+def _history_capabilities_from_paths(paths: dict[str, Any]) -> dict[str, Any]:
+    history_candidates: list[str] = []
+    single_message_lookup_supported = False
+    for path, methods in sorted(paths.items()):
+        methods_dict = methods if isinstance(methods, dict) else {}
+        lower_path = str(path).lower()
+        method_names = {str(method).lower() for method in methods_dict.keys()}
+        if lower_path == "/message/{messageid}" and "get" in method_names:
+            single_message_lookup_supported = True
+        if "get" not in method_names:
+            continue
+        if any(term in lower_path for term in ("history", "messages", "chat/history", "chats/history")):
+            if lower_path != "/message/{messageid}":
+                history_candidates.append(str(path))
+    return {
+        "swagger_checked": True,
+        "endpoint_count": len(paths),
+        "history_list_supported": bool(history_candidates),
+        "history_candidate_paths": history_candidates[:10],
+        "single_message_lookup_supported": single_message_lookup_supported,
+        "download_supported": "/download" in paths,
+        "contacts_supported": "/contacts" in paths,
+    }
+
+
+def quepasa_history_capabilities(config: dict[str, Any]) -> dict[str, Any]:
+    raw_url = _quepasa_base_url(config)
+    swagger_url = _normalize_swagger_doc_url(raw_url)
+    result = {
+        "ok": False,
+        "transport": "quepasa_direct_history",
+        "provider": "quepasa",
+        "base_url_configured": bool(raw_url),
+        **_history_safety(),
+    }
+    if not swagger_url:
+        return {**result, "error": "quepasa_swagger_url_missing", "capabilities": {"swagger_checked": False}}
+    req = urllib.request.Request(swagger_url, headers={"Accept": "application/json"}, method="GET")
+    try:
+        with urllib.request.urlopen(req, timeout=10) as resp:
+            paths = _parse_swagger_paths(resp.read(2_000_000))
+            status = int(getattr(resp, "status", 200) or 200)
+    except urllib.error.HTTPError as exc:
+        return {**result, "error": "quepasa_swagger_http_error", "status": int(exc.code), "capabilities": {"swagger_checked": False}}
+    except Exception as exc:  # pragma: no cover - defensive transport stack
+        return {**result, "error": _redact_error(str(exc)), "capabilities": {"swagger_checked": False}}
+    capabilities = _history_capabilities_from_paths(paths)
+    return {**result, "ok": True, "status": status, "capabilities": capabilities}
+
+
+def pull_history_via_quepasa(
+    thread: str = "",
+    contact: str = "",
+    limit: int = 100,
+    pages: int = 1,
+    window_days: int = 0,
+    mode: str = "summary",
+    config: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    """Attempt a read-only provider-history pull through QuePasa.
+
+    QuePasa currently exposes single-message lookup in the live Swagger but no
+    paginated chat-history/list endpoint. This adapter therefore gates capability
+    discovery separately from history use: when unsupported, it returns a safe
+    refusal and leaves ``provider_history_used=false``.
+    """
+    cfg = _history_config(config or {})
+    result = _history_base_result(thread=thread, contact=contact, limit=limit, pages=pages, cfg=cfg)
+    result["window_days"] = _safe_int(window_days, 0, 0, 365)
+    result["mode"] = str(mode or "summary").strip().lower()[:40] or "summary"
+    if not cfg.get("enabled"):
+        return {**result, "error": "provider_history_disabled"}
+    raw_url = _quepasa_base_url(config or {})
+    if not raw_url:
+        return {**result, "error": "provider_history_url_missing"}
+    if not _quepasa_api_key():
+        return {**result, "error": "provider_history_api_key_missing"}
+
+    capabilities_result = quepasa_history_capabilities(config or {})
+    capabilities = capabilities_result.get("capabilities") if isinstance(capabilities_result, dict) else {}
+    result["capabilities"] = capabilities if isinstance(capabilities, dict) else {}
+    result["provider_capability_checked"] = bool(result["capabilities"].get("swagger_checked"))
+    if not capabilities_result.get("ok"):
+        return {**result, "error": capabilities_result.get("error") or "provider_history_capability_check_failed"}
+    if not result["capabilities"].get("history_list_supported"):
+        return {
+            **result,
+            "error": "provider_history_unsupported",
+            "blocked_reason": "quepasa_history_list_endpoint_missing",
+        }
+
+    return {
+        **result,
+        "error": "provider_history_adapter_not_implemented_for_detected_endpoint",
+        "blocked_reason": "safe_pagination_mapping_required",
+    }
+
+
+def _target_chat_id(target: dict[str, Any]) -> str:
+    if not isinstance(target, dict):
+        return ""
+    target_type = target.get("type")
+    if target_type == "contact":
+        return str(target.get("contact_id") or "").strip()
+    if target_type == "group":
+        return str(target.get("group_id") or "").strip()
+    if target_type == "list":
+        return str(target.get("list_id") or "").strip()
+    return ""
+
+
+def _safe_success_message(message: Any) -> dict[str, Any]:
+    if not isinstance(message, dict):
+        return {}
+    safe: dict[str, Any] = {}
+    for source, dest in (
+        ("id", "message_id_hash"),
+        ("chatId", "chat_ref_hash"),
+        ("wid", "wid_hash"),
+        ("trackId", "track_id_hash"),
+    ):
+        value = message.get(source)
+        hashed = _hash_ref(value)
+        if hashed:
+            safe[dest] = hashed
+    return safe
+
+
+def _hash_ref(value: Any) -> str:
+    raw = str(value or "").strip()
+    return hashlib.sha256(raw.encode("utf-8")).hexdigest()[:16] if raw else ""
+
+
+def _safe_groupinfo(value: Any) -> dict[str, Any]:
+    if not isinstance(value, dict):
+        return {}
+    raw_ref = (
+        value.get("id")
+        or value.get("jid")
+        or value.get("JID")
+        or value.get("group_jid")
+        or value.get("chatId")
+    )
+    safe: dict[str, Any] = {}
+    hashed = _hash_ref(raw_ref)
+    if hashed:
+        safe["group_ref_hash"] = hashed
+    if value.get("Name") or value.get("name") or value.get("title"):
+        safe["name_present"] = True
+    return safe
+
+
+def _parse_json_body(body: bytes) -> dict[str, Any]:
+    if not body:
+        return {}
+    try:
+        parsed = json.loads(body.decode("utf-8", errors="replace"))
+    except json.JSONDecodeError:
+        return {}
+    return parsed if isinstance(parsed, dict) else {}
+
+
+def _media_payload_fields(media: Any) -> tuple[dict[str, Any] | None, str | None]:
+    if not media:
+        return None, None
+    if not isinstance(media, dict):
+        return None, "media_invalid"
+    url = str(media.get("url") or "").strip()
+    content = str(media.get("content") or "").strip()
+    if bool(url) == bool(content):
+        return None, "media_requires_exactly_one_source"
+    fields: dict[str, Any] = {}
+    if url:
+        parsed = urllib.parse.urlsplit(url)
+        if parsed.scheme not in {"http", "https"} or not parsed.netloc:
+            return None, "media_url_invalid"
+        fields["url"] = url
+    if content:
+        if not content.lower().startswith("data:") or ";base64," not in content[:120].lower():
+            return None, "media_content_invalid"
+        fields["content"] = content
+    filename = str(media.get("filename") or media.get("fileName") or "").strip()
+    if filename:
+        fields["fileName"] = filename[:160]
+    return fields, None
+
+
+def _post_message(send_url: str, api_key: str, chat_id: str, text: str, media: Any = None) -> dict[str, Any]:
+    body_data: dict[str, Any] = {"chatId": chat_id}
+    if text:
+        body_data["text"] = text
+    media_fields, media_error = _media_payload_fields(media)
+    if media_error:
+        return {"ok": False, "transport": "quepasa_direct", "error": media_error}
+    if media_fields:
+        body_data.update(media_fields)
+    if not body_data.get("text") and not media_fields:
+        return {"ok": False, "transport": "quepasa_direct", "error": "payload_invalid"}
+    body = json.dumps(body_data, ensure_ascii=False).encode("utf-8")
+    headers = {
+        "Content-Type": "application/json",
+        "X-QUEPASA-TOKEN": api_key,
+    }
+    req = urllib.request.Request(send_url, data=body, headers=headers, method="POST")
+    try:
+        with urllib.request.urlopen(req, timeout=15) as resp:
+            parsed = _parse_json_body(resp.read(4096))
+            status = int(getattr(resp, "status", 200) or 200)
+    except urllib.error.HTTPError as exc:
+        return {
+            "ok": False,
+            "transport": "quepasa_direct",
+            "error": "http_error",
+            "status": int(exc.code),
+        }
+    except Exception as exc:  # pragma: no cover - defensive against transport stack
+        return {"ok": False, "transport": "quepasa_direct", "error": _redact_error(str(exc))}
+
+    if parsed.get("success") is not True:
+        return {
+            "ok": False,
+            "transport": "quepasa_direct",
+            "error": "quepasa_success_false",
+            "status": status,
+            "provider_status": str(parsed.get("status") or "")[:120],
+        }
+
+    safe_message = _safe_success_message(parsed.get("message"))
+    return {
+        "ok": True,
+        "transport": "quepasa_direct",
+        "status": status,
+        "provider_status": str(parsed.get("status") or "")[:120],
+        "media_sent": bool(media_fields),
+        **safe_message,
+    }
+
+
+def _post_text(send_url: str, api_key: str, chat_id: str, text: str) -> dict[str, Any]:
+    return _post_message(send_url, api_key, chat_id, text)
+
+
+def _post_presence(
+    presence_url: str,
+    api_key: str,
+    chat_id: str,
+    presence_type: str,
+    duration_ms: int,
+) -> dict[str, Any]:
+    body = json.dumps(
+        {"chatid": chat_id, "type": presence_type, "duration": duration_ms},
+        ensure_ascii=False,
+    ).encode("utf-8")
+    req = urllib.request.Request(
+        presence_url,
+        data=body,
+        headers={"Content-Type": "application/json", "X-QUEPASA-TOKEN": api_key},
+        method="POST",
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=15) as resp:
+            parsed = _parse_json_body(resp.read(4096))
+            status = int(getattr(resp, "status", 200) or 200)
+    except urllib.error.HTTPError as exc:
+        return {
+            "ok": False,
+            "transport": "quepasa_direct_presence",
+            "error": "http_error",
+            "status": int(exc.code),
+        }
+    except Exception:  # pragma: no cover - defensive transport boundary
+        return {
+            "ok": False,
+            "transport": "quepasa_direct_presence",
+            "error": "transport_error",
+        }
+
+    if parsed.get("success") is not True:
+        return {
+            "ok": False,
+            "transport": "quepasa_direct_presence",
+            "error": "quepasa_success_false",
+            "status": status,
+        }
+    raw_status = str(parsed.get("status") or "").strip().lower()
+    safe_status = raw_status if raw_status in {"ok", "sent", "success", "presence-set", "presence_set"} else "ok"
+    return {
+        "ok": True,
+        "transport": "quepasa_direct_presence",
+        "status": status,
+        "provider_status": safe_status,
+    }
+
+
+def _resolve_lid_participant(raw_url: str, api_key: str, participant: str) -> str:
+    """Resolve a QuePasa LID JID to the phone string accepted by /groups/create.
+
+    The returned phone is used only in the provider payload and is never exposed
+    in tool output. Empty string means fail closed.
+    """
+    value = str(participant or "").strip()
+    if not value.endswith("@lid"):
+        return value
+    useridentifier_url = _normalize_endpoint_url(raw_url, "/useridentifier")
+    if not useridentifier_url:
+        return ""
+    url = useridentifier_url + "?" + urllib.parse.urlencode({"lid": value})
+    req = urllib.request.Request(url, headers={"X-QUEPASA-TOKEN": api_key}, method="GET")
+    try:
+        with urllib.request.urlopen(req, timeout=15) as resp:
+            parsed = _parse_json_body(resp.read(4096))
+    except Exception:
+        return ""
+    if parsed.get("success") is not True:
+        return ""
+    phone = str(parsed.get("phone") or "").strip()
+    return phone
+
+
+def _normalize_group_participants(raw_url: str, api_key: str, participants: list[str]) -> list[str] | None:
+    normalized: list[str] = []
+    for participant in participants:
+        resolved = _resolve_lid_participant(raw_url, api_key, str(participant).strip())
+        if not resolved:
+            return None
+        normalized.append(resolved)
+    return normalized
+
+
+def _post_group_create(group_url: str, api_key: str, title: str, participants: list[str]) -> dict[str, Any]:
+    body = json.dumps({"title": title, "participants": participants}, ensure_ascii=False).encode("utf-8")
+    headers = {
+        "Content-Type": "application/json",
+        "X-QUEPASA-TOKEN": api_key,
+    }
+    req = urllib.request.Request(group_url, data=body, headers=headers, method="POST")
+    try:
+        with urllib.request.urlopen(req, timeout=20) as resp:
+            parsed = _parse_json_body(resp.read(8192))
+            status = int(getattr(resp, "status", 200) or 200)
+    except urllib.error.HTTPError as exc:
+        return {
+            "ok": False,
+            "transport": "quepasa_direct_group_create",
+            "error": "http_error",
+            "status": int(exc.code),
+        }
+    except Exception as exc:  # pragma: no cover - defensive against transport stack
+        return {"ok": False, "transport": "quepasa_direct_group_create", "error": _redact_error(str(exc))}
+
+    if parsed.get("success") is not True:
+        return {
+            "ok": False,
+            "transport": "quepasa_direct_group_create",
+            "error": "quepasa_success_false",
+            "status": status,
+            "provider_status": str(parsed.get("status") or "")[:120],
+        }
+
+    return {
+        "ok": True,
+        "transport": "quepasa_direct_group_create",
+        "status": status,
+        "provider_status": str(parsed.get("status") or "")[:120],
+        "participant_count": len(participants),
+        **_safe_groupinfo(parsed.get("groupinfo")),
+    }
+
+
+def _quepasa_base_url(config: dict[str, Any]) -> str:
+    quepasa_raw = (config or {}).get("quepasa")
+    quepasa = quepasa_raw if isinstance(quepasa_raw, dict) else {}
+    return str(
+        quepasa.get("send_url")
+        or quepasa.get("base_url")
+        or os.getenv("WHATSAPP_OPS_QUEPASA_SEND_URL", "")
+        or ""
+    )
+
+
+def _quepasa_api_key() -> str:
+    return os.getenv("WHATSAPP_OPS_QUEPASA_API_KEY", "")
+
+
+def send_presence_via_quepasa(payload: dict[str, Any], config: dict[str, Any]) -> dict[str, Any]:
+    """Best-effort typing/presence call; never exposes target or provider body."""
+    quepasa_raw = (config or {}).get("quepasa")
+    quepasa = quepasa_raw if isinstance(quepasa_raw, dict) else {}
+    if not _truthy(quepasa.get("send_enabled", False)):
+        return {"ok": False, "error": "quepasa_send_disabled"}
+
+    presence_url = _normalize_presence_url(_quepasa_base_url(config))
+    if not presence_url:
+        return {"ok": False, "error": "quepasa_presence_url_missing"}
+    api_key = _quepasa_api_key()
+    if not api_key:
+        return {"ok": False, "error": "quepasa_api_key_missing"}
+
+    targets = (payload or {}).get("targets") or []
+    if not isinstance(targets, list) or not targets:
+        return {"ok": False, "error": "payload_invalid"}
+    presence_type = str((payload or {}).get("presence_type") or "text").strip().lower()
+    if presence_type not in {"text", "audio", "paused"}:
+        return {"ok": False, "error": "presence_type_invalid"}
+    duration_ms = _safe_int((payload or {}).get("duration_ms"), 1000, 100, 60_000)
+
+    results: list[dict[str, Any]] = []
+    for target in targets:
+        chat_id = _target_chat_id(target)
+        if not chat_id:
+            return {"ok": False, "error": "target_invalid"}
+        result = _post_presence(presence_url, api_key, chat_id, presence_type, duration_ms)
+        results.append(result)
+        if not result.get("ok"):
+            return result
+    if len(results) == 1:
+        return results[0]
+    return {
+        "ok": True,
+        "transport": "quepasa_direct_presence",
+        "presence_count": len(results),
+    }
+
+
+def send_via_quepasa(payload: dict[str, Any], config: dict[str, Any]) -> dict[str, Any]:
+    quepasa_raw = (config or {}).get("quepasa")
+    quepasa = quepasa_raw if isinstance(quepasa_raw, dict) else {}
+    if not _truthy(quepasa.get("send_enabled", False)):
+        return {"ok": False, "error": "quepasa_send_disabled"}
+
+    raw_url = _quepasa_base_url(config)
+    media = (payload or {}).get("media") if isinstance(payload, dict) else None
+    as_document = bool(isinstance(media, dict) and media.get("as_document"))
+    send_url = (
+        _normalize_document_send_url(str(raw_url or ""))
+        if as_document
+        else _normalize_send_url(str(raw_url or ""))
+    )
+    if not send_url:
+        return {"ok": False, "error": "quepasa_send_url_missing"}
+
+    api_key = _quepasa_api_key()
+    if not api_key:
+        return {"ok": False, "error": "quepasa_api_key_missing"}
+
+    message = str((payload or {}).get("message") or "").strip()
+    targets = (payload or {}).get("targets") or []
+    if not isinstance(targets, list) or not targets:
+        return {"ok": False, "error": "payload_invalid"}
+    if not message and not media:
+        return {"ok": False, "error": "payload_invalid"}
+
+    results: list[dict[str, Any]] = []
+    for target in targets:
+        chat_id = _target_chat_id(target)
+        if not chat_id:
+            return {"ok": False, "error": "target_invalid"}
+        result = _post_message(send_url, api_key, chat_id, message, media=media)
+        results.append(result)
+        if not result.get("ok"):
+            return result
+
+    if len(results) == 1:
+        return results[0]
+    return {"ok": True, "transport": "quepasa_direct", "messages": results}
+
+
+def create_group_via_quepasa(payload: dict[str, Any], config: dict[str, Any]) -> dict[str, Any]:
+    """Create a WhatsApp group via QuePasa POST /groups/create.
+
+    Fail-closed: requires both normal QuePasa sends and an explicit group-create
+    flag. Never returns raw participant refs or raw group JIDs.
+    """
+    quepasa_raw = (config or {}).get("quepasa")
+    quepasa = quepasa_raw if isinstance(quepasa_raw, dict) else {}
+    if not _truthy(quepasa.get("send_enabled", False)):
+        return {"ok": False, "error": "quepasa_send_disabled"}
+    if not _truthy(quepasa.get("group_create_enabled", False)):
+        return {"ok": False, "error": "quepasa_group_create_disabled"}
+
+    raw_url = _quepasa_base_url(config)
+    group_url = _normalize_group_create_url(str(raw_url or ""))
+    if not group_url:
+        return {"ok": False, "error": "quepasa_group_create_url_missing"}
+
+    api_key = _quepasa_api_key()
+    if not api_key:
+        return {"ok": False, "error": "quepasa_api_key_missing"}
+
+    group = (payload or {}).get("group_create") if isinstance(payload, dict) else None
+    group = group if isinstance(group, dict) else {}
+    title = str(group.get("title") or "").strip()
+    participants = group.get("participants") or []
+    if not title or not isinstance(participants, list) or not participants:
+        return {"ok": False, "error": "payload_invalid"}
+    clean_participants = [str(p).strip() for p in participants if str(p).strip()]
+    if len(clean_participants) != len(participants) or not clean_participants:
+        return {"ok": False, "error": "payload_invalid"}
+    provider_participants = _normalize_group_participants(str(raw_url or ""), api_key, clean_participants)
+    if not provider_participants:
+        return {"ok": False, "error": "participant_lid_resolution_failed"}
+
+    return _post_group_create(group_url, api_key, title, provider_participants)

@@ -260,7 +260,12 @@ def _(rid, params: dict) -> dict:
             COMMAND_REGISTRY,
             SUBCOMMANDS,
             _build_description,
+            _resolve_config_gates_from_config,
+            resolve_command,
         )
+
+        cfg = _load_cfg()
+        config_gates = _resolve_config_gates_from_config(cfg)
 
         all_pairs: list[list[str]] = []
         canon: dict[str, str] = {}
@@ -270,6 +275,8 @@ def _(rid, params: dict) -> dict:
 
         for cmd in COMMAND_REGISTRY:
             if cmd.name in _TUI_HIDDEN or cmd.gateway_only:
+                continue
+            if cmd.gateway_config_gate and cmd.name not in config_gates:
                 continue
 
             c = f"/{cmd.name}"
@@ -302,7 +309,7 @@ def _(rid, params: dict) -> dict:
 
         warning = ""
         try:
-            qcmds = _load_cfg().get("quick_commands", {}) or {}
+            qcmds = (cfg or {}).get("quick_commands", {}) or {}
             if isinstance(qcmds, dict) and qcmds:
                 bucket = "User commands"
                 if bucket not in cat_map:
@@ -310,6 +317,10 @@ def _(rid, params: dict) -> dict:
                     cat_order.append(bucket)
                 for qname, qc in sorted(qcmds.items()):
                     if not isinstance(qc, dict):
+                        continue
+                    # Registry-backed commands and aliases are canonical; do
+                    # not duplicate their legacy quick-command entries.
+                    if resolve_command(qname) is not None:
                         continue
                     key = f"/{qname}"
                     canon[key.lower()] = key
@@ -437,7 +448,21 @@ def _(rid, params: dict) -> dict:
         name = resolved
     session = _sessions.get(params.get("session_id", ""))
 
-    qcmds = _load_cfg().get("quick_commands", {})
+    cfg = _load_cfg()
+    from hermes_cli.commands import is_config_gated_command_enabled
+
+    if not is_config_gated_command_enabled(name, cfg):
+        return _err(rid, 4030, f"Command /{name} is disabled by configuration")
+
+    if name == "ctxwpp":
+        from hermes_cli.whatsapp_ops_commands import render_thread_context_command
+
+        return _ok(
+            rid,
+            {"type": "builtin", "output": render_thread_context_command(arg)},
+        )
+
+    qcmds = cfg.get("quick_commands", {})
     if name in qcmds:
         qc = qcmds[name]
         if qc.get("type") == "exec":
@@ -448,8 +473,11 @@ def _(rid, params: dict) -> dict:
             sanitized_env = build_subprocess_env()
             from hermes_cli._subprocess_compat import windows_hide_flags
 
+            exec_cmd = qc.get("command", "")
+            if qc.get("pass_args") and arg:
+                exec_cmd = f"{exec_cmd} {shlex.quote(arg)}"
             r = subprocess.run(
-                qc.get("command", ""),
+                exec_cmd,
                 shell=True,
                 capture_output=True,
                 text=True,
@@ -1093,6 +1121,19 @@ def _(rid, params: dict) -> dict:
     _cmd_parts = _cmd_text.split(maxsplit=1)
     _cmd_base = (_cmd_parts[0] if _cmd_parts else "").lower()
     _cmd_arg = _cmd_parts[1] if len(_cmd_parts) > 1 else ""
+
+    from hermes_cli.commands import (
+        is_config_gated_command_enabled,
+        resolve_command,
+    )
+
+    _cmd_def = resolve_command(_cmd_base)
+    if _cmd_def and not is_config_gated_command_enabled(_cmd_def.name, _load_cfg()):
+        return _err(
+            rid,
+            4030,
+            f"Command /{_cmd_def.name} is disabled by configuration",
+        )
 
     live_output = _live_slash_command_output(
         params.get("session_id", ""), session, _cmd_base, _cmd_arg

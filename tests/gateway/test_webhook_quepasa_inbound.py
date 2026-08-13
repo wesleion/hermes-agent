@@ -1,0 +1,415 @@
+"""WebhookAdapter receive-only QuePasa inbound tests.
+
+These tests lock the Gate 1.21 contract: a QuePasa inbound route may ingest a
+sanitized event into the WhatsApp Ops store, but it must not dispatch an agent
+run, direct-deliver a message, or send WhatsApp transport.
+"""
+
+from __future__ import annotations
+
+import hashlib
+import hmac
+import json
+import os
+from types import SimpleNamespace
+from unittest.mock import AsyncMock
+
+import pytest
+from aiohttp import web
+from aiohttp.test_utils import TestClient, TestServer
+
+from gateway.config import PlatformConfig
+from gateway.platforms.webhook import WebhookAdapter, _DYNAMIC_ROUTES_FILENAME
+from tools.whatsapp_ops_tool import wpp_inbound_lookup
+
+
+pytestmark = pytest.mark.asyncio
+
+
+SECRET = "test-quepasa-secret"
+ROUTE = "quepasa-inbound"
+
+
+def _make_adapter(
+    *,
+    routes: dict | None = None,
+    max_body_bytes: int = 4096,
+    use_secret_env: bool = False,
+    route_profile: str | None = None,
+) -> WebhookAdapter:
+    default_route = {
+        "kind": "quepasa_inbound",
+        "events": [],
+    }
+    if use_secret_env:
+        default_route["secret_env"] = "WHATSAPP_OPS_WEBHOOK_SECRET"
+    else:
+        default_route["secret"] = SECRET
+    if route_profile is not None:
+        default_route["profile"] = route_profile
+    config = PlatformConfig(
+        enabled=True,
+        extra={
+            "host": "127.0.0.1",
+            "port": 0,
+            "rate_limit": 10,
+            "max_body_bytes": max_body_bytes,
+            "routes": routes if routes is not None else {ROUTE: default_route},
+        },
+    )
+    adapter = WebhookAdapter(config)
+    adapter.handle_message = AsyncMock()
+    adapter._direct_deliver = AsyncMock()
+    return adapter
+
+
+def _create_app(adapter: WebhookAdapter) -> web.Application:
+    app = web.Application()
+    app.router.add_post("/webhooks/{route_name}", adapter._handle_webhook)
+    app.router.add_post(
+        "/p/{profile}/webhooks/{route_name}", adapter._handle_webhook
+    )
+    return app
+
+
+def _signature(body: bytes, secret: str = SECRET) -> str:
+    return hmac.new(secret.encode(), body, hashlib.sha256).hexdigest()
+
+
+def _payload(event_id: str = "msg_synth_001") -> dict:
+    return {
+        "id": event_id,
+        "event_type": "message",
+        "chat": {"id": "5511999999999@s.whatsapp.net", "type": "individual"},
+        "participant": {"id": "5511999999999@s.whatsapp.net", "name": "Synthetic Lead"},
+        "message": {"conversation": "Oi, quero saber mais sobre o projeto."},
+        "apikey": "synthetic-secret-that-must-not-leak",
+        "server_url": "https://quepasa.example.invalid",
+    }
+
+
+async def _post(
+    adapter: WebhookAdapter,
+    payload: dict,
+    *,
+    signature: str | None = None,
+    profile: str | None = None,
+    route_name: str = ROUTE,
+):
+    body = json.dumps(payload).encode()
+    headers = {}
+    if signature is not None:
+        headers["X-Webhook-Signature"] = signature
+    path = (
+        f"/p/{profile}/webhooks/{route_name}"
+        if profile
+        else f"/webhooks/{route_name}"
+    )
+    server = TestServer(_create_app(adapter))
+    async with TestClient(server) as client:
+        resp = await client.post(path, data=body, headers=headers)
+        try:
+            data = await resp.json()
+        except Exception:
+            data = {"raw": await resp.text()}
+        return resp.status, data
+
+
+async def _post_chunked(adapter: WebhookAdapter, payload: dict, *, signature: str | None = None):
+    body = json.dumps(payload).encode()
+    headers = {}
+    if signature is not None:
+        headers["X-Webhook-Signature"] = signature
+
+    async def chunks():
+        yield body[:8]
+        yield body[8:]
+
+    server = TestServer(_create_app(adapter))
+    async with TestClient(server) as client:
+        resp = await client.post(f"/webhooks/{ROUTE}", data=chunks(), headers=headers)
+        try:
+            data = await resp.json()
+        except Exception:
+            data = {"raw": await resp.text()}
+        return resp.status, data
+
+
+async def test_quepasa_inbound_route_ingests_without_agent_or_delivery(tmp_path, monkeypatch):
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    adapter = _make_adapter()
+    body_payload = _payload()
+    body = json.dumps(body_payload).encode()
+
+    status, data = await _post(adapter, body_payload, signature=_signature(body))
+
+    assert status == 200
+    assert data["status"] == "ingested"
+    assert data["route"] == ROUTE
+    assert data["deduped"] is False
+    assert data["event_id"].startswith("inbound_")
+    adapter.handle_message.assert_not_called()
+    adapter._direct_deliver.assert_not_called()
+
+    lookup = json.loads(wpp_inbound_lookup(limit=5))
+    assert lookup["ok"] is True
+    assert lookup["events"]
+    serialized = json.dumps(lookup, ensure_ascii=False)
+    assert "5511999999999" not in serialized
+    assert "synthetic-secret-that-must-not-leak" not in serialized
+    assert "s.whatsapp.net" not in serialized
+    assert "<redacted>" in serialized
+
+
+async def test_quepasa_inbound_route_dedupes_persistently(tmp_path, monkeypatch):
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    adapter = _make_adapter()
+    body_payload = _payload("msg_duplicate_001")
+    body = json.dumps(body_payload).encode()
+
+    first_status, first_data = await _post(adapter, body_payload, signature=_signature(body))
+    second_status, second_data = await _post(adapter, body_payload, signature=_signature(body))
+
+    assert first_status == 200
+    assert second_status == 200
+    assert first_data["status"] == "ingested"
+    assert second_data["status"] == "duplicate"
+    assert second_data["deduped"] is True
+    assert first_data["event_id"] == second_data["event_id"]
+    adapter.handle_message.assert_not_called()
+    adapter._direct_deliver.assert_not_called()
+
+
+async def test_quepasa_inbound_route_fails_closed_without_valid_signature(tmp_path, monkeypatch):
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    adapter = _make_adapter()
+
+    no_sig_status, _ = await _post(adapter, _payload("msg_auth_001"), signature=None)
+    bad_sig_status, _ = await _post(adapter, _payload("msg_auth_002"), signature="bad")
+
+    assert no_sig_status == 401
+    assert bad_sig_status == 401
+    adapter.handle_message.assert_not_called()
+    adapter._direct_deliver.assert_not_called()
+    assert json.loads(wpp_inbound_lookup(limit=5))["events"] == []
+
+
+async def test_quepasa_inbound_route_accepts_secret_from_env(tmp_path, monkeypatch):
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    monkeypatch.setenv("WHATSAPP_OPS_WEBHOOK_SECRET", SECRET)
+    adapter = _make_adapter(use_secret_env=True)
+    body_payload = _payload("msg_env_secret_001")
+    body = json.dumps(body_payload).encode()
+
+    status, data = await _post(adapter, body_payload, signature=_signature(body))
+
+    assert status == 200
+    assert data["status"] == "ingested"
+    adapter.handle_message.assert_not_called()
+    adapter._direct_deliver.assert_not_called()
+
+
+async def test_quepasa_multiplex_scopes_secret_and_store_to_profile(
+    tmp_path, monkeypatch
+):
+    from agent import secret_scope
+    import hermes_cli.profiles as profiles
+    from hermes_constants import (
+        reset_hermes_home_override,
+        set_hermes_home_override,
+    )
+
+    default_home = tmp_path / "default"
+    profile_home = default_home / "profiles" / "alpha"
+    profile_home.mkdir(parents=True)
+    profile_secret = "alpha-quepasa-secret"
+    global_secret = "foreign-global-secret"
+    (profile_home / ".env").write_text(
+        f"WHATSAPP_OPS_WEBHOOK_SECRET={profile_secret}\n",
+        encoding="utf-8",
+    )
+    monkeypatch.setenv("HERMES_HOME", str(default_home))
+    monkeypatch.setenv("WHATSAPP_OPS_WEBHOOK_SECRET", global_secret)
+    monkeypatch.setattr(
+        profiles,
+        "profiles_to_serve",
+        lambda multiplex, profile_allowlist=None: [("alpha", profile_home)],
+    )
+    monkeypatch.setattr(profiles, "get_profile_dir", lambda _name: profile_home)
+
+    adapter = _make_adapter(use_secret_env=True, route_profile="alpha")
+    adapter.gateway_runner = SimpleNamespace(
+        config=SimpleNamespace(multiplex_profiles=True)
+    )
+    body_payload = _payload("msg_profile_scope_001")
+    body = json.dumps(body_payload).encode()
+
+    secret_scope.set_multiplex_active(True)
+    try:
+        foreign_status, _ = await _post(
+            adapter,
+            body_payload,
+            signature=_signature(body, global_secret),
+            profile="alpha",
+        )
+        profile_status, data = await _post(
+            adapter,
+            body_payload,
+            signature=_signature(body, profile_secret),
+            profile="alpha",
+        )
+    finally:
+        secret_scope.set_multiplex_active(False)
+
+    assert foreign_status == 401
+    assert profile_status == 200
+    assert data["status"] == "ingested"
+    assert json.loads(wpp_inbound_lookup(limit=5))["events"] == []
+
+    token = set_hermes_home_override(str(profile_home))
+    try:
+        profile_events = json.loads(wpp_inbound_lookup(limit=5))["events"]
+    finally:
+        reset_hermes_home_override(token)
+    assert len(profile_events) == 1
+    assert profile_events[0]["event_id"] == data["event_id"]
+    adapter.handle_message.assert_not_called()
+    adapter._direct_deliver.assert_not_called()
+
+
+async def test_quepasa_multiplex_dynamic_routes_are_isolated_a_b_a(
+    tmp_path, monkeypatch
+):
+    from agent import secret_scope
+    import hermes_cli.profiles as profiles
+
+    default_home = tmp_path / "default"
+    profile_a = default_home / "profiles" / "alpha"
+    profile_b = default_home / "profiles" / "beta"
+    profile_a.mkdir(parents=True)
+    profile_b.mkdir(parents=True)
+    route_a = {
+        "route-a": {
+            "kind": "quepasa_inbound",
+            "events": [],
+            "secret": "alpha-inline-secret",
+        }
+    }
+    route_b = {
+        "route-b": {
+            "kind": "quepasa_inbound",
+            "events": [],
+            "secret": "bravo-inline-secret",
+        }
+    }
+    file_a = profile_a / _DYNAMIC_ROUTES_FILENAME
+    file_b = profile_b / _DYNAMIC_ROUTES_FILENAME
+    file_a.write_text(json.dumps(route_a), encoding="utf-8")
+    file_b.write_text(json.dumps(route_b), encoding="utf-8")
+    # Deliberately equal mtimes reproduce the adapter-global cache bug.
+    shared_mtime_ns = 1_700_000_000_000_000_000
+    os.utime(file_a, ns=(shared_mtime_ns, shared_mtime_ns))
+    os.utime(file_b, ns=(shared_mtime_ns, shared_mtime_ns))
+
+    homes = {"alpha": profile_a, "beta": profile_b}
+    monkeypatch.setenv("HERMES_HOME", str(default_home))
+    monkeypatch.setattr(
+        profiles,
+        "profiles_to_serve",
+        lambda multiplex, profile_allowlist=None: list(homes.items()),
+    )
+    monkeypatch.setattr(profiles, "get_profile_dir", lambda name: homes[name])
+    adapter = _make_adapter(routes={})
+    adapter.gateway_runner = SimpleNamespace(
+        config=SimpleNamespace(multiplex_profiles=True)
+    )
+
+    async def post(profile, route_name, secret, event_id):
+        payload = _payload(event_id)
+        body = json.dumps(payload).encode()
+        return await _post(
+            adapter,
+            payload,
+            signature=_signature(body, secret),
+            profile=profile,
+            route_name=route_name,
+        )
+
+    secret_scope.set_multiplex_active(True)
+    try:
+        a1, _ = await post("alpha", "route-a", "alpha-inline-secret", "msg_a_1")
+        b_foreign, _ = await post(
+            "beta", "route-a", "alpha-inline-secret", "msg_b_foreign"
+        )
+        b1, _ = await post("beta", "route-b", "bravo-inline-secret", "msg_b_1")
+        a_foreign, _ = await post(
+            "alpha", "route-b", "bravo-inline-secret", "msg_a_foreign"
+        )
+        a2, _ = await post("alpha", "route-a", "alpha-inline-secret", "msg_a_2")
+    finally:
+        secret_scope.set_multiplex_active(False)
+
+    assert (a1, b_foreign, b1, a_foreign, a2) == (200, 404, 200, 404, 200)
+    cache = adapter._dynamic_routes_by_home
+    assert set(cache[str(profile_a.resolve())][1]) == {"route-a"}
+    assert set(cache[str(profile_b.resolve())][1]) == {"route-b"}
+    adapter.handle_message.assert_not_called()
+    adapter._direct_deliver.assert_not_called()
+
+
+async def test_quepasa_inbound_route_secret_env_fails_closed_when_missing(tmp_path, monkeypatch):
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    monkeypatch.delenv("WHATSAPP_OPS_WEBHOOK_SECRET", raising=False)
+    adapter = _make_adapter(use_secret_env=True)
+    body_payload = _payload("msg_env_missing_001")
+    body = json.dumps(body_payload).encode()
+
+    status, data = await _post(adapter, body_payload, signature=_signature(body))
+
+    assert status == 403
+    assert data["error"] == "Webhook route is missing an HMAC secret"
+    adapter.handle_message.assert_not_called()
+    adapter._direct_deliver.assert_not_called()
+    assert json.loads(wpp_inbound_lookup(limit=5))["events"] == []
+
+
+async def test_quepasa_inbound_requires_source_event_id(tmp_path, monkeypatch):
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    adapter = _make_adapter()
+    body_payload = _payload("")
+    body_payload.pop("id", None)
+    body = json.dumps(body_payload).encode()
+
+    status, data = await _post(adapter, body_payload, signature=_signature(body))
+
+    assert status == 400
+    assert data["status"] == "error"
+    assert data["error"] == "source_event_id_required"
+    adapter.handle_message.assert_not_called()
+    adapter._direct_deliver.assert_not_called()
+
+
+async def test_quepasa_inbound_route_respects_body_limit(tmp_path, monkeypatch):
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    adapter = _make_adapter(max_body_bytes=16)
+    body_payload = _payload("msg_large_001")
+    body = json.dumps(body_payload).encode()
+
+    status, _ = await _post(adapter, body_payload, signature=_signature(body))
+
+    assert status == 413
+    adapter.handle_message.assert_not_called()
+    adapter._direct_deliver.assert_not_called()
+
+
+async def test_quepasa_inbound_route_respects_body_limit_without_content_length(tmp_path, monkeypatch):
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    adapter = _make_adapter(max_body_bytes=16)
+    body_payload = _payload("msg_chunked_large_001")
+    body = json.dumps(body_payload).encode()
+
+    status, _ = await _post_chunked(adapter, body_payload, signature=_signature(body))
+
+    assert status == 413
+    adapter.handle_message.assert_not_called()
+    adapter._direct_deliver.assert_not_called()
