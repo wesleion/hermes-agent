@@ -9,17 +9,13 @@ from hermes_constants import reset_hermes_home_override, set_hermes_home_overrid
 
 
 CRM_HEADER = (
-    "event_id",
-    "idempotency_key",
-    "occurred_at",
-    "event_type",
-    "draft_id",
-    "target_safe_id",
-    "target_hash",
-    "message_hash",
-    "send_transport",
-    "actor_mode",
-    "status",
+    "ID Interacao",
+    "ID Lead",
+    "ID Contato",
+    "Tipo Interacao",
+    "Data",
+    "Resumo",
+    "Proximo Passo",
 )
 
 
@@ -33,9 +29,9 @@ def _config() -> dict:
             "allowed_event_types": ["send_completed"],
             "google_sheets": {
                 "spreadsheet_id": "sheet-prod-01",
-                "range": "HunterCRM!A:K",
+                "range": "'Interacoes'!A:G",
                 "allowed_spreadsheet_ids": ["sheet-prod-01"],
-                "allowed_ranges": ["HunterCRM!A:K"],
+                "allowed_ranges": ["'Interacoes'!A:G"],
                 "credentials_env": "GOOGLE_SERVICE_ACCOUNT_JSON",
                 "timeout_seconds": 10,
             },
@@ -44,7 +40,17 @@ def _config() -> dict:
 
 
 def _draft(targets=None) -> dict:
-    targets = targets or [{"type": "contact", "contact_id": "contact_safe_01"}]
+    targets = targets or [{
+        "type": "contact",
+        "contact_id": "contact_safe_01",
+        "crm": {
+            "lead_id": "L-001",
+            "contact_id": "C-001",
+            "interaction_type": "WhatsApp",
+            "summary": "Primeiro contato supervisionado concluído",
+            "next_step": "Aguardar retorno e qualificar interesse",
+        },
+    }]
     return {
         "id": "draft_safe_01",
         "targets_json": json.dumps(targets),
@@ -73,8 +79,9 @@ def _confirmed_response(payload: dict) -> dict:
     return {
         "updates": {
             "updatedRows": 1,
-            "updatedData": {"values": [payload["row"]]},
-        }
+            "updatedRange": "'Interacoes'!A2:G2",
+        },
+        "read_back": {"values": [payload["row"]]},
     }
 
 
@@ -113,7 +120,7 @@ def test_crm_defaults_are_fail_closed_and_schema_is_stable():
             "crm_spreadsheet_not_allowed",
         ),
         (
-            lambda c: c["crm"]["google_sheets"].update(allowed_ranges=["Other!A:K"]),
+            lambda c: c["crm"]["google_sheets"].update(allowed_ranges=["Other!A:G"]),
             "crm_range_not_allowed",
         ),
         (
@@ -123,7 +130,7 @@ def test_crm_defaults_are_fail_closed_and_schema_is_stable():
             "crm_wildcard_forbidden",
         ),
         (
-            lambda c: c["crm"]["google_sheets"].update(range="Hunter*!A:K", allowed_ranges=["Hunter*!A:K"]),
+            lambda c: c["crm"]["google_sheets"].update(range="Hunter*!A:G", allowed_ranges=["Hunter*!A:G"]),
             "crm_wildcard_forbidden",
         ),
     ],
@@ -203,7 +210,7 @@ def test_preflight_requires_resolved_human_approval_for_exact_message(tmp_path, 
     client.assert_not_called()
 
 
-def test_confirmed_append_uses_string_only_schema_without_message_or_raw_target(tmp_path):
+def test_confirmed_append_uses_business_schema_without_message_or_raw_target(tmp_path):
     from tools.whatsapp_ops_crm import append_approved_send_event
 
     captured = {}
@@ -214,10 +221,12 @@ def test_confirmed_append_uses_string_only_schema_without_message_or_raw_target(
         return _confirmed_response(payload)
 
     raw_target = "5511999990000@s.whatsapp.net"
+    target = json.loads(_draft()["targets_json"])[0]
+    target["contact_id"] = raw_target
     token = set_hermes_home_override(tmp_path)
     try:
         result = append_approved_send_event(
-            draft=_draft([{"type": "contact", "contact_id": raw_target}]),
+            draft=_draft([target]),
             approval=_approval(),
             send_result=_send_result(),
             config=_config(),
@@ -239,10 +248,16 @@ def test_confirmed_append_uses_string_only_schema_without_message_or_raw_target(
     assert tuple(payload["header"]) == CRM_HEADER
     assert len(row) == len(CRM_HEADER)
     assert all(isinstance(value, str) for value in row)
-    assert row[CRM_HEADER.index("event_type")] == "send_completed"
-    assert row[CRM_HEADER.index("actor_mode")] == "human_approved"
-    assert row[CRM_HEADER.index("status")] == "sent"
-    assert row[CRM_HEADER.index("send_transport")] == "quepasa_direct"
+    assert row == [
+        row[0],
+        "L-001",
+        "C-001",
+        "WhatsApp",
+        "2026-07-15",
+        "Primeiro contato supervisionado concluído",
+        "Aguardar retorno e qualificar interesse",
+    ]
+    assert row[0].startswith("INT-")
     assert "conteudo que jamais" not in serialized
     assert raw_target not in serialized
     assert "5511999990000" not in serialized
@@ -264,14 +279,21 @@ def test_default_google_client_uses_append_raw_insert_rows_and_exact_scope(tmp_p
             return "credentials-object"
 
     class Request:
+        def __init__(self, response):
+            self.response = response
+
         def execute(self):
-            calls["executed"] = True
-            return {"updates": {"updatedRows": 1, "updatedData": {"values": [row]}}}
+            calls["executed"] = calls.get("executed", 0) + 1
+            return self.response
 
     class Values:
         def append(self, **kwargs):
             calls["append"] = kwargs
-            return Request()
+            return Request({"updates": {"updatedRows": 1, "updatedRange": "'Interacoes'!A2:G2"}})
+
+        def get(self, **kwargs):
+            calls["get"] = kwargs
+            return Request({"values": [row]})
 
         def update(self, **kwargs):  # pragma: no cover - must never be reached
             raise AssertionError("update must never be called")
@@ -329,21 +351,26 @@ def test_default_google_client_uses_append_raw_insert_rows_and_exact_scope(tmp_p
     )
     assert calls["append"] == {
         "spreadsheetId": "sheet-prod-01",
-        "range": "HunterCRM!A:K",
+        "range": "'Interacoes'!A:G",
         "valueInputOption": "RAW",
         "insertDataOption": "INSERT_ROWS",
         "includeValuesInResponse": True,
         "body": {"values": [row]},
     }
-    assert calls["executed"] is True
+    assert calls["get"] == {
+        "spreadsheetId": "sheet-prod-01",
+        "range": "'Interacoes'!A2:G2",
+        "majorDimension": "ROWS",
+    }
+    assert calls["executed"] == 2
 
 
 @pytest.mark.parametrize(
     "response",
     [
-        {"updates": {"updatedRows": 0, "updatedData": {"values": []}}},
-        {"updates": {"updatedRows": 1, "updatedData": {"values": [["different"]]}}},
-        {"updates": {"updatedCells": 10, "updatedData": {"values": []}}},
+        {"updates": {"updatedRows": 0, "updatedRange": "'Interacoes'!A2:G2"}, "read_back": {"values": []}},
+        {"updates": {"updatedRows": 1, "updatedRange": "'Interacoes'!A2:G2"}, "read_back": {"values": [["different"]]}},
+        {"updates": {"updatedCells": 6, "updatedRange": "'Interacoes'!A2:G2"}, "read_back": {"values": []}},
         {},
     ],
 )
@@ -376,11 +403,13 @@ def test_exception_is_sanitized_and_audited_without_secrets_or_pii(tmp_path):
     secret = "super-secret-private-key"
     spreadsheet_id = _config()["crm"]["google_sheets"]["spreadsheet_id"]
     raw_target = "5511999990000@s.whatsapp.net"
+    target = json.loads(_draft()["targets_json"])[0]
+    target["contact_id"] = raw_target
     client = Mock(side_effect=RuntimeError(f"{secret} {spreadsheet_id} {raw_target}"))
     token = set_hermes_home_override(tmp_path)
     try:
         result = append_approved_send_event(
-            draft=_draft([{"type": "contact", "contact_id": raw_target}]),
+            draft=_draft([target]),
             approval=_approval(),
             send_result=_send_result(),
             config=_config(),
@@ -437,6 +466,36 @@ def test_duplicate_confirmed_append_returns_replay_without_second_client_call(tm
         "write_performed": False,
     }
     client.assert_called_once()
+
+
+@pytest.mark.parametrize(
+    ("targets", "reason"),
+    [
+        ([{"type": "contact", "contact_id": "contact_safe_01"}], "crm_context_missing"),
+        ([{"type": "group_create", "name": "Grupo", "crm": {}}], "crm_contact_target_required"),
+        ([{"type": "contact", "contact_id": "contact_safe_01", "crm": {"lead_id": "L-001"}}], "crm_context_invalid"),
+    ],
+)
+def test_crm_context_and_single_contact_target_are_required(tmp_path, targets, reason):
+    from tools.whatsapp_ops_crm import append_approved_send_event
+
+    client = Mock()
+    token = set_hermes_home_override(tmp_path)
+    try:
+        result = append_approved_send_event(
+            draft=_draft(targets),
+            approval=_approval(),
+            send_result=_send_result(),
+            config=_config(),
+            client=client,
+        )
+    finally:
+        reset_hermes_home_override(token)
+
+    assert result["result"] == "blocked"
+    assert result["reason"] == reason
+    assert result["write_performed"] is False
+    client.assert_not_called()
 
 
 def test_store_reservation_is_atomic_and_uncertain_states_block(tmp_path):

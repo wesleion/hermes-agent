@@ -4,11 +4,10 @@ The sink is an internal post-send effect, not a model-callable write tool. Googl
 libraries are imported lazily so minimal Hermes runtimes can still import the
 WhatsApp toolset.
 
-Google Sheets row header (stable order):
-``event_id, idempotency_key, occurred_at, event_type, draft_id,
-target_safe_id, target_hash, message_hash, send_transport, actor_mode, status``.
-Every cell is a safe string. Message content, raw WhatsApp refs, spreadsheet
-coordinates, credentials, and provider responses are never returned or audited.
+The sink writes the existing commercial ``Interacoes`` schema only. Every cell
+comes from explicit CRM context bound into the approved draft; message content,
+raw WhatsApp refs, spreadsheet coordinates, credentials, and provider responses
+are never copied into the row or returned.
 """
 
 from __future__ import annotations
@@ -30,17 +29,13 @@ from tools.whatsapp_ops_store import (
 )
 
 CRM_ROW_HEADER = (
-    "event_id",
-    "idempotency_key",
-    "occurred_at",
-    "event_type",
-    "draft_id",
-    "target_safe_id",
-    "target_hash",
-    "message_hash",
-    "send_transport",
-    "actor_mode",
-    "status",
+    "ID Interacao",
+    "ID Lead",
+    "ID Contato",
+    "Tipo Interacao",
+    "Data",
+    "Resumo",
+    "Proximo Passo",
 )
 
 _SPREADSHEETS_SCOPE = "https://www.googleapis.com/auth/spreadsheets"
@@ -48,6 +43,13 @@ _CREDENTIAL_ENV_RE = re.compile(r"^[A-Z][A-Z0-9_]{2,80}$")
 _SAFE_TOKEN_RE = re.compile(r"^[A-Za-z][A-Za-z0-9_.:-]{0,79}$")
 _WILDCARD_RE = re.compile(r"[*?]")
 _LONG_DIGITS_RE = re.compile(r"\d{7,}")
+_CRM_ID_RE = re.compile(r"^[A-Za-z][A-Za-z0-9_.:-]{0,39}$")
+_URL_RE = re.compile(r"(?i)\b(?:https?://|www\.)\S+")
+_EMAIL_RE = re.compile(r"[\w.+-]+@[\w.-]+\.[A-Za-z]{2,}")
+_WA_REF_RE = re.compile(r"(?i)\b[\w.+:-]+@(?:lid|g\.us|s\.whatsapp\.net|c\.us)\b")
+_SECRET_RE = re.compile(
+    r"(?i)\b(?:token|secret|api[_ -]?key|authorization|private[_ -]?key|password)\s*[:=]"
+)
 
 
 def default_crm_config() -> dict[str, Any]:
@@ -121,22 +123,52 @@ def _parse_targets(draft: dict[str, Any]) -> list[dict[str, Any]]:
     return [item for item in parsed if isinstance(item, dict)] if isinstance(parsed, list) else []
 
 
-def _target_identity(draft: dict[str, Any]) -> tuple[str, str]:
-    targets = _parse_targets(draft)
-    canonical = json.dumps(targets, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
-    target_hash = hash_text(canonical or "unknown_target")
-    if len(targets) != 1:
-        return "multi_target_" + target_hash[:16], target_hash
+def _safe_crm_text(value: Any, *, max_length: int, required: bool = True) -> str:
+    text = re.sub(r"\s+", " ", str(value or "").strip())
+    if not text:
+        return "" if not required else ""
+    if len(text) > max_length:
+        return ""
+    if text.startswith(("=", "+", "-", "@")):
+        return ""
+    if (
+        _URL_RE.search(text)
+        or _EMAIL_RE.search(text)
+        or _WA_REF_RE.search(text)
+        or _LONG_DIGITS_RE.search(text)
+        or _SECRET_RE.search(text)
+    ):
+        return ""
+    return text
 
-    target = targets[0]
-    target_type = str(target.get("type") or "contact").strip().lower()
-    if target_type == "group_create":
-        return "group_create_" + target_hash[:16], target_hash
-    candidate = target.get("contact_id") or target.get("list_id") or target.get("group_id")
-    safe_candidate = _safe_token(candidate, fallback="")
-    if safe_candidate:
-        return safe_candidate, target_hash
-    return "target_" + target_hash[:16], target_hash
+
+def _crm_context(draft: dict[str, Any]) -> tuple[dict[str, str] | None, str | None]:
+    targets = _parse_targets(draft)
+    if len(targets) != 1 or str(targets[0].get("type") or "contact").strip().lower() != "contact":
+        return None, "crm_contact_target_required"
+    raw = targets[0].get("crm")
+    if not isinstance(raw, dict) or not raw:
+        return None, "crm_context_missing"
+    lead_id = str(raw.get("lead_id") or "").strip()
+    contact_id = str(raw.get("contact_id") or "").strip()
+    interaction_type = _safe_crm_text(raw.get("interaction_type"), max_length=40)
+    summary = _safe_crm_text(raw.get("summary"), max_length=240)
+    next_step = _safe_crm_text(raw.get("next_step"), max_length=180, required=False)
+    if (
+        not _CRM_ID_RE.fullmatch(lead_id)
+        or not _CRM_ID_RE.fullmatch(contact_id)
+        or not interaction_type
+        or not summary
+        or (raw.get("next_step") not in (None, "") and not next_step)
+    ):
+        return None, "crm_context_invalid"
+    return {
+        "lead_id": lead_id,
+        "contact_id": contact_id,
+        "interaction_type": interaction_type,
+        "summary": summary,
+        "next_step": next_step,
+    }, None
 
 
 def _safe_occurred_at(draft: dict[str, Any], approval: dict[str, Any]) -> str:
@@ -153,33 +185,22 @@ def _safe_occurred_at(draft: dict[str, Any], approval: dict[str, Any]) -> str:
 
 def _build_payload(
     draft: dict[str, Any], approval: dict[str, Any], send_result: dict[str, Any]
-) -> tuple[dict[str, Any], str]:
-    event_id, idempotency_key = _event_identity(draft, approval)
-    target_safe_id, target_hash = _target_identity(draft)
-    draft_id = _safe_token(
-        draft.get("id"), fallback="draft_" + hash_text(str(draft.get("id") or ""))[:16]
-    )
-    message_hash_raw = str(draft.get("message_hash") or "")
-    message_hash = (
-        message_hash_raw.lower()
-        if re.fullmatch(r"[A-Fa-f0-9]{64}", message_hash_raw)
-        else hash_text(message_hash_raw)
-    )
-    transport = _safe_token(send_result.get("transport"), fallback="unknown_transport")
+) -> dict[str, Any]:
+    event_id, _ = _event_identity(draft, approval)
+    context, reason = _crm_context(draft)
+    if context is None:
+        raise ValueError(reason or "crm_context_invalid")
+    occurred_at = _safe_occurred_at(draft, approval)
     row = [
-        event_id,
-        idempotency_key,
-        _safe_occurred_at(draft, approval),
-        "send_completed",
-        draft_id,
-        target_safe_id,
-        target_hash,
-        message_hash,
-        transport,
-        "human_approved",
-        "sent",
+        "INT-" + hash_text("interaction\n" + event_id)[:12],
+        context["lead_id"],
+        context["contact_id"],
+        context["interaction_type"],
+        occurred_at[:10],
+        context["summary"],
+        context["next_step"],
     ]
-    return {"header": list(CRM_ROW_HEADER), "row": row}, idempotency_key
+    return {"header": list(CRM_ROW_HEADER), "row": row}
 
 
 def _valid_timeout_seconds(sheets: dict[str, Any]) -> int | None:
@@ -253,8 +274,9 @@ def _verify_append_response(response: Any, row: list[str]) -> bool:
     cells_confirmed = updates.get("updatedCells") == len(row)
     if not (rows_confirmed or cells_confirmed):
         return False
-    updated_data = updates.get("updatedData")
-    return isinstance(updated_data, dict) and updated_data.get("values") == [row]
+    updated_range = str(updates.get("updatedRange") or "").strip()
+    read_back = response.get("read_back")
+    return bool(updated_range) and isinstance(read_back, dict) and read_back.get("values") == [row]
 
 
 def _google_dependencies() -> tuple[Any, Callable[..., Any], Callable[..., Any], Callable[..., Any]]:
@@ -323,6 +345,20 @@ def append_google_sheets_row(payload: dict[str, Any], config: dict[str, Any]) ->
             )
             .execute()
         )
+        updates = response.get("updates") if isinstance(response, dict) else None
+        updated_range = str((updates or {}).get("updatedRange") or "").strip()
+        if not updated_range:
+            return {"ok": False, "reason": "append_unverified"}
+        read_back = (
+            service.spreadsheets()
+            .values()
+            .get(
+                spreadsheetId=str(sheets["spreadsheet_id"]),
+                range=updated_range,
+                majorDimension="ROWS",
+            )
+            .execute()
+        )
     except Exception as exc:
         return {
             "ok": False,
@@ -330,7 +366,7 @@ def append_google_sheets_row(payload: dict[str, Any], config: dict[str, Any]) ->
             "error_class": _safe_error_class(exc),
         }
 
-    if not _verify_append_response(response, row):
+    if not _verify_append_response({"updates": response.get("updates"), "read_back": read_back}, row):
         return {"ok": False, "reason": "append_unverified"}
     return {"ok": True, "reason": "append_confirmed"}
 
@@ -371,10 +407,11 @@ def append_approved_send_event(
     """
     init_db()
     crm_config = _configured_crm(config)
-    payload, idempotency_key = _build_payload(draft, approval, send_result)
-    event_id = payload["row"][0]
+    event_id, idempotency_key = _event_identity(draft, approval)
     enabled = crm_config.get("enabled") is True
     blocked_reason = _preflight_reason(crm_config, draft, approval, send_result)
+    _, context_reason = _crm_context(draft)
+    blocked_reason = blocked_reason or context_reason
     if blocked_reason:
         record_crm_audit(
             "crm_append_blocked",
@@ -390,6 +427,7 @@ def append_approved_send_event(
             write_performed=False,
         )
 
+    payload = _build_payload(draft, approval, send_result)
     reservation = reserve_crm_append(idempotency_key, event_id)
     if not reservation["reserved"]:
         existing_status = reservation["status"]

@@ -38,6 +38,37 @@ def _redact_telegram_error_text(error: object) -> str:
         return "<telegram error redacted>"
 
 
+def _whatsapp_approval_effect_summary(execution: dict[str, Any]) -> str:
+    """Render enumerated WhatsApp/CRM outcomes without echoing payload data."""
+    if execution.get("ok") is not True:
+        reasons = execution.get("reasons") or []
+        if not reasons and isinstance(execution.get("send_result"), dict):
+            reasons = [execution["send_result"].get("error") or "execution_failed"]
+        allowed = {
+            "approval_required",
+            "idempotency_duplicate",
+            "kill_switch_active",
+            "quepasa_send_disabled",
+            "send_disabled",
+            "target_not_whitelisted",
+            "target_ref_unresolved",
+        }
+        safe = [str(reason) for reason in reasons if str(reason) in allowed]
+        return "WhatsApp: NÃO enviado. Bloqueio: " + (", ".join(safe) or "execution_blocked") + ". CRM: não executado."
+
+    crm = execution.get("crm") if isinstance(execution.get("crm"), dict) else {}
+    crm_result = str(crm.get("result") or "not_attempted")
+    if execution.get("crm_write_performed") is True and crm_result == "appended":
+        crm_text = "CRM: interação registrada em Interacoes e read-back confirmado."
+    elif crm_result == "failed_unknown":
+        crm_text = "CRM: registro não confirmado; sem retry automático."
+    elif crm_result == "idempotent_replay":
+        crm_text = "CRM: interação já registrada; nenhuma duplicação."
+    else:
+        crm_text = "CRM: não registrado."
+    return "WhatsApp: enviado via QuePasa/direct. " + crm_text
+
+
 def _scoped_gate_env(name: str, default: str = "") -> str:
     """Read a TELEGRAM_*/GATEWAY_* authorization gate env var per-profile.
 
@@ -6786,27 +6817,7 @@ class TelegramAdapter(BasePlatformAdapter):
                         from tools.whatsapp_ops_tool import wpp_send_approved as _wpp_send_approved
 
                         execution = json.loads(_wpp_send_approved(draft_id))
-                        if execution.get("ok"):
-                            send_result = execution.get("send_result") if isinstance(execution.get("send_result"), dict) else {}
-                            group_hash = str(send_result.get("group_ref_hash") or "")
-                            media_sent = bool(send_result.get("media_sent"))
-                            suffix_parts = []
-                            if group_hash:
-                                suffix_parts.append(f"ref_hash={group_hash}")
-                            suffix_parts.append(f"media={'sim' if media_sent else 'não'}")
-                            provider_status = str(send_result.get("provider_status") or "")[:80]
-                            if provider_status:
-                                suffix_parts.append(f"status={provider_status}")
-                            followup = "Envio executado via QuePasa/direct. " + "; ".join(suffix_parts) + "."
-                        else:
-                            reasons = execution.get("reasons") or []
-                            if not reasons and isinstance(execution.get("send_result"), dict):
-                                reasons = [execution["send_result"].get("error") or "execution_failed"]
-                            reason_text = ", ".join(str(r) for r in reasons if r) or "execution_blocked"
-                            followup = (
-                                "Aprovação registrada, mas o envio NÃO executou. "
-                                f"Bloqueio: {reason_text}."
-                            )
+                        followup = _whatsapp_approval_effect_summary(execution)
                     except Exception as exc:
                         logger.error("[%s] WhatsApp approved send callback failed: %s", self.name, exc, exc_info=True)
                         followup = "Aprovação registrada, mas o envio NÃO executou por erro interno."

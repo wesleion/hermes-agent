@@ -46,7 +46,7 @@ def _ensure_telegram_mock():
 
 _ensure_telegram_mock()
 
-from plugins.platforms.telegram.adapter import TelegramAdapter
+from plugins.platforms.telegram.adapter import TelegramAdapter, _whatsapp_approval_effect_summary
 from gateway.config import Platform, PlatformConfig
 
 
@@ -204,6 +204,63 @@ class TestTelegramExecApproval:
 
 class TestTelegramApprovalCallback:
     """Test the approval callback handling in _handle_callback_query."""
+
+    @pytest.mark.parametrize(
+        ("execution", "expected"),
+        [
+            (
+                {"ok": True, "crm_write_performed": True, "crm": {"result": "appended"}},
+                "WhatsApp: enviado via QuePasa/direct. CRM: interação registrada em Interacoes e read-back confirmado.",
+            ),
+            (
+                {"ok": True, "crm_write_performed": False, "crm": {"result": "failed_unknown"}},
+                "WhatsApp: enviado via QuePasa/direct. CRM: registro não confirmado; sem retry automático.",
+            ),
+            (
+                {"ok": False, "reasons": ["idempotency_duplicate", "private-secret"]},
+                "WhatsApp: NÃO enviado. Bloqueio: idempotency_duplicate. CRM: não executado.",
+            ),
+        ],
+    )
+    def test_whatsapp_effect_summary_is_explicit_and_leak_safe(self, execution, expected):
+        assert _whatsapp_approval_effect_summary(execution) == expected
+        assert "private-secret" not in expected
+
+    @pytest.mark.asyncio
+    async def test_whatsapp_approval_click_reports_send_and_crm_readback(self):
+        adapter = _make_adapter()
+        query = AsyncMock()
+        query.data = "wpp:a:approval_safe_01"
+        query.message = MagicMock()
+        query.message.chat_id = 12345
+        query.message.chat.type = "private"
+        query.from_user = MagicMock()
+        query.from_user.id = "12345"
+        query.from_user.first_name = "Operator"
+        query.answer = AsyncMock()
+        query.edit_message_text = AsyncMock()
+        update = MagicMock()
+        update.callback_query = query
+
+        resolved = {"ok": True, "draft_id": "draft_safe_01"}
+        execution = {
+            "ok": True,
+            "send_result": {"ok": True, "transport": "quepasa_direct"},
+            "crm_write_performed": True,
+            "crm": {"result": "appended", "reason": "append_confirmed"},
+        }
+        with patch.dict(os.environ, {"TELEGRAM_ALLOWED_USERS": "*"}, clear=False):
+            with patch("tools.whatsapp_ops_store.resolve_approval", return_value=resolved) as resolve_mock:
+                with patch("tools.whatsapp_ops_tool.wpp_send_approved", return_value=__import__("json").dumps(execution)) as send_mock:
+                    await adapter._handle_callback_query(update, MagicMock())
+
+        resolve_mock.assert_called_once()
+        send_mock.assert_called_once_with("draft_safe_01")
+        edited = query.edit_message_text.call_args.kwargs
+        assert "WhatsApp: enviado" in edited["text"]
+        assert "CRM: interação registrada" in edited["text"]
+        assert "read-back confirmado" in edited["text"]
+        assert edited["reply_markup"] is None
 
 
     @pytest.mark.asyncio

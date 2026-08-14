@@ -2425,12 +2425,26 @@ def _crm_enabled_send_config():
             "allowed_event_types": ["send_completed"],
             "google_sheets": {
                 "spreadsheet_id": "sheet-integration-secret",
-                "range": "CRM!A:K",
+                "range": "'Interacoes'!A:G",
                 "allowed_spreadsheet_ids": ["sheet-integration-secret"],
-                "allowed_ranges": ["CRM!A:K"],
-                "credentials_env": "GOOGLE_SERVICE_ACCOUNT_JSON",
+                "allowed_ranges": ["'Interacoes'!A:G"],
+                "credentials_env": "HUNTER_CRM_GOOGLE_SERVICE_ACCOUNT_JSON",
                 "timeout_seconds": 10,
             },
+        },
+    }
+
+
+def _crm_target(contact_id="c_1"):
+    return {
+        "type": "contact",
+        "contact_id": contact_id,
+        "crm": {
+            "lead_id": "L-001",
+            "contact_id": "C-001",
+            "interaction_type": "WhatsApp",
+            "summary": "Contato supervisionado concluído",
+            "next_step": "Aguardar retorno",
         },
     }
 
@@ -2443,13 +2457,16 @@ def test_wpp_send_success_then_confirmed_crm_append(tmp_path, monkeypatch):
     send_client = Mock(return_value={"ok": True, "transport": "mock_transport"})
 
     def crm_client(payload, config):
-        return {"updates": {"updatedRows": 1, "updatedData": {"values": [payload["row"]]}}}
+        return {
+            "updates": {"updatedRows": 1, "updatedRange": "'Interacoes'!A2:G2"},
+            "read_back": {"values": [payload["row"]]},
+        }
 
     token = set_hermes_home_override(tmp_path)
     try:
         init_db()
         draft = create_draft(
-            targets=[{"type": "contact", "contact_id": "c_1"}],
+            targets=[_crm_target()],
             message="Mensagem aprovada com efeito CRM pós-send",
         )
         approval = create_approval(draft["draft_id"])
@@ -2490,7 +2507,7 @@ def test_wpp_send_success_crm_failure_keeps_whatsapp_sent(tmp_path, monkeypatch)
     token = set_hermes_home_override(tmp_path)
     try:
         init_db()
-        draft = create_draft(targets=[{"type": "contact", "contact_id": "c_1"}], message="Envio prevalece")
+        draft = create_draft(targets=[_crm_target()], message="Envio prevalece")
         approval = create_approval(draft["draft_id"])
         resolve_approval(approval["approval_id"], "approved", approver_ref="human:test")
         result = _parse(
@@ -2584,7 +2601,7 @@ def test_wpp_send_default_crm_disabled_performs_zero_crm_writes(tmp_path, monkey
     crm_client.assert_not_called()
 
 
-def test_wpp_group_create_crm_row_contains_only_safe_target_hash(tmp_path, monkeypatch):
+def test_wpp_group_create_never_appends_commercial_crm_interaction(tmp_path, monkeypatch):
     from tools.whatsapp_ops_store import create_approval, create_draft, init_db, resolve_approval, upsert_contact
     from tools.whatsapp_ops_tool import wpp_send_approved
 
@@ -2609,7 +2626,10 @@ def test_wpp_group_create_crm_row_contains_only_safe_target_hash(tmp_path, monke
 
     def crm_client(payload, crm_config):
         crm_payloads.append(payload)
-        return {"updates": {"updatedRows": 1, "updatedData": {"values": [payload["row"]]}}}
+        return {
+            "updates": {"updatedRows": 1, "updatedRange": "'Interacoes'!A2:G2"},
+            "read_back": {"values": [payload["row"]]},
+        }
 
     token = set_hermes_home_override(tmp_path)
     try:
@@ -2630,12 +2650,10 @@ def test_wpp_group_create_crm_row_contains_only_safe_target_hash(tmp_path, monke
         reset_hermes_home_override(token)
 
     assert result["ok"] is True
-    assert result["crm_written"] is True
+    assert result["crm_written"] is False
+    assert result["crm"]["reason"] == "crm_contact_target_required"
+    assert crm_payloads == []
     serialized = json.dumps(crm_payloads, ensure_ascii=False)
     assert raw_ref not in serialized
     assert "5511999990000" not in serialized
     assert "Grupo Privado" not in serialized
-    header = crm_payloads[0]["header"]
-    row = crm_payloads[0]["row"]
-    assert row[header.index("target_safe_id")].startswith("group_create_")
-    assert len(row[header.index("target_hash")]) == 64
