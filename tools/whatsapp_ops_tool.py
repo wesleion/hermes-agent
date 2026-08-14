@@ -1297,8 +1297,55 @@ def _safe_float_value(value: Any, default: float, minimum: float, maximum: float
     return max(minimum, min(parsed, maximum))
 
 
+_COMMERCIAL_DATE_PATTERN = (
+    r"\b\d{4}-\d{2}-\d{2}"
+    r"(?:[T ][0-2]\d:[0-5]\d(?::[0-5]\d)?(?:Z|[+-]\d{2}:?\d{2})?)?\b"
+)
+_COMMERCIAL_MAX_DEPTH = 6
+_COMMERCIAL_MAX_NODES = 4096
+_COMMERCIAL_MAX_TEXT = 2048
+_COMMERCIAL_SENSITIVE_KEYS = frozenset(
+    {"apikey", "secret", "token", "authorization", "bearer"}
+)
+
+
+def _commercial_scalar_text(value: Any) -> str:
+    if isinstance(value, str):
+        return value
+    if type(value) in {bool, int, float}:
+        return str(value)
+    return ""
+
+
+def _commercial_key_name(value: Any) -> str:
+    if not isinstance(value, str) or len(value) > 128:
+        return ""
+    return re.sub(r"[^a-z0-9]", "", value.casefold())
+
+
+def _commercial_key_is_sensitive(value: Any) -> bool:
+    if not isinstance(value, str) or len(value) > 128:
+        return False
+    segmented = re.sub(r"(?<=[A-Z])(?=[A-Z][a-z])", "_", value)
+    segmented = re.sub(r"(?<=[a-z0-9])(?=[A-Z])", "_", segmented)
+    parts = [part for part in re.split(r"[^a-z0-9]+", segmented.casefold()) if part]
+    compact = "".join(parts)
+    has_api_key_pair = any(
+        first == "api" and second == "key" for first, second in zip(parts, parts[1:])
+    )
+    return has_api_key_pair or any(
+        sensitive in compact for sensitive in _COMMERCIAL_SENSITIVE_KEYS
+    )
+
+
+def _commercial_execution_context(value: Any) -> str:
+    if value is None or (isinstance(value, str) and not value.strip()):
+        return "operator"
+    return _commercial_scalar_text(value).strip().lower()
+
+
 def _safe_commercial_text(value: Any, limit: int = 180) -> str:
-    text = str(value or "")
+    text = _commercial_scalar_text(value)[:_COMMERCIAL_MAX_TEXT]
     if not text:
         return ""
     protected: dict[str, str] = {}
@@ -1308,12 +1355,17 @@ def _safe_commercial_text(value: Any, limit: int = 180) -> str:
         protected[key] = match.group(0)
         return key
 
-    text = re.sub(r"\b\d{4}-\d{2}-\d{2}(?:[T ][0-2]\d:[0-5]\d(?::[0-5]\d)?(?:Z|[+-]\d{2}:?\d{2})?)?\b", protect, text)
+    text = re.sub(_COMMERCIAL_DATE_PATTERN, protect, text)
     url_pattern = r"(?i)http" + r"s?://\S+"
     text = re.sub(url_pattern, "", text)
     text = re.sub(r"\b[^\s@]+@[^\s@]+\.[^\s@]+\b", "", text)
     text = re.sub(r"\b\S+@(?:g\.us|lid|s\.whatsapp\.net|c\.us|whatsapp\.net)\b", "", text, flags=re.IGNORECASE)
-    text = re.sub(r"(?i)\b(?:api[_-]?key|secret|token|authorization|bearer)\s*[=:]\s*[^\s,;]+", "", text)
+    text = re.sub(
+        r"(?i)(?<![\w])['\"]?(?:api[\s_-]*key|secret|token|authorization|bearer)"
+        r"['\"]?\s*[=:]\s*(?:['\"][^'\"]*['\"]|[^\s,;]+)",
+        "",
+        text,
+    )
     text = re.sub(r"(?<![\w-])\+?\d[\d\s().-]{7,}\d(?![\w-])", "", text)
     for key, value_text in protected.items():
         text = text.replace(key, value_text)
@@ -1322,25 +1374,155 @@ def _safe_commercial_text(value: Any, limit: int = 180) -> str:
 
 
 def _commercial_raw_risk_reasons(*values: Any) -> list[str]:
-    raw = " ".join(str(value or "") for value in values if value is not None)
-    if not raw:
-        return []
     reasons: list[str] = []
-    url_pattern = r"(?i)http" + r"s?://"
-    checks = {
-        "url_or_link": url_pattern,
-        "raw_whatsapp_ref": r"(?i)@(?:g\.us|lid|s\.whatsapp\.net|c\.us|whatsapp\.net)\b",
-        "secret_like_text": r"(?i)\b(?:api[_-]?key|secret|token|authorization|bearer)\s*[=:]\s*[^\s,;]+",
-        "phone_like_text": r"(?<![\w-])\+?\d[\d\s().-]{7,}\d(?![\w-])",
-    }
-    for reason, pattern in checks.items():
-        if re.search(pattern, raw):
-            reasons.append(reason)
-    return reasons
+    stack = [(value, 0) for value in reversed(values)]
+    nodes = 0
+    checks = (
+        ("url_or_link", r"(?i)http" + r"s?://"),
+        (
+            "raw_whatsapp_ref",
+            r"(?i)@(?:g\.us|lid|s\.whatsapp\.net|c\.us|whatsapp\.net)\b",
+        ),
+        ("email_like_text", r"\b[^\s@]+@[^\s@]+\.[^\s@]+\b"),
+        (
+            "secret_like_text",
+            r"(?i)(?<![\w])['\"]?(?:api[\s_-]*key|secret|token|authorization|bearer)"
+            r"['\"]?\s*[=:]",
+        ),
+    )
+    while stack:
+        value, depth = stack.pop()
+        nodes += 1
+        if nodes > _COMMERCIAL_MAX_NODES:
+            reasons.append("input_too_complex")
+            break
+        if depth > _COMMERCIAL_MAX_DEPTH:
+            reasons.append("input_too_complex")
+            continue
+        if isinstance(value, dict):
+            for key, nested in value.items():
+                if nodes + len(stack) >= _COMMERCIAL_MAX_NODES:
+                    reasons.append("input_too_complex")
+                    break
+                normalized_key = _commercial_key_name(key)
+                if not normalized_key:
+                    reasons.append("unsafe_nested_input")
+                    continue
+                if _commercial_key_is_sensitive(key):
+                    reasons.append("secret_like_text")
+                    continue
+                stack.append((nested, depth + 1))
+            continue
+        if isinstance(value, (list, tuple)):
+            for nested in value:
+                if nodes + len(stack) >= _COMMERCIAL_MAX_NODES:
+                    reasons.append("input_too_complex")
+                    break
+                stack.append((nested, depth + 1))
+            continue
+        if value is None:
+            continue
+        raw = _commercial_scalar_text(value)
+        if not raw:
+            if not isinstance(value, str):
+                reasons.append("unsafe_nested_input")
+            continue
+        if len(raw) > _COMMERCIAL_MAX_TEXT:
+            reasons.append("input_too_complex")
+            raw = raw[:_COMMERCIAL_MAX_TEXT]
+        for reason, pattern in checks:
+            if re.search(pattern, raw):
+                reasons.append(reason)
+        phone_scan = re.sub(_COMMERCIAL_DATE_PATTERN, "", raw)
+        if re.search(
+            r"(?<![\w-])\+?\d[\d\s().-]{7,}\d(?![\w-])", phone_scan
+        ):
+            reasons.append("phone_like_text")
+    return list(dict.fromkeys(reasons))
+
+
+def _commercial_sensitive_key_reasons(*values: Any) -> list[str]:
+    reasons: list[str] = []
+    stack = [(value, 0) for value in reversed(values)]
+    nodes = 0
+    while stack:
+        value, depth = stack.pop()
+        nodes += 1
+        if nodes > _COMMERCIAL_MAX_NODES:
+            reasons.append("input_too_complex")
+            break
+        if depth > _COMMERCIAL_MAX_DEPTH:
+            reasons.append("input_too_complex")
+            continue
+        if isinstance(value, dict):
+            for key, nested in value.items():
+                if nodes + len(stack) >= _COMMERCIAL_MAX_NODES:
+                    reasons.append("input_too_complex")
+                    break
+                if not _commercial_key_name(key):
+                    reasons.append("unsafe_nested_input")
+                    continue
+                if _commercial_key_is_sensitive(key):
+                    reasons.append("secret_like_text")
+                    continue
+                stack.append((nested, depth + 1))
+        elif isinstance(value, (list, tuple)):
+            for nested in value:
+                if nodes + len(stack) >= _COMMERCIAL_MAX_NODES:
+                    reasons.append("input_too_complex")
+                    break
+                stack.append((nested, depth + 1))
+    return list(dict.fromkeys(reasons))
+
+
+def _sanitize_commercial_structure(
+    value: Any,
+    *,
+    _depth: int = 0,
+    _budget: dict[str, int] | None = None,
+) -> Any:
+    budget = {"nodes": 0} if _budget is None else _budget
+    budget["nodes"] += 1
+    if budget["nodes"] > _COMMERCIAL_MAX_NODES or _depth > _COMMERCIAL_MAX_DEPTH:
+        return None
+    if isinstance(value, dict):
+        sanitized: dict[str, Any] = {}
+        for key, nested in value.items():
+            if budget["nodes"] >= _COMMERCIAL_MAX_NODES:
+                break
+            normalized_key = _commercial_key_name(key)
+            if not normalized_key or _commercial_key_is_sensitive(key):
+                continue
+            sanitized[key] = _sanitize_commercial_structure(
+                nested,
+                _depth=_depth + 1,
+                _budget=budget,
+            )
+        return sanitized
+    if isinstance(value, list):
+        sanitized_items: list[Any] = []
+        for nested in value:
+            if budget["nodes"] >= _COMMERCIAL_MAX_NODES:
+                break
+            sanitized_items.append(
+                _sanitize_commercial_structure(
+                    nested,
+                    _depth=_depth + 1,
+                    _budget=budget,
+                )
+            )
+        return sanitized_items
+    if value is None or type(value) in {bool, int, float}:
+        return value
+    if isinstance(value, str):
+        return _safe_commercial_text(value, _COMMERCIAL_MAX_TEXT)
+    return None
 
 
 def _safe_lead_id(value: Any) -> str:
-    raw = str(value or "").strip()
+    raw = _commercial_scalar_text(value).strip()[:_COMMERCIAL_MAX_TEXT]
+    if _commercial_raw_risk_reasons(raw):
+        return "lead_" + hash_text(raw or "unknown")[:10]
     safe = re.sub(r"[^A-Za-z0-9_.:-]+", "", raw)[:80]
     if not safe:
         return "lead_" + hash_text(raw or "unknown")[:10]
@@ -1352,7 +1534,7 @@ def _safe_lead_id(value: Any) -> str:
 def _safe_target_for_draft(value: Any) -> dict[str, Any] | None:
     if not isinstance(value, dict):
         return None
-    kind = str(value.get("type") or "contact").strip().lower()
+    kind = _commercial_scalar_text(value.get("type") or "contact").strip().lower()
     if kind in {"contato", "person", "lead"}:
         kind = "contact"
     if kind in {"grupo", "list"}:
@@ -1360,7 +1542,13 @@ def _safe_target_for_draft(value: Any) -> dict[str, Any] | None:
     if kind not in {"contact", "group"}:
         return None
     key = "group_id" if kind == "group" else "contact_id"
-    raw_id = str(value.get(key) or value.get("id") or value.get("contact_id") or value.get("group_id") or "").strip()
+    raw_id = _commercial_scalar_text(
+        value.get(key)
+        or value.get("id")
+        or value.get("contact_id")
+        or value.get("group_id")
+        or ""
+    ).strip()[:_COMMERCIAL_MAX_TEXT]
     if not raw_id:
         return None
     url_prefix = r"(?i)http" + r"s?://"
@@ -1389,7 +1577,9 @@ def _score_lead(lead: dict[str, Any], min_confidence: float, rank: int = 0, incl
     context = _safe_commercial_text(lead.get("context") or lead.get("notes") or lead.get("last_interaction"), 180)
     open_tasks = _safe_int_value(lead.get("open_tasks") or lead.get("tarefas_abertas") or 0, 0, 0, 20)
     stale_days = _safe_int_value(lead.get("last_interaction_days") or lead.get("stale_days") or 0, 0, 0, 365)
-    last_direction = str(lead.get("last_direction") or lead.get("direction") or "").strip().casefold()
+    last_direction = _commercial_scalar_text(
+        lead.get("last_direction") or lead.get("direction") or ""
+    ).strip().casefold()
     awaiting_reply = last_direction in {"outgoing", "from_me", "fromme", "sent_by_us"}
     target = _lead_target(lead)
 
@@ -1484,7 +1674,7 @@ def wpp_opportunity_scores(
     config: dict[str, Any] | None = None,
 ) -> str:
     """Rank commercial opportunities without sending, writing CRM, or fetching provider history."""
-    context = str(execution_context or "operator").strip().lower()
+    context = _commercial_execution_context(execution_context)
     if context not in {"operator", "autonomous"}:
         return _json({
             "ok": False,
@@ -1519,7 +1709,25 @@ def wpp_opportunity_scores(
         cap = min(cap, autonomy_decision.effective_items)
         threshold = max(threshold, autonomy_decision.min_confidence)
     input_leads = lead_inputs if isinstance(lead_inputs, list) else leads if isinstance(leads, list) else []
-    scored = [_score_lead(lead, threshold, include_evidence=include_evidence) for lead in input_leads if isinstance(lead, dict)]
+    typed_leads = [lead for lead in input_leads if isinstance(lead, dict)]
+    input_blocks = (
+        _autonomous_input_blocks(typed_leads)
+        if context == "autonomous"
+        else _commercial_input_blocks(typed_leads)
+    )
+    scoring_leads = [_sanitized_autonomous_lead(lead) for lead in typed_leads]
+    scored = [
+        _score_lead(lead, threshold, include_evidence=include_evidence)
+        for lead in scoring_leads
+        if isinstance(lead, dict)
+    ]
+    scored = _apply_autonomous_input_blocks(scored, input_blocks)
+    public_scored = _sanitize_commercial_structure(scored)
+    scored = (
+        [dict(item) for item in public_scored if isinstance(item, dict)]
+        if isinstance(public_scored, list)
+        else []
+    )
     scored.sort(key=lambda item: (float(item.get("confidence") or 0), item.get("priority") == "high"), reverse=True)
     for idx, item in enumerate(scored, start=1):
         item["rank"] = idx
@@ -1590,7 +1798,7 @@ def wpp_proactive_draft_queue(
     calls Telegram by itself, and never fetches provider history. Human approval
     + allowlist + send flags remain the only send path after a created draft.
     """
-    context = str(execution_context or "operator").strip().lower()
+    context = _commercial_execution_context(execution_context)
     if context not in {"operator", "autonomous"}:
         return _json({
             "ok": False,
@@ -1648,14 +1856,14 @@ def wpp_proactive_draft_queue(
         candidate_id = _candidate_id(raw)
         confidence = _safe_float_value(raw.get("confidence"), 0.0, 0.0, 1.0)
         target = _lead_target(raw)
-        action = str(raw.get("recommended_action") or "draft_followup").strip().lower()
+        action = _commercial_scalar_text(
+            raw.get("recommended_action") or "draft_followup"
+        ).strip().lower()
         message = _draft_message_for_opportunity(raw, objective=objective)
         rationale = _safe_commercial_text(raw.get("rationale") or raw.get("reason"), 220)
         source_context = raw.get("source_context") if isinstance(raw.get("source_context"), dict) else {}
         source_summary = _safe_commercial_text(source_context.get("summary") if isinstance(source_context, dict) else "", 180)
-        raw_risks = _commercial_raw_risk_reasons(
-            raw.get("message"), raw.get("draft_message"), raw.get("rationale"), raw.get("reason"), source_summary
-        )
+        raw_risks = _commercial_raw_risk_reasons(raw, objective)
         message_hash = "sha256:" + hash_text(message)[:16]
         dedupe_key = _safe_lead_id(raw.get("dedupe_key") or f"{candidate_id}:{message_hash}:{target}")
         base_item = {
@@ -1758,11 +1966,11 @@ def wpp_proactive_draft_queue(
                 "draft_created": True,
                 "approval_created": bool(approval),
             })
-        except Exception as exc:
+        except Exception:
             items.append({
                 **base_item,
                 "status": "manual_required",
-                "error": _safe_commercial_text(str(exc), 120) or "draft_creation_failed",
+                "error": "draft_creation_failed",
                 "missing_context": ["draft_creation_failed"],
                 "draft_created": False,
                 "approval_created": False,
@@ -1802,8 +2010,19 @@ _AUTONOMOUS_EXTERNAL_FLAGS: dict[str, bool] = {
 }
 
 
-def _autonomous_error_payload(error: str) -> dict[str, Any]:
-    return {"ok": False, "error": str(error or "autonomous_run_refused"), **_AUTONOMOUS_EXTERNAL_FLAGS}
+def _autonomous_error_code(value: Any, default: str) -> str:
+    error = _commercial_scalar_text(value).strip()
+    if re.fullmatch(r"[a-z][a-z0-9_]{0,79}", error):
+        return error
+    return default
+
+
+def _autonomous_error_payload(error: Any) -> dict[str, Any]:
+    return {
+        "ok": False,
+        "error": _autonomous_error_code(error, "autonomous_run_refused"),
+        **_AUTONOMOUS_EXTERNAL_FLAGS,
+    }
 
 
 def _autonomous_json_object(value: Any) -> dict[str, Any] | None:
@@ -1818,6 +2037,31 @@ def _autonomous_json_object(value: Any) -> dict[str, Any] | None:
     return parsed if isinstance(parsed, dict) else None
 
 
+def _sanitized_autonomous_lead(value: dict[str, Any]) -> dict[str, Any]:
+    sanitized = _sanitize_commercial_structure(value)
+    safe = sanitized if isinstance(sanitized, dict) else {}
+    safe["lead_id"] = _safe_lead_id(
+        value.get("lead_id")
+        or value.get("candidate_id")
+        or value.get("id")
+        or value.get("name")
+    )
+    return safe
+
+
+def _commercial_input_blocks(lead_inputs: list[dict[str, Any]]) -> dict[str, list[str]]:
+    blocked: dict[str, list[str]] = {}
+    for lead in lead_inputs:
+        reasons = _commercial_raw_risk_reasons(lead)
+        if not reasons:
+            continue
+        lead_id = _safe_lead_id(
+            lead.get("lead_id") or lead.get("candidate_id") or lead.get("id") or lead.get("name")
+        )
+        blocked[lead_id] = reasons
+    return blocked
+
+
 def _autonomous_input_blocks(lead_inputs: list[dict[str, Any]]) -> dict[str, list[str]]:
     blocked: dict[str, list[str]] = {}
     for lead in lead_inputs:
@@ -1828,7 +2072,9 @@ def _autonomous_input_blocks(lead_inputs: list[dict[str, Any]]) -> dict[str, lis
         target = lead.get("target")
         targets = lead.get("targets")
         if isinstance(target, dict):
-            kind = str(target.get("type") or "contact").strip().lower()
+            kind = _commercial_scalar_text(
+                target.get("type") or "contact"
+            ).strip().lower()
             if kind in {"group", "grupo", "list"}:
                 reasons.append("contact_only_v1")
             if _safe_target_for_draft(target) is None:
@@ -1840,41 +2086,24 @@ def _autonomous_input_blocks(lead_inputs: list[dict[str, Any]]) -> dict[str, lis
                 if not isinstance(alternate_target, dict):
                     reasons.append("unsafe_target")
                     continue
-                alternate_kind = str(alternate_target.get("type") or "contact").strip().lower()
+                alternate_kind = _commercial_scalar_text(
+                    alternate_target.get("type") or "contact"
+                ).strip().lower()
                 if alternate_kind in {"group", "grupo", "list"}:
                     reasons.append("contact_only_v1")
                 if _safe_target_for_draft(alternate_target) is None:
                     reasons.append("unsafe_target")
         elif targets is not None:
             reasons.append("unsafe_target")
-        if bool(lead.get("manual_required")) or str(
+        if bool(lead.get("manual_required")) or _commercial_scalar_text(
             lead.get("recommended_action") or ""
         ).strip().lower() in {"manual_required", "ask_operator", "wait"}:
             reasons.append("operator_review")
-        if bool(lead.get("awaiting_reply")) or str(
+        if bool(lead.get("awaiting_reply")) or _commercial_scalar_text(
             lead.get("last_direction") or ""
         ).strip().lower() in {"outgoing", "sent", "from_me"}:
             reasons.append("awaiting_reply")
-        reasons.extend(
-            _commercial_raw_risk_reasons(
-                lead.get("lead_id"),
-                lead.get("candidate_id"),
-                lead.get("id"),
-                lead.get("name"),
-                lead.get("status"),
-                lead.get("status_pipeline"),
-                lead.get("pipeline_status"),
-                lead.get("context"),
-                lead.get("message"),
-                lead.get("draft_message"),
-                lead.get("rationale"),
-                lead.get("reason"),
-                lead.get("objective"),
-                lead.get("source_context"),
-                target,
-                targets,
-            )
-        )
+        reasons.extend(_commercial_raw_risk_reasons(lead))
         if reasons:
             blocked[lead_id] = list(dict.fromkeys(reasons))
     return blocked
@@ -1957,7 +2186,11 @@ def _complete_autonomous_composer_run(
         result_class=result_class,
     )
     if completed.get("ok") is not True:
-        payload = _autonomous_error_payload(str(completed.get("error") or "autonomy_run_completion_refused"))
+        payload = _autonomous_error_payload(
+            _autonomous_error_code(
+                completed.get("error"), "autonomy_run_completion_refused"
+            )
+        )
         payload.update(
             {
                 "tool": "wpp_autonomous_run",
@@ -2005,7 +2238,13 @@ def wpp_autonomous_run(
         requires_local_write=requires_local_write,
     )
     if envelope.get("ok") is not True:
-        return _json(_autonomous_error_payload(str(envelope.get("error") or "mission_envelope_not_found")))
+        return _json(
+            _autonomous_error_payload(
+                _autonomous_error_code(
+                    envelope.get("error"), "mission_envelope_not_found"
+                )
+            )
+        )
 
     cfg = _runtime_config() if config is None else _deep_merge(_default_config(), config)
     fence = ""
@@ -2016,7 +2255,13 @@ def wpp_autonomous_run(
             requires_local_write=True,
         )
         if reserved.get("ok") is not True:
-            return _json(_autonomous_error_payload(str(reserved.get("error") or "autonomy_run_refused")))
+            return _json(
+                _autonomous_error_payload(
+                    _autonomous_error_code(
+                        reserved.get("error"), "autonomy_run_refused"
+                    )
+                )
+            )
         raw_fence = reserved.get("fence")
         if not isinstance(raw_fence, str) or not raw_fence:
             if reserved.get("status") == "completed":
@@ -2039,6 +2284,7 @@ def wpp_autonomous_run(
 
     item_count = 0
     try:
+        input_blocks = _autonomous_input_blocks(lead_inputs)
         score_result = _autonomous_json_object(
             wpp_opportunity_scores(
                 lead_inputs=lead_inputs,
@@ -2048,7 +2294,9 @@ def wpp_autonomous_run(
             )
         )
         if score_result is None or score_result.get("ok") is not True:
-            error = str((score_result or {}).get("error") or "autonomous_score_failed")
+            error = _autonomous_error_code(
+                (score_result or {}).get("error"), "autonomous_score_failed"
+            )
             if not requires_local_write:
                 return _json(_autonomous_error_payload(error))
             return _json(
@@ -2063,10 +2311,26 @@ def wpp_autonomous_run(
             )
 
         raw_opportunities = score_result.get("opportunities")
-        opportunities = [dict(item) for item in raw_opportunities if isinstance(item, dict)] if isinstance(raw_opportunities, list) else []
+        raw_items = (
+            [dict(item) for item in raw_opportunities if isinstance(item, dict)]
+            if isinstance(raw_opportunities, list)
+            else []
+        )
+        sanitized_items = _sanitize_commercial_structure(raw_items)
+        opportunities = (
+            [dict(item) for item in sanitized_items if isinstance(item, dict)]
+            if isinstance(sanitized_items, list)
+            else []
+        )
         opportunities = _apply_autonomous_input_blocks(
             opportunities,
-            _autonomous_input_blocks(lead_inputs),
+            input_blocks,
+        )
+        public_items = _sanitize_commercial_structure(opportunities)
+        opportunities = (
+            [dict(item) for item in public_items if isinstance(item, dict)]
+            if isinstance(public_items, list)
+            else []
         )
         item_count = len(opportunities)
         blocked_count = sum(1 for item in opportunities if bool(item.get("manual_required")))
@@ -2121,7 +2385,9 @@ def wpp_autonomous_run(
                     items=item_count,
                     local_writes=0,
                     result_class="policy_blocked",
-                    error=str(envelope_recheck.get("error") or "mission_envelope_changed"),
+                    error=_autonomous_error_code(
+                        envelope_recheck.get("error"), "mission_envelope_changed"
+                    ),
                 )
             )
 
@@ -2169,8 +2435,9 @@ def wpp_autonomous_run(
         manual_required_count = _safe_int_value(
             queue_result.get("manual_required_count"), 0, 0, item_count
         )
-        queue_error = str(queue_result.get("error") or "")
+        queue_error = _autonomous_error_code(queue_result.get("error"), "")
         if queue_result.get("ok") is not True:
+            queue_error = queue_error or "autonomous_queue_failed"
             result_class = "policy_blocked" if queue_error == "autonomy_denied" else "safe_failure"
         elif approvals_created != drafts_created:
             result_class = "safe_failure"
@@ -2181,7 +2448,15 @@ def wpp_autonomous_run(
             result_class = "policy_blocked"
         else:
             result_class = "no_op"
-        queue_items = queue_result.get("items") if isinstance(queue_result.get("items"), list) else []
+        raw_queue_items = (
+            queue_result.get("items")
+            if isinstance(queue_result.get("items"), list)
+            else []
+        )
+        sanitized_queue_items = _sanitize_commercial_structure(raw_queue_items)
+        queue_items = (
+            sanitized_queue_items if isinstance(sanitized_queue_items, list) else []
+        )
         extra = {
             "drafts_created": drafts_created,
             "approvals_created": approvals_created,

@@ -1,3 +1,4 @@
+import hashlib
 import json
 import sqlite3
 from datetime import datetime, timedelta, timezone
@@ -1551,17 +1552,30 @@ def test_inspect_mission_envelope_is_exact_sanitized_and_read_only(tmp_path):
             expires_at=(datetime.now(timezone.utc) + timedelta(hours=1)).isoformat(),
         )
         db = get_db_path()
-        with sqlite3.connect(db) as conn:
-            before = {
-                table: conn.execute(f"SELECT COUNT(*) FROM {table}").fetchone()[0]
-                for table in ("mission_envelopes", "autonomy_runs", "drafts", "approvals", "outbox", "contacts")
+        def snapshot():
+            with sqlite3.connect(db) as conn:
+                schema = conn.execute(
+                    "SELECT type, name, tbl_name, sql FROM sqlite_master ORDER BY type, name"
+                ).fetchall()
+                tables = [row[1] for row in schema if row[0] == "table"]
+                row_counts = {}
+                for table in tables:
+                    quoted = '"' + table.replace('"', '""') + '"'
+                    row_counts[table] = conn.execute(
+                        f"SELECT COUNT(*) FROM {quoted}"
+                    ).fetchone()[0]
+            return {
+                "file_hash": hashlib.sha256(db.read_bytes()).hexdigest(),
+                "schema_hash": hashlib.sha256(
+                    json.dumps(schema, ensure_ascii=False).encode("utf-8")
+                ).hexdigest(),
+                "tables": tables,
+                "row_counts": row_counts,
             }
+
+        before = snapshot()
         inspected = inspect_mission_envelope(envelope["envelope_digest"])
-        with sqlite3.connect(db) as conn:
-            after = {
-                table: conn.execute(f"SELECT COUNT(*) FROM {table}").fetchone()[0]
-                for table in ("mission_envelopes", "autonomy_runs", "drafts", "approvals", "outbox", "contacts")
-            }
+        after = snapshot()
     finally:
         reset_hermes_home_override(token)
 
@@ -1580,6 +1594,61 @@ def test_inspect_mission_envelope_is_exact_sanitized_and_read_only(tmp_path):
         "active",
         "killed",
     }
+
+
+def test_inspect_mission_envelope_missing_store_is_fail_closed_without_creating_db(tmp_path):
+    from tools.whatsapp_ops_store import get_db_path, inspect_mission_envelope
+
+    token = set_hermes_home_override(tmp_path)
+    try:
+        db = get_db_path()
+        assert not db.exists()
+        inspected = inspect_mission_envelope("a" * 64)
+        still_absent = not db.exists()
+    finally:
+        reset_hermes_home_override(token)
+
+    assert inspected == {
+        "ok": False,
+        "error": "mission_envelope_store_unavailable",
+    }
+    assert still_absent is True
+
+
+def test_inspect_mission_envelope_legacy_store_is_fail_closed_and_byte_unchanged(tmp_path):
+    from tools.whatsapp_ops_store import get_db_path, inspect_mission_envelope
+
+    token = set_hermes_home_override(tmp_path)
+    try:
+        db = get_db_path()
+        with sqlite3.connect(db) as conn:
+            conn.execute("CREATE TABLE legacy_rows (id INTEGER PRIMARY KEY, value TEXT NOT NULL)")
+            conn.execute("INSERT INTO legacy_rows (value) VALUES (?)", ("legacy-value",))
+        before_hash = hashlib.sha256(db.read_bytes()).hexdigest()
+        with sqlite3.connect(db) as conn:
+            before_schema = conn.execute(
+                "SELECT type, name, tbl_name, sql FROM sqlite_master ORDER BY type, name"
+            ).fetchall()
+            before_rows = conn.execute("SELECT id, value FROM legacy_rows").fetchall()
+
+        inspected = inspect_mission_envelope("b" * 64)
+
+        after_hash = hashlib.sha256(db.read_bytes()).hexdigest()
+        with sqlite3.connect(db) as conn:
+            after_schema = conn.execute(
+                "SELECT type, name, tbl_name, sql FROM sqlite_master ORDER BY type, name"
+            ).fetchall()
+            after_rows = conn.execute("SELECT id, value FROM legacy_rows").fetchall()
+    finally:
+        reset_hermes_home_override(token)
+
+    assert inspected == {
+        "ok": False,
+        "error": "mission_envelope_store_unavailable",
+    }
+    assert after_hash == before_hash
+    assert after_schema == before_schema
+    assert after_rows == before_rows
 
 
 def test_atomic_autonomy_write_rechecks_lease_after_acquiring_write_lock(tmp_path, monkeypatch):

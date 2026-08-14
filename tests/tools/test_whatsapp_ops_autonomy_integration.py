@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import sqlite3
+from typing import Any, cast
 
 from hermes_constants import reset_hermes_home_override, set_hermes_home_override
 
@@ -491,6 +492,327 @@ def test_autonomous_queue_blocks_unsafe_or_manual_inputs_without_local_writes(tm
     serialized = json.dumps(results, ensure_ascii=False)
     assert raw_phone not in serialized
     assert "unsafe.example" not in serialized
+
+
+def test_autonomous_preview_and_queue_block_nested_raw_inputs_without_leaking(tmp_path):
+    from tools.whatsapp_ops_store import get_db_path
+    from tools.whatsapp_ops_tool import wpp_autonomous_run, wpp_opportunity_scores
+
+    sentinel = "TOPSECRET-REVIEW-PROBE"
+    raw_url = "https" + "://nested-unsafe.example/path"
+    raw_email = "owner" + "@nested-unsafe.example"
+    raw_phone = "553199998" + "765"
+    raw_ref = "120363430137938027" + "@g.us"
+    unsafe_lead = {
+        **_mission_leads(1)[0],
+        "commercial_context": {
+            "safe_segment": "renovacao",
+            "layers": [
+                {"api-key": sentinel},
+                {"channels": [raw_url, raw_email, raw_phone, raw_ref]},
+            ],
+        },
+    }
+
+    token = set_hermes_home_override(tmp_path)
+    try:
+        envelope = _register_mission(max_items=1, max_local_writes=1)
+        db = get_db_path()
+        before = _business_counts(db)
+        scored = _parse(
+            wpp_opportunity_scores(
+                lead_inputs=[unsafe_lead],
+                limit=1,
+                execution_context="autonomous",
+                config=_autonomy_config(max_items=1),
+            )
+        )
+        preview = _parse(
+            wpp_autonomous_run(
+                envelope["envelope_digest"],
+                "run_nested_preview_01",
+                [unsafe_lead],
+                mode="preview",
+                config=_autonomy_config(max_items=1),
+            )
+        )
+        queued = _parse(
+            wpp_autonomous_run(
+                envelope["envelope_digest"],
+                "run_nested_queue_01",
+                [unsafe_lead],
+                mode="queue",
+                config=_autonomy_config(max_items=1),
+            )
+        )
+        after = _business_counts(db)
+    finally:
+        reset_hermes_home_override(token)
+
+    assert scored["opportunities"][0]["manual_required"] is True
+    assert preview["opportunities"][0]["manual_required"] is True
+    assert preview["counters"]["blocked"] == 1
+    assert queued["result_class"] == "policy_blocked"
+    assert queued["counters"]["local_writes"] == 0
+    assert queued["items"][0]["status"] == "manual_required"
+    assert after["drafts"] == before["drafts"]
+    assert after["approvals"] == before["approvals"]
+    assert after["outbox"] == before["outbox"]
+    serialized = json.dumps(
+        {"score": scored, "preview": preview, "queue": queued},
+        ensure_ascii=False,
+        sort_keys=True,
+    )
+    for raw_value in (sentinel, raw_url, raw_email, raw_phone, raw_ref):
+        assert raw_value not in serialized
+
+
+def test_operator_score_blocks_nested_raw_inputs_without_leaking():
+    from tools.whatsapp_ops_tool import wpp_opportunity_scores
+
+    raw_cases = (
+        ("url_or_link", "https" + "://operator-unsafe.example/path"),
+        ("email_like_text", "owner" + "@operator-unsafe.example"),
+        ("phone_like_text", "553199998" + "765"),
+        ("raw_whatsapp_ref", "120363430137938027" + "@g.us"),
+    )
+    blocked = []
+    for index, (reason, raw_value) in enumerate(raw_cases, start=1):
+        unsafe_lead = {
+            **_mission_leads(1)[0],
+            "lead_id": f"OPERATOR-UNSAFE-{index}",
+            "commercial_context": {"layers": [{"value": raw_value}]},
+        }
+        result = _parse(
+            wpp_opportunity_scores(
+                lead_inputs=[unsafe_lead],
+                limit=1,
+                execution_context="operator",
+                config=_autonomy_config(max_items=1),
+            )
+        )
+        blocked.append((reason, raw_value, result))
+
+    safe_control = _parse(
+        wpp_opportunity_scores(
+            lead_inputs=[
+                {
+                    **_mission_leads(1)[0],
+                    "lead_id": "OPERATOR-SAFE-CONTROL",
+                    "commercial_context": {
+                        "layers": [{"value": "renovacao prioritaria"}]
+                    },
+                }
+            ],
+            limit=1,
+            execution_context="operator",
+            config=_autonomy_config(max_items=1),
+        )
+    )
+
+    for reason, raw_value, result in blocked:
+        opportunity = result["opportunities"][0]
+        assert opportunity["manual_required"] is True
+        assert reason in opportunity["risk_flags"]
+        serialized = json.dumps(result, ensure_ascii=False, sort_keys=True)
+        assert raw_value.casefold() not in serialized.casefold()
+    assert safe_control["opportunities"][0]["manual_required"] is False
+
+
+def test_commercial_tools_reject_container_execution_context_without_echo():
+    from tools.whatsapp_ops_tool import wpp_opportunity_scores, wpp_proactive_draft_queue
+
+    sentinel = "TOPSECRET-EXECUTION-CONTEXT-PROBE"
+    execution_context = {"api_key": sentinel}
+    results = [
+        _parse(
+            wpp_opportunity_scores(
+                lead_inputs=_mission_leads(1),
+                execution_context=cast(Any, execution_context),
+            )
+        ),
+        _parse(
+            wpp_proactive_draft_queue(
+                candidates=_candidates(1),
+                execution_context=cast(Any, execution_context),
+            )
+        ),
+    ]
+
+    for result in results:
+        assert result["ok"] is False
+        assert result["error"] == "execution_context_invalid"
+        assert result["execution_context"] == ""
+    serialized = json.dumps(results, ensure_ascii=False, sort_keys=True)
+    assert sentinel.casefold() not in serialized.casefold()
+
+
+def test_autonomous_paths_block_composite_sensitive_keys_without_leaking(tmp_path):
+    from tools.whatsapp_ops_store import get_db_path
+    from tools.whatsapp_ops_tool import wpp_autonomous_run, wpp_opportunity_scores
+
+    token = set_hermes_home_override(tmp_path)
+    try:
+        envelope = _register_mission(max_items=1, max_local_writes=1)
+        db = get_db_path()
+        before = _business_counts(db)
+        results = []
+        for index, sensitive_key in enumerate(
+            (
+                "access_token",
+                "bearer_token",
+                "commercial_api_key",
+                "apiKeyMaterial",
+                "apiKEYMaterial",
+                "clientSECRETMaterial",
+                "AccessTOKENMaterial",
+                "commercialapikey",
+                "clientsecretmaterial",
+                "accesstoken",
+                "bearertoken",
+                "authorizationheader",
+            ),
+            start=1,
+        ):
+            sentinel = f"TOPSECRET-COMPOSITE-{index}-PROBE"
+            unsafe_lead = {
+                **_mission_leads(1)[0],
+                "commercial_context": {
+                    "safe_segment": "renovacao",
+                    sensitive_key: sentinel,
+                },
+            }
+            operator_scored = _parse(
+                wpp_opportunity_scores(
+                    lead_inputs=[unsafe_lead],
+                    limit=1,
+                    execution_context="operator",
+                    config=_autonomy_config(max_items=1),
+                )
+            )
+            scored = _parse(
+                wpp_opportunity_scores(
+                    lead_inputs=[unsafe_lead],
+                    limit=1,
+                    execution_context="autonomous",
+                    config=_autonomy_config(max_items=1),
+                )
+            )
+            preview = _parse(
+                wpp_autonomous_run(
+                    envelope["envelope_digest"],
+                    f"run_composite_preview_{index}",
+                    [unsafe_lead],
+                    mode="preview",
+                    config=_autonomy_config(max_items=1),
+                )
+            )
+            queued = _parse(
+                wpp_autonomous_run(
+                    envelope["envelope_digest"],
+                    f"run_composite_queue_{index}",
+                    [unsafe_lead],
+                    mode="queue",
+                    config=_autonomy_config(max_items=1),
+                )
+            )
+            results.append((sentinel, operator_scored, scored, preview, queued))
+        after = _business_counts(db)
+    finally:
+        reset_hermes_home_override(token)
+
+    assert after["drafts"] == before["drafts"]
+    assert after["approvals"] == before["approvals"]
+    assert after["outbox"] == before["outbox"]
+    for sentinel, operator_scored, scored, preview, queued in results:
+        assert operator_scored["opportunities"][0]["manual_required"] is True
+        assert "secret_like_text" in operator_scored["opportunities"][0]["risk_flags"]
+        assert scored["opportunities"][0]["manual_required"] is True
+        assert "secret_like_text" in scored["opportunities"][0]["risk_flags"]
+        assert preview["opportunities"][0]["manual_required"] is True
+        assert preview["counters"]["blocked"] == 1
+        assert queued["result_class"] == "policy_blocked"
+        assert queued["counters"]["local_writes"] == 0
+        assert queued["items"][0]["status"] == "manual_required"
+        serialized = json.dumps(
+            {
+                "operator_score": operator_scored,
+                "autonomous_score": scored,
+                "preview": preview,
+                "queue": queued,
+            },
+            ensure_ascii=False,
+            sort_keys=True,
+        )
+        assert sentinel.casefold() not in serialized.casefold()
+
+
+def test_autonomous_preview_preserves_safe_nested_commercial_context(tmp_path):
+    from tools.whatsapp_ops_tool import wpp_autonomous_run
+
+    safe_lead = {
+        **_mission_leads(1)[0],
+        "commercial_context": {
+            "segment": "renovacao",
+            "signals": ["proposta", {"intent": "retomar"}],
+        },
+    }
+    token = set_hermes_home_override(tmp_path)
+    try:
+        envelope = _register_mission(max_items=1, max_local_writes=1)
+        preview = _parse(
+            wpp_autonomous_run(
+                envelope["envelope_digest"],
+                "run_safe_nested_preview_01",
+                [safe_lead],
+                mode="preview",
+                config=_autonomy_config(max_items=1),
+            )
+        )
+    finally:
+        reset_hermes_home_override(token)
+
+    assert preview["ok"] is True
+    assert preview["counters"]["actionable"] == 1
+    assert preview["counters"]["blocked"] == 0
+    assert preview["opportunities"][0]["manual_required"] is False
+
+
+def test_autonomous_preview_bounds_nested_input_complexity_without_echo(tmp_path):
+    from tools.whatsapp_ops_tool import wpp_autonomous_run
+
+    sentinel = "TOPSECRET-BOUNDARY-PROBE"
+    deep: dict[str, object] = {"value": "safe"}
+    for _ in range(8):
+        deep = {"next": deep}
+    bounded_lead = {
+        **_mission_leads(1)[0],
+        "commercial_context": {
+            "long_text": ("A" * 3000) + sentinel,
+            "deep": deep,
+            "wide": ["safe"] * 5000,
+        },
+    }
+
+    token = set_hermes_home_override(tmp_path)
+    try:
+        envelope = _register_mission(max_items=1, max_local_writes=1)
+        preview = _parse(
+            wpp_autonomous_run(
+                envelope["envelope_digest"],
+                "run_bounded_nested_preview_01",
+                [bounded_lead],
+                mode="preview",
+                config=_autonomy_config(max_items=1),
+            )
+        )
+    finally:
+        reset_hermes_home_override(token)
+
+    opportunity = preview["opportunities"][0]
+    assert opportunity["manual_required"] is True
+    assert "input_too_complex" in opportunity["risk_flags"]
+    assert sentinel not in json.dumps(preview, ensure_ascii=False, sort_keys=True)
 
 
 def test_autonomous_queue_exception_completes_safe_failure_and_is_not_blind_retried(tmp_path, monkeypatch):

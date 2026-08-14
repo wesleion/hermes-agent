@@ -1550,9 +1550,15 @@ def test_wpp_opportunity_scores_rank_read_only_sanitized_and_auditable(tmp_path)
     assert first["lead_id"] == "LEAD-001"
     assert first["opportunity_id"].startswith("opp_")
     assert first["priority"] == "high"
-    assert first["manual_required"] is False
-    assert first["recommended_action"] == "draft_followup"
-    assert first["recommended_next_action"] == "draft_followup"
+    assert first["manual_required"] is True
+    assert first["recommended_action"] == "manual_required"
+    assert first["recommended_next_action"] == "manual_required"
+    assert set(first["risk_flags"]) >= {
+        "url_or_link",
+        "raw_whatsapp_ref",
+        "secret_like_text",
+        "phone_like_text",
+    }
     assert set(first["score_breakdown"]) >= {"pipeline", "recency", "open_tasks", "intent", "target", "data_quality"}
     assert first["signals"]
     assert second["manual_required"] is True

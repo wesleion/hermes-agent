@@ -158,6 +158,20 @@ def _connect() -> sqlite3.Connection:
     return conn
 
 
+def _connect_read_only() -> sqlite3.Connection:
+    """Open the existing store without creating files or allowing writes."""
+
+    db_uri = get_db_path().absolute().as_uri() + "?mode=ro"
+    conn = sqlite3.connect(db_uri, uri=True)
+    try:
+        conn.execute("PRAGMA query_only = ON")
+    except sqlite3.Error:
+        conn.close()
+        raise
+    conn.row_factory = sqlite3.Row
+    return conn
+
+
 def _migrate_mission_ledger(conn: sqlite3.Connection) -> None:
     """Atomically add the bounded mission ledger without owning the connection.
 
@@ -5218,13 +5232,15 @@ def inspect_mission_envelope(
         return _mission_error("mission_envelope_digest_invalid")
     if type(requires_local_write) is not bool:
         return _mission_error("mission_envelope_local_write_flag_invalid")
-    init_db()
-    with _connect() as conn:
-        envelope, error = _validated_mission_envelope(
-            conn,
-            envelope_digest,
-            requires_local_write=requires_local_write,
-        )
+    try:
+        with _connect_read_only() as conn:
+            envelope, error = _validated_mission_envelope(
+                conn,
+                envelope_digest,
+                requires_local_write=requires_local_write,
+            )
+    except sqlite3.Error:
+        return _mission_error("mission_envelope_store_unavailable")
     if error is not None or envelope is None:
         return _mission_error(error or "mission_envelope_changed")
     return _safe_mission_envelope(envelope)
