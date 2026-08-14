@@ -77,6 +77,8 @@ def evaluate_send_guardrails(
 
     if draft.get("has_untrusted_media"):
         reasons.append("media_untrusted")
+    if draft.get("signature_valid") is not True:
+        reasons.append("draft_signature_invalid")
 
     targets = draft.get("targets") or []
     if not targets:
@@ -130,6 +132,8 @@ def evaluate_send_guardrails(
             reasons.append("approval_expired")
         if draft.get("message_hash") != approval.get("message_hash"):
             reasons.append("message_changed_after_approval")
+        if draft.get("idempotency_key") != approval.get("draft_idempotency_key"):
+            reasons.append("draft_changed_after_approval")
 
     if idempotency_used:
         reasons.append("idempotency_duplicate")

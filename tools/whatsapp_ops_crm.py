@@ -20,6 +20,7 @@ from datetime import datetime, timezone
 from typing import Any, Callable
 
 from tools.whatsapp_ops_store import (
+    get_contact_crm_binding,
     hash_text,
     init_db,
     mark_crm_append_result,
@@ -156,6 +157,10 @@ def _crm_context(draft: dict[str, Any]) -> tuple[dict[str, str] | None, str | No
     targets = _parse_targets(draft)
     if len(targets) != 1 or str(targets[0].get("type") or "contact").strip().lower() != "contact":
         return None, "crm_contact_target_required"
+    local_contact_id = str(targets[0].get("contact_id") or "").strip()
+    trusted_binding = get_contact_crm_binding(local_contact_id)
+    if trusted_binding is None:
+        return None, "crm_contact_binding_missing"
     raw = targets[0].get("crm")
     if not isinstance(raw, dict) or not raw:
         return None, "crm_context_missing"
@@ -172,6 +177,11 @@ def _crm_context(draft: dict[str, Any]) -> tuple[dict[str, str] | None, str | No
         or (raw.get("next_step") not in (None, "") and not next_step)
     ):
         return None, "crm_context_invalid"
+    if (
+        lead_id != str(trusted_binding.get("lead_id") or "").strip()
+        or contact_id != str(trusted_binding.get("contact_id") or "").strip()
+    ):
+        return None, "crm_contact_binding_mismatch"
     return {
         "lead_id": lead_id,
         "contact_id": contact_id,
@@ -179,6 +189,11 @@ def _crm_context(draft: dict[str, Any]) -> tuple[dict[str, str] | None, str | No
         "summary": summary,
         "next_step": next_step,
     }, None
+
+
+def approval_crm_preview(draft: dict[str, Any]) -> tuple[dict[str, str] | None, str | None]:
+    """Return only sanitized, trusted fields that the human will approve."""
+    return _crm_context(draft)
 
 
 def _safe_occurred_at(draft: dict[str, Any], approval: dict[str, Any]) -> str:
@@ -259,6 +274,8 @@ def _preflight_reason(
         return "approval_resolution_missing"
     if approval.get("message_hash") != draft.get("message_hash"):
         return "approval_message_mismatch"
+    if approval.get("draft_idempotency_key") != draft.get("idempotency_key"):
+        return "approval_draft_mismatch"
     if send_result.get("ok") is not True:
         return "send_not_completed"
 
@@ -308,6 +325,18 @@ def _preflight_reason(
     if not _CREDENTIAL_ENV_RE.fullmatch(credentials_env):
         return "crm_credentials_env_invalid"
     return None
+
+
+def crm_send_preflight(
+    *, draft: dict[str, Any], approval: dict[str, Any], config: dict[str, Any]
+) -> str | None:
+    """Validate every CRM gate before a contact send reaches its provider."""
+    crm_config = _configured_crm(config)
+    reason = _preflight_reason(crm_config, draft, approval, {"ok": True})
+    if reason:
+        return reason
+    _, context_reason = _crm_context(draft)
+    return context_reason
 
 
 def _verify_append_response(response: Any, row: list[str]) -> bool:

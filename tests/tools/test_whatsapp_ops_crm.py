@@ -19,6 +19,19 @@ CRM_HEADER = (
 )
 
 
+@pytest.fixture(autouse=True)
+def _trusted_contact_crm_binding(monkeypatch):
+    import tools.whatsapp_ops_crm as crm
+
+    monkeypatch.setattr(
+        crm,
+        "get_contact_crm_binding",
+        lambda contact_id: {"lead_id": "L-001", "contact_id": "C-001"}
+        if str(contact_id or "").strip()
+        else None,
+    )
+
+
 def _config() -> dict:
     return {
         "crm": {
@@ -70,6 +83,7 @@ def _approval() -> dict:
         "id": "approval_safe_01",
         "status": "approved",
         "message_hash": "a" * 64,
+        "draft_idempotency_key": "b" * 64,
         "approver_ref_hash": "c" * 64,
         "resolved_at": "2026-07-15T12:01:00+00:00",
     }
@@ -207,6 +221,10 @@ def test_unsafe_credentials_env_is_blocked_before_client(tmp_path):
         (lambda approval: approval.update(approver_ref_hash=""), "approval_human_actor_missing"),
         (lambda approval: approval.update(resolved_at=""), "approval_resolution_missing"),
         (lambda approval: approval.update(message_hash="d" * 64), "approval_message_mismatch"),
+        (
+            lambda approval: approval.update(draft_idempotency_key="d" * 64),
+            "approval_draft_mismatch",
+        ),
     ],
 )
 def test_preflight_requires_resolved_human_approval_for_exact_message(tmp_path, mutate, reason):
@@ -220,6 +238,37 @@ def test_preflight_requires_resolved_human_approval_for_exact_message(tmp_path, 
         result = append_approved_send_event(
             draft=_draft(),
             approval=approval,
+            send_result=_send_result(),
+            config=_config(),
+            client=client,
+        )
+    finally:
+        reset_hermes_home_override(token)
+
+    assert result["result"] == "blocked"
+    assert result["reason"] == reason
+    assert result["attempted"] is False
+    client.assert_not_called()
+
+
+@pytest.mark.parametrize(
+    ("binding", "reason"),
+    [
+        (None, "crm_contact_binding_missing"),
+        ({"lead_id": "L-999", "contact_id": "C-001"}, "crm_contact_binding_mismatch"),
+        ({"lead_id": "L-001", "contact_id": "C-999"}, "crm_contact_binding_mismatch"),
+    ],
+)
+def test_crm_context_must_match_trusted_local_contact_binding(tmp_path, monkeypatch, binding, reason):
+    import tools.whatsapp_ops_crm as crm
+
+    monkeypatch.setattr(crm, "get_contact_crm_binding", lambda _contact_id: binding)
+    client = Mock()
+    token = set_hermes_home_override(tmp_path)
+    try:
+        result = crm.append_approved_send_event(
+            draft=_draft(),
+            approval=_approval(),
             send_result=_send_result(),
             config=_config(),
             client=client,

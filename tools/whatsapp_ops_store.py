@@ -30,6 +30,7 @@ DB_FILENAME = "wpp_ops.sqlite"
 _STAGING_TTL = timedelta(minutes=5)
 _STAGING_TTL_MIN_SECONDS = 60
 _STAGING_TTL_MAX_SECONDS = 7 * 24 * 60 * 60
+_CRM_BINDING_ID_RE = re.compile(r"^[A-Za-z][A-Za-z0-9_.:-]{0,39}$")
 
 
 def utc_now() -> str:
@@ -232,6 +233,7 @@ def init_db() -> Path:
                 approval_token_hash TEXT NOT NULL UNIQUE,
                 approver_ref_hash TEXT,
                 message_hash TEXT NOT NULL,
+                draft_idempotency_key TEXT NOT NULL,
                 status TEXT NOT NULL,
                 expires_at TEXT NOT NULL,
                 created_at TEXT NOT NULL,
@@ -319,6 +321,7 @@ def init_db() -> Path:
             """
         )
         _ensure_draft_columns(conn)
+        _ensure_approval_columns(conn)
         _ensure_list_columns(conn)
         _ensure_contact_channel_columns(conn)
         _ensure_media_transcription_columns(conn)
@@ -346,6 +349,16 @@ def _ensure_draft_columns(conn: sqlite3.Connection) -> None:
     columns = {row["name"] for row in conn.execute("PRAGMA table_info(drafts)")}
     if "media_json" not in columns:
         conn.execute("ALTER TABLE drafts ADD COLUMN media_json TEXT")
+
+
+def _ensure_approval_columns(conn: sqlite3.Connection) -> None:
+    """Bind new approvals to the complete immutable draft signature.
+
+    Legacy rows remain NULL and therefore fail closed in send/CRM policy.
+    """
+    columns = {row["name"] for row in conn.execute("PRAGMA table_info(approvals)")}
+    if "draft_idempotency_key" not in columns:
+        conn.execute("ALTER TABLE approvals ADD COLUMN draft_idempotency_key TEXT")
 
 
 def _ensure_list_columns(conn: sqlite3.Connection) -> None:
@@ -1313,7 +1326,24 @@ def upsert_contact(
     phone_hash = hash_text(phone_digits) if phone_digits else None
     masked_phone = _safe_existing_phone_mask(phone_e164)
     phone_value = phone_e164.strip() if phone_digits or masked_phone else None
+    incoming_metadata = dict(metadata) if isinstance(metadata, dict) else {}
+    # CRM identity is an authorization boundary. Generic contact/allowlist
+    # sync may preserve an existing binding but may never create or replace it.
+    incoming_metadata.pop("crm_lead_id", None)
+    incoming_metadata.pop("crm_contact_id", None)
     with _connect() as conn:
+        existing = conn.execute(
+            "SELECT metadata_json FROM contacts WHERE id=?", (contact_id,)
+        ).fetchone()
+        if existing is not None:
+            try:
+                existing_metadata = json.loads(str(existing["metadata_json"] or "{}"))
+            except (TypeError, json.JSONDecodeError):
+                existing_metadata = {}
+            if isinstance(existing_metadata, dict):
+                for key in ("crm_lead_id", "crm_contact_id"):
+                    if existing_metadata.get(key):
+                        incoming_metadata[key] = existing_metadata[key]
         conn.execute(
             """
             INSERT INTO contacts (
@@ -1334,7 +1364,7 @@ def upsert_contact(
                 phone_hash,
                 phone_value,
                 policy_group,
-                json.dumps(metadata or {}, ensure_ascii=False, sort_keys=True),
+                json.dumps(incoming_metadata, ensure_ascii=False, sort_keys=True),
                 now,
                 now,
             ),
@@ -1355,6 +1385,47 @@ def upsert_contact(
             )
         stored = conn.execute("SELECT * FROM contacts WHERE id=?", (contact_id,)).fetchone()
     return _safe_contact(dict(stored))
+
+
+def bind_contact_crm_identity(
+    *, contact_id: str, lead_id: str, crm_contact_id: str
+) -> dict[str, str]:
+    """Explicitly bind one local contact to one immutable CRM identity pair."""
+    local_id = str(contact_id or "").strip()
+    lead = str(lead_id or "").strip()
+    crm_contact = str(crm_contact_id or "").strip()
+    if (
+        not local_id
+        or not _CRM_BINDING_ID_RE.fullmatch(lead)
+        or not _CRM_BINDING_ID_RE.fullmatch(crm_contact)
+    ):
+        raise ValueError("invalid CRM contact binding")
+    init_db()
+    with _connect() as conn:
+        row = conn.execute(
+            "SELECT metadata_json FROM contacts WHERE id=?", (local_id,)
+        ).fetchone()
+        if row is None:
+            raise ValueError("CRM contact binding owner not found")
+        try:
+            metadata = json.loads(str(row["metadata_json"] or "{}"))
+        except (TypeError, json.JSONDecodeError):
+            metadata = {}
+        if not isinstance(metadata, dict):
+            metadata = {}
+        existing = (
+            str(metadata.get("crm_lead_id") or "").strip(),
+            str(metadata.get("crm_contact_id") or "").strip(),
+        )
+        requested = (lead, crm_contact)
+        if any(existing) and existing != requested:
+            raise ValueError("CRM contact binding conflict")
+        metadata.update({"crm_lead_id": lead, "crm_contact_id": crm_contact})
+        conn.execute(
+            "UPDATE contacts SET metadata_json=?, updated_at=? WHERE id=?",
+            (json.dumps(metadata, ensure_ascii=False, sort_keys=True), utc_now(), local_id),
+        )
+    return {"lead_id": lead, "contact_id": crm_contact}
 
 
 def upsert_channel(
@@ -2579,10 +2650,60 @@ def create_draft(
     }
 
 
+def draft_signature_matches(draft: dict[str, Any]) -> bool:
+    """Verify that the stored key still signs targets, message, schedule and media."""
+    try:
+        targets = json.loads(str(draft.get("targets_json") or "[]"))
+    except (TypeError, json.JSONDecodeError):
+        return False
+    if not isinstance(targets, list):
+        return False
+    expected = hash_text(
+        json.dumps(targets, sort_keys=True, ensure_ascii=False)
+        + "\n"
+        + str(draft.get("message") or "")
+        + "\n"
+        + str(draft.get("send_at") or "")
+        + "\n"
+        + str(draft.get("media_json") or "")
+    )
+    return secrets.compare_digest(expected, str(draft.get("idempotency_key") or ""))
+
+
 def get_draft(draft_id: str) -> dict[str, Any] | None:
     init_db()
     with _connect() as conn:
         return _row_to_dict(conn.execute("SELECT * FROM drafts WHERE id=?", (draft_id,)).fetchone())
+
+
+def get_contact_crm_binding(contact_id: str) -> dict[str, str] | None:
+    """Return the trusted CRM identity bound to one local contact.
+
+    WhatsApp/local contact IDs and CRM IDs are different namespaces.  The
+    explicit local contact metadata is the authority that binds them.
+    """
+    local_id = str(contact_id or "").strip()
+    if not local_id:
+        return None
+    init_db()
+    with _connect() as conn:
+        row = conn.execute("SELECT metadata_json FROM contacts WHERE id=?", (local_id,)).fetchone()
+    if row is None:
+        return None
+    try:
+        metadata = json.loads(str(row["metadata_json"] or "{}"))
+    except (TypeError, json.JSONDecodeError):
+        return None
+    if not isinstance(metadata, dict):
+        return None
+    lead_id = str(metadata.get("crm_lead_id") or "").strip()
+    crm_contact_id = str(metadata.get("crm_contact_id") or "").strip()
+    if (
+        not _CRM_BINDING_ID_RE.fullmatch(lead_id)
+        or not _CRM_BINDING_ID_RE.fullmatch(crm_contact_id)
+    ):
+        return None
+    return {"lead_id": lead_id, "contact_id": crm_contact_id}
 
 
 def create_approval(draft_id: str, timeout_minutes: int = 60) -> dict[str, str]:
@@ -2600,8 +2721,8 @@ def create_approval(draft_id: str, timeout_minutes: int = 60) -> dict[str, str]:
             """
             INSERT INTO approvals (
                 id, draft_id, approval_token_hash, approver_ref_hash,
-                message_hash, status, expires_at, created_at, resolved_at
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                message_hash, draft_idempotency_key, status, expires_at, created_at, resolved_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             (
                 approval_id,
@@ -2609,6 +2730,7 @@ def create_approval(draft_id: str, timeout_minutes: int = 60) -> dict[str, str]:
                 token_hash,
                 None,
                 draft["message_hash"],
+                draft["idempotency_key"],
                 "pending",
                 expires_at,
                 now,

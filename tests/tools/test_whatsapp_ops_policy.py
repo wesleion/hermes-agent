@@ -22,6 +22,7 @@ def _draft(**overrides):
         "message_hash": "hash-ok",
         "approved_message_hash": "hash-ok",
         "idempotency_key": "idem-1",
+        "signature_valid": True,
         "has_untrusted_media": False,
     }
     draft.update(overrides)
@@ -34,6 +35,7 @@ def _approval(**overrides):
         "token_valid": True,
         "expires_at": (datetime.now(timezone.utc) + timedelta(minutes=30)).isoformat(),
         "message_hash": "hash-ok",
+        "draft_idempotency_key": "idem-1",
     }
     approval.update(overrides)
     return approval
@@ -93,6 +95,34 @@ def test_send_guardrails_reject_message_changed_after_approval():
 
     assert result.allowed is False
     assert "message_changed_after_approval" in result.reasons
+
+
+def test_send_guardrails_reject_targets_or_crm_changed_after_approval():
+    from tools.whatsapp_ops_policy import evaluate_send_guardrails
+
+    result = evaluate_send_guardrails(
+        config=_base_config(),
+        draft=_draft(idempotency_key="idem-mutated"),
+        approval=_approval(draft_idempotency_key="idem-1"),
+        idempotency_used=False,
+    )
+
+    assert result.allowed is False
+    assert "draft_changed_after_approval" in result.reasons
+
+
+def test_send_guardrails_reject_corrupted_draft_signature():
+    from tools.whatsapp_ops_policy import evaluate_send_guardrails
+
+    result = evaluate_send_guardrails(
+        config=_base_config(),
+        draft=_draft(signature_valid=False),
+        approval=_approval(),
+        idempotency_used=False,
+    )
+
+    assert result.allowed is False
+    assert "draft_signature_invalid" in result.reasons
 
 
 def test_send_guardrails_reject_duplicate_idempotency():

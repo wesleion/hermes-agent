@@ -6,6 +6,7 @@ code-level guardrails pass; prompt instructions are never the send gate.
 
 from __future__ import annotations
 
+import html
 import json
 import os
 import re
@@ -17,7 +18,12 @@ from typing import Any, Callable
 
 from tools.registry import registry
 from tools.whatsapp_ops_autonomy import autonomy_status, evaluate_autonomy
-from tools.whatsapp_ops_crm import append_approved_send_event, default_crm_config
+from tools.whatsapp_ops_crm import (
+    append_approved_send_event,
+    approval_crm_preview,
+    crm_send_preflight,
+    default_crm_config,
+)
 from tools.whatsapp_ops_policy import evaluate_send_guardrails
 from tools.whatsapp_ops_quepasa import pull_history_via_quepasa
 
@@ -29,6 +35,7 @@ from tools.whatsapp_ops_store import (
     consume_latest_raw_ref,
     create_approval,
     create_draft,
+    draft_signature_matches,
     get_actionable_queue,
     get_cockpit_overview,
     get_conversation_summary,
@@ -158,6 +165,7 @@ def _draft_for_policy(draft: dict[str, Any] | None) -> dict[str, Any] | None:
         "message": draft.get("message", ""),
         "message_hash": draft.get("message_hash", ""),
         "idempotency_key": draft.get("idempotency_key", ""),
+        "signature_valid": draft_signature_matches(draft),
         "has_untrusted_media": bool(media.get("_invalid")),
     }
 
@@ -243,6 +251,7 @@ def _approval_for_policy(approval: dict[str, Any] | None) -> dict[str, Any] | No
         "token_valid": True,
         "expires_at": approval.get("expires_at"),
         "message_hash": approval.get("message_hash"),
+        "draft_idempotency_key": approval.get("draft_idempotency_key"),
     }
 
 
@@ -523,7 +532,7 @@ def _send_telegram_approval_card(approval: dict[str, Any], draft: dict[str, Any]
         return {"ok": False, "reason": "telegram_chat_missing"}
     approval_id = approval.get("approval_id", "")
     draft_id = approval.get("draft_id") or (draft or {}).get("id", "")
-    text_preview = str((draft or {}).get("message", ""))[:700]
+    text_preview = html.escape(str((draft or {}).get("message", ""))[:700])
     media_summary = _safe_media_summary(_load_draft_media(draft))
     media_line = ""
     if media_summary:
@@ -539,17 +548,38 @@ def _send_telegram_approval_card(approval: dict[str, Any], draft: dict[str, Any]
         is_group_create = any(isinstance(t, dict) and t.get("type") == "group_create" for t in targets)
     except Exception:
         is_group_create = False
+    crm_line = ""
+    raw_crm = (cfg or {}).get("crm")
+    crm_enabled = isinstance(raw_crm, dict) and raw_crm.get("enabled") is True
+    if crm_enabled:
+        crm_preview, crm_reason = approval_crm_preview(draft or {})
+        if crm_preview is None:
+            return {"ok": False, "reason": crm_reason or "crm_context_invalid"}
+        crm_line = (
+            "\n<b>CRM Interacoes</b>\n"
+            f"Lead: <code>{html.escape(crm_preview['lead_id'])}</code>\n"
+            f"Contato: <code>{html.escape(crm_preview['contact_id'])}</code>\n"
+            f"Tipo: {html.escape(crm_preview['interaction_type'])}\n"
+            f"Resumo: {html.escape(crm_preview['summary'])}\n"
+            f"Próximo passo: {html.escape(crm_preview['next_step']) or '(vazio)'}\n"
+        )
     approval_note = (
         "Aprovar e enviar executa a criação via QuePasa/direct agora. Editar pede revisão sem enviar."
         if is_group_create
-        else "Aprovar e enviar dispara via QuePasa/direct agora. Editar pede revisão sem enviar."
+        else (
+            "Aprovar e enviar dispara via QuePasa/direct agora e aprova o registro CRM exatamente acima. "
+            "Editar pede revisão sem enviar."
+            if crm_enabled
+            else "Aprovar e enviar dispara via QuePasa/direct agora. Editar pede revisão sem enviar."
+        )
     )
     text = (
         "📲 <b>WhatsApp Ops approval</b>\n\n"
-        f"Draft: <code>{draft_id}</code>\n"
-        f"Approval: <code>{approval_id}</code>\n"
+        f"Draft: <code>{html.escape(str(draft_id))}</code>\n"
+        f"Approval: <code>{html.escape(str(approval_id))}</code>\n"
         f"{media_line}\n"
         f"<pre>{text_preview}</pre>\n\n"
+        f"{crm_line}\n"
         f"{approval_note}"
     )
     payload: dict[str, Any] = {
@@ -879,6 +909,18 @@ def wpp_send_approved(
         return _json({"ok": False, "draft_id": draft_id, "reasons": result.reasons})
 
     is_group_create = _is_group_create_policy_draft(policy_draft)
+    raw_crm = cfg.get("crm")
+    if (
+        not is_group_create
+        and isinstance(raw_crm, dict)
+        and raw_crm.get("enabled") is True
+        and draft is not None
+        and approval is not None
+    ):
+        crm_reason = crm_send_preflight(draft=draft, approval=approval, config=cfg)
+        if crm_reason:
+            return _json({"ok": False, "draft_id": draft_id, "reasons": [crm_reason]})
+
     if is_group_create:
         payload, payload_error = _group_create_provider_payload(draft_id, draft, idempotency_key, cfg)
         if payload_error:
@@ -970,6 +1012,18 @@ def wpp_request_approval(draft_id: str) -> str:
     cfg = _runtime_config()
     timeout = int((cfg.get("approval") or {}).get("timeout_minutes", 60))
     try:
+        draft = get_draft(draft_id)
+        if draft is None:
+            return _json({"ok": False, "draft_id": draft_id, "error": "draft_not_found"})
+        raw_crm = cfg.get("crm")
+        if isinstance(raw_crm, dict) and raw_crm.get("enabled") is True:
+            crm_preview, crm_reason = approval_crm_preview(draft)
+            if crm_preview is None:
+                return _json({
+                    "ok": False,
+                    "draft_id": draft_id,
+                    "error": crm_reason or "crm_context_invalid",
+                })
         approval = create_approval(draft_id, timeout_minutes=timeout)
         draft = get_draft(draft_id)
         notification = _send_telegram_approval_card(approval, draft, cfg)

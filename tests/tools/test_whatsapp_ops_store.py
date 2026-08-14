@@ -79,13 +79,45 @@ def test_approval_token_is_stored_hashed_not_plaintext(tmp_path):
 
     with sqlite3.connect(db_path) as conn:
         rows = conn.execute(
-            "SELECT approval_token_hash FROM approvals WHERE draft_id=?",
+            "SELECT approval_token_hash, draft_idempotency_key FROM approvals WHERE draft_id=?",
             (draft["draft_id"],),
         ).fetchall()
 
     assert len(rows) == 1
     assert "approval_token" not in approval
     assert len(rows[0][0]) == 64
+    assert rows[0][1] == draft["idempotency_key"]
+
+
+def test_init_db_adds_draft_signature_to_legacy_approvals_table(tmp_path):
+    from tools.whatsapp_ops_store import init_db
+
+    token = set_hermes_home_override(tmp_path)
+    try:
+        db_path = tmp_path / "wpp_ops.sqlite"
+        with sqlite3.connect(db_path) as conn:
+            conn.execute(
+                """
+                CREATE TABLE approvals (
+                    id TEXT PRIMARY KEY,
+                    draft_id TEXT NOT NULL,
+                    approval_token_hash TEXT NOT NULL UNIQUE,
+                    approver_ref_hash TEXT,
+                    message_hash TEXT NOT NULL,
+                    status TEXT NOT NULL,
+                    expires_at TEXT NOT NULL,
+                    created_at TEXT NOT NULL,
+                    resolved_at TEXT
+                )
+                """
+            )
+        init_db()
+        with sqlite3.connect(db_path) as conn:
+            columns = {row[1] for row in conn.execute("PRAGMA table_info(approvals)")}
+    finally:
+        reset_hermes_home_override(token)
+
+    assert "draft_idempotency_key" in columns
 
 
 def test_create_approval_starts_pending_and_does_not_return_plaintext_token(tmp_path):
@@ -259,6 +291,50 @@ def test_sync_allowlist_from_env_upserts_aliases_without_raw_target_leak(tmp_pat
     assert listed[0]["display_name"] == "Weslei Teste"
     assert raw_target not in serialized
     assert "551199998888" not in serialized
+
+
+def test_crm_binding_requires_explicit_binder_and_survives_contact_sync(tmp_path):
+    from tools.whatsapp_ops_store import (
+        bind_contact_crm_identity,
+        get_contact_crm_binding,
+        init_db,
+        upsert_contact,
+    )
+
+    token = set_hermes_home_override(tmp_path)
+    try:
+        init_db()
+        upsert_contact(
+            contact_id="contact_safe_01",
+            display_name="Contato Seguro",
+            metadata={
+                "crm_lead_id": "L-INJECTED",
+                "crm_contact_id": "C-INJECTED",
+                "source": "allowlist",
+            },
+        )
+        before_bind = get_contact_crm_binding("contact_safe_01")
+        bound = bind_contact_crm_identity(
+            contact_id="contact_safe_01",
+            lead_id="L-001",
+            crm_contact_id="C-001",
+        )
+        upsert_contact(
+            contact_id="contact_safe_01",
+            display_name="Contato Atualizado",
+            metadata={
+                "crm_lead_id": "L-ATTACK",
+                "crm_contact_id": "C-ATTACK",
+                "source": "runtime_config",
+            },
+        )
+        after_sync = get_contact_crm_binding("contact_safe_01")
+    finally:
+        reset_hermes_home_override(token)
+
+    assert before_bind is None
+    assert bound == {"lead_id": "L-001", "contact_id": "C-001"}
+    assert after_sync == bound
 
 
 def test_list_contacts_masks_legacy_raw_contact_ids(tmp_path):

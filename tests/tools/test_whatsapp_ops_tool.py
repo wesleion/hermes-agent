@@ -1,4 +1,5 @@
 import json
+import sqlite3
 from unittest.mock import Mock
 
 import pytest
@@ -929,6 +930,109 @@ def test_wpp_request_approval_sends_telegram_inline_card_without_plaintext_token
     assert keyboard[2]["callback_data"] == f"wpp:d:{approval['approval_id']}"
     assert "approval_token" not in approval
     assert "telegram-secret-token" not in serialized
+
+
+def test_telegram_approval_card_shows_bound_crm_context(tmp_path, monkeypatch):
+    import tools.whatsapp_ops_crm as crm
+    from tools.whatsapp_ops_tool import _send_telegram_approval_card
+
+    sent = {}
+
+    class _FakeResponse:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, exc_type, exc, tb):
+            return False
+
+        def read(self):
+            return b'{"ok": true, "result": {"message_id": 321}}'
+
+    def fake_urlopen(req, timeout=0):
+        sent["payload"] = json.loads(req.data.decode("utf-8"))
+        return _FakeResponse()
+
+    monkeypatch.setenv("TELEGRAM_BOT_TOKEN", "telegram-secret-token")
+    monkeypatch.setenv("TELEGRAM_HOME_CHANNEL", "-100123")
+    monkeypatch.setattr("tools.whatsapp_ops_tool.urllib.request.urlopen", fake_urlopen)
+    monkeypatch.setattr(
+        crm,
+        "get_contact_crm_binding",
+        lambda contact_id: {"lead_id": "L-001", "contact_id": "C-001"}
+        if contact_id == "contact_safe_01"
+        else None,
+    )
+    draft = {
+        "id": "draft_safe_01",
+        "message": "Mensagem supervisionada",
+        "targets_json": json.dumps([{
+            "type": "contact",
+            "contact_id": "contact_safe_01",
+            "crm": {
+                "lead_id": "L-001",
+                "contact_id": "C-001",
+                "interaction_type": "WhatsApp",
+                "summary": "Contato inicial priorizado",
+                "next_step": "Aguardar retorno",
+            },
+        }]),
+    }
+    approval = {"approval_id": "approval_safe_01", "draft_id": "draft_safe_01"}
+    token = set_hermes_home_override(tmp_path)
+    try:
+        result = _send_telegram_approval_card(
+            approval,
+            draft,
+            {"crm": {"enabled": True}},
+        )
+    finally:
+        reset_hermes_home_override(token)
+
+    text = sent["payload"]["text"]
+    assert result == {"ok": True, "message_id": "321"}
+    assert "CRM Interacoes" in text
+    assert "Lead: <code>L-001</code>" in text
+    assert "Contato: <code>C-001</code>" in text
+    assert "Tipo: WhatsApp" in text
+    assert "Resumo: Contato inicial priorizado" in text
+    assert "Próximo passo: Aguardar retorno" in text
+    assert "contact_safe_01" not in text
+
+
+def test_request_approval_blocks_unbound_crm_before_creating_approval(tmp_path, monkeypatch):
+    from tools.whatsapp_ops_store import create_draft, get_draft, get_latest_approval, init_db
+    from tools.whatsapp_ops_tool import wpp_request_approval
+
+    monkeypatch.setattr(
+        "tools.whatsapp_ops_tool._runtime_config",
+        lambda: {"approval": {"timeout_minutes": 60}, "crm": {"enabled": True}},
+    )
+    token = set_hermes_home_override(tmp_path)
+    try:
+        init_db()
+        draft = create_draft(
+            targets=[{
+                "type": "contact",
+                "contact_id": "contact_unbound",
+                "crm": {
+                    "lead_id": "L-001",
+                    "contact_id": "C-001",
+                    "interaction_type": "WhatsApp",
+                    "summary": "Contato inicial priorizado",
+                    "next_step": "Aguardar retorno",
+                },
+            }],
+            message="Mensagem não pode chegar ao card",
+        )
+        result = _parse(wpp_request_approval(draft["draft_id"]))
+        stored = get_draft(draft["draft_id"])
+        approval = get_latest_approval(draft["draft_id"])
+    finally:
+        reset_hermes_home_override(token)
+
+    assert result == {"ok": False, "draft_id": draft["draft_id"], "error": "crm_contact_binding_missing"}
+    assert stored["status"] == "draft"
+    assert approval is None
 
 
 @pytest.mark.parametrize("trusted_context", [None, "telegram_callback"])
@@ -2453,6 +2557,20 @@ def _crm_target(contact_id="c_1"):
     }
 
 
+def _bind_crm_contact():
+    from tools.whatsapp_ops_store import bind_contact_crm_identity, upsert_contact
+
+    upsert_contact(
+        contact_id="c_1",
+        display_name="Contato CRM Teste",
+    )
+    bind_contact_crm_identity(
+        contact_id="c_1",
+        lead_id="L-001",
+        crm_contact_id="C-001",
+    )
+
+
 def test_wpp_send_success_then_confirmed_crm_append(tmp_path, monkeypatch):
     from tools.whatsapp_ops_store import create_approval, create_draft, get_draft, init_db, resolve_approval
     from tools.whatsapp_ops_tool import wpp_send_approved
@@ -2469,6 +2587,7 @@ def test_wpp_send_success_then_confirmed_crm_append(tmp_path, monkeypatch):
     token = set_hermes_home_override(tmp_path)
     try:
         init_db()
+        _bind_crm_contact()
         draft = create_draft(
             targets=[_crm_target()],
             message="Mensagem aprovada com efeito CRM pós-send",
@@ -2511,6 +2630,7 @@ def test_wpp_send_success_crm_failure_keeps_whatsapp_sent(tmp_path, monkeypatch)
     token = set_hermes_home_override(tmp_path)
     try:
         init_db()
+        _bind_crm_contact()
         draft = create_draft(targets=[_crm_target()], message="Envio prevalece")
         approval = create_approval(draft["draft_id"])
         resolve_approval(approval["approval_id"], "approved", approver_ref="human:test")
@@ -2536,6 +2656,88 @@ def test_wpp_send_success_crm_failure_keeps_whatsapp_sent(tmp_path, monkeypatch)
     assert "5511999990000" not in json.dumps(result)
 
 
+def test_wpp_send_blocks_unbound_crm_before_whatsapp_provider(tmp_path, monkeypatch):
+    from tools.whatsapp_ops_store import create_approval, create_draft, init_db, resolve_approval
+    from tools.whatsapp_ops_tool import wpp_send_approved
+
+    _allow_raw_contact(monkeypatch)
+    send_client = Mock(return_value={"ok": True, "transport": "must_not_run"})
+    crm_client = Mock()
+    token = set_hermes_home_override(tmp_path)
+    try:
+        init_db()
+        draft = create_draft(targets=[_crm_target()], message="Bloquear antes do provider")
+        approval = create_approval(draft["draft_id"])
+        resolve_approval(approval["approval_id"], "approved", approver_ref="human:test")
+        result = _parse(
+            wpp_send_approved(
+                draft["draft_id"],
+                config=_crm_enabled_send_config(),
+                send_client=send_client,
+                crm_client=crm_client,
+            )
+        )
+    finally:
+        reset_hermes_home_override(token)
+
+    assert result == {
+        "ok": False,
+        "draft_id": draft["draft_id"],
+        "reasons": ["crm_contact_binding_missing"],
+    }
+    send_client.assert_not_called()
+    crm_client.assert_not_called()
+
+
+def test_wpp_send_blocks_target_mutation_after_approval(tmp_path, monkeypatch):
+    from tools.whatsapp_ops_store import create_approval, create_draft, init_db, resolve_approval
+    from tools.whatsapp_ops_tool import wpp_send_approved
+
+    _allow_raw_contact(monkeypatch)
+    send_client = Mock(return_value={"ok": True, "transport": "must_not_run"})
+    config = {
+        "send_enabled": True,
+        "kill_switch": False,
+        "approval": {"required": True, "timeout_minutes": 60},
+        "allowlists": {"contacts": ["c_1"], "groups": []},
+        "quepasa": {"send_enabled": True},
+    }
+    token = set_hermes_home_override(tmp_path)
+    try:
+        init_db()
+        draft = create_draft(
+            targets=[{"type": "contact", "contact_id": "c_1"}],
+            message="Conteúdo aprovado",
+        )
+        approval = create_approval(draft["draft_id"])
+        resolve_approval(approval["approval_id"], "approved", approver_ref="human:test")
+        with sqlite3.connect(tmp_path / "wpp_ops.sqlite") as conn:
+            conn.execute(
+                "UPDATE drafts SET targets_json=? WHERE id=?",
+                (
+                    json.dumps([{
+                        "type": "contact",
+                        "contact_id": "c_1",
+                        "crm": {"summary": "mutated"},
+                    }]),
+                    draft["draft_id"],
+                ),
+            )
+        result = _parse(
+            wpp_send_approved(
+                draft["draft_id"],
+                config=config,
+                send_client=send_client,
+            )
+        )
+    finally:
+        reset_hermes_home_override(token)
+
+    assert result["ok"] is False
+    assert "draft_signature_invalid" in result["reasons"]
+    send_client.assert_not_called()
+
+
 def test_wpp_send_failure_never_calls_crm(tmp_path, monkeypatch):
     from tools.whatsapp_ops_store import create_approval, create_draft, get_draft, init_db, resolve_approval
     from tools.whatsapp_ops_tool import wpp_send_approved
@@ -2546,7 +2748,8 @@ def test_wpp_send_failure_never_calls_crm(tmp_path, monkeypatch):
     token = set_hermes_home_override(tmp_path)
     try:
         init_db()
-        draft = create_draft(targets=[{"type": "contact", "contact_id": "c_1"}], message="Falha transporte")
+        _bind_crm_contact()
+        draft = create_draft(targets=[_crm_target()], message="Falha transporte")
         approval = create_approval(draft["draft_id"])
         resolve_approval(approval["approval_id"], "approved", approver_ref="human:test")
         result = _parse(
