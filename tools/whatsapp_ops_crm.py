@@ -50,21 +50,31 @@ _WA_REF_RE = re.compile(r"(?i)\b[\w.+:-]+@(?:lid|g\.us|s\.whatsapp\.net|c\.us)\b
 _SECRET_RE = re.compile(
     r"(?i)\b(?:token|secret|api[_ -]?key|authorization|private[_ -]?key|password)\s*[:=]"
 )
+_INTERACTION_RANGE_RE = re.compile(
+    r"^(?P<sheet>'(?:[^']|'')+'|[A-Za-z0-9_. -]+)!A:G$"
+)
+_LEAD_LOOKUP_RANGE_RE = re.compile(
+    r"^(?:'Leads'|Leads)!A1:Z(?P<last>[1-9][0-9]{0,2})$"
+)
 
 
 def default_crm_config() -> dict[str, Any]:
     """Return an independent fail-closed CRM configuration."""
     return {
         "enabled": False,
+        "read_only": True,
         "write_enabled": False,
+        "append_after_send_enabled": False,
         "backend": "google_sheets_append",
         "mode": "append_only",
         "allowed_event_types": ["send_completed"],
         "google_sheets": {
             "spreadsheet_id": "",
             "range": "",
+            "lead_lookup_range": "",
             "allowed_spreadsheet_ids": [],
             "allowed_ranges": [],
+            "allowed_lead_lookup_ranges": [],
             "credentials_env": "GOOGLE_SERVICE_ACCOUNT_JSON",
             "timeout_seconds": 10,
         },
@@ -210,6 +220,16 @@ def _valid_timeout_seconds(sheets: dict[str, Any]) -> int | None:
     return raw
 
 
+def _interaction_header_range(target_range: str) -> str | None:
+    match = _INTERACTION_RANGE_RE.fullmatch(str(target_range or "").strip())
+    return match.group("sheet") + "!A1:G1" if match else None
+
+
+def _lead_lookup_range_is_bounded(value: str) -> bool:
+    match = _LEAD_LOOKUP_RANGE_RE.fullmatch(str(value or "").strip())
+    return bool(match and 2 <= int(match.group("last")) <= 501)
+
+
 def _preflight_reason(
     crm_config: dict[str, Any],
     draft: dict[str, Any],
@@ -218,8 +238,12 @@ def _preflight_reason(
 ) -> str | None:
     if crm_config.get("enabled") is not True:
         return "crm_disabled"
+    if crm_config.get("read_only") is not False:
+        return "crm_read_only"
     if crm_config.get("write_enabled") is not True:
         return "crm_write_disabled"
+    if crm_config.get("append_after_send_enabled") is not True:
+        return "crm_append_after_send_disabled"
     if crm_config.get("backend") != "google_sheets_append":
         return "crm_backend_invalid"
     if crm_config.get("mode") != "append_only":
@@ -243,19 +267,41 @@ def _preflight_reason(
         return "crm_google_sheets_config_invalid"
     spreadsheet_id = str(sheets.get("spreadsheet_id") or "").strip()
     target_range = str(sheets.get("range") or "").strip()
+    lead_lookup_range = str(sheets.get("lead_lookup_range") or "").strip()
     if not spreadsheet_id:
         return "crm_spreadsheet_missing"
     if not target_range:
         return "crm_range_missing"
+    if not lead_lookup_range:
+        return "crm_lead_lookup_range_missing"
+    if any(
+        _WILDCARD_RE.search(value)
+        for value in (spreadsheet_id, target_range, lead_lookup_range)
+    ):
+        return "crm_wildcard_forbidden"
+    if _interaction_header_range(target_range) is None:
+        return "crm_range_invalid"
+    if not _lead_lookup_range_is_bounded(lead_lookup_range):
+        return "crm_lead_lookup_range_invalid"
     if _valid_timeout_seconds(sheets) is None:
         return "crm_timeout_invalid"
     allowed_ids = sheets.get("allowed_spreadsheet_ids")
     allowed_ranges = sheets.get("allowed_ranges")
+    allowed_lead_ranges = sheets.get("allowed_lead_lookup_ranges")
     if not isinstance(allowed_ids, list) or spreadsheet_id not in allowed_ids:
         return "crm_spreadsheet_not_allowed"
     if not isinstance(allowed_ranges, list) or target_range not in allowed_ranges:
         return "crm_range_not_allowed"
-    configured_values = [spreadsheet_id, target_range, *allowed_ids, *allowed_ranges]
+    if not isinstance(allowed_lead_ranges, list) or lead_lookup_range not in allowed_lead_ranges:
+        return "crm_lead_lookup_range_not_allowed"
+    configured_values = [
+        spreadsheet_id,
+        target_range,
+        lead_lookup_range,
+        *allowed_ids,
+        *allowed_ranges,
+        *allowed_lead_ranges,
+    ]
     if any(_WILDCARD_RE.search(str(value or "")) for value in configured_values):
         return "crm_wildcard_forbidden"
     credentials_env = str(sheets.get("credentials_env") or "")
@@ -332,11 +378,50 @@ def append_google_sheets_row(payload: dict[str, Any], config: dict[str, Any]) ->
         service = build(
             "sheets", "v4", http=transport, cache_discovery=False
         )
+        values_api = service.spreadsheets().values()
+        spreadsheet_id = str(sheets["spreadsheet_id"])
+        header_range = _interaction_header_range(str(sheets["range"]))
+        if header_range is None:
+            return {"ok": False, "reason": "crm_range_invalid"}
+        header_response = values_api.get(
+            spreadsheetId=spreadsheet_id,
+            range=header_range,
+            majorDimension="ROWS",
+        ).execute()
+        header_rows = header_response.get("values") if isinstance(header_response, dict) else None
+        if header_rows != [list(CRM_ROW_HEADER)]:
+            return {"ok": False, "reason": "crm_interacoes_schema_mismatch"}
+
+        lead_response = values_api.get(
+            spreadsheetId=spreadsheet_id,
+            range=str(sheets["lead_lookup_range"]),
+            majorDimension="ROWS",
+        ).execute()
+        lead_rows = lead_response.get("values") if isinstance(lead_response, dict) else None
+        if not isinstance(lead_rows, list) or not lead_rows or not isinstance(lead_rows[0], list):
+            return {"ok": False, "reason": "crm_lead_header_mismatch"}
+        lead_header = [str(value or "").strip() for value in lead_rows[0]]
+        if lead_header.count("ID Lead") != 1:
+            return {"ok": False, "reason": "crm_lead_header_mismatch"}
+        lead_index = lead_header.index("ID Lead")
+        lead_id = row[1]
+        lead_matches = 0
+        for candidate in lead_rows[1:]:
+            if (
+                isinstance(candidate, list)
+                and lead_index < len(candidate)
+                and str(candidate[lead_index] or "").strip() == lead_id
+            ):
+                lead_matches += 1
+        if lead_matches == 0:
+            return {"ok": False, "reason": "crm_lead_not_found"}
+        if lead_matches > 1:
+            return {"ok": False, "reason": "crm_lead_ambiguous"}
+
         response = (
-            service.spreadsheets()
-            .values()
+            values_api
             .append(
-                spreadsheetId=str(sheets["spreadsheet_id"]),
+                spreadsheetId=spreadsheet_id,
                 range=str(sheets["range"]),
                 valueInputOption="RAW",
                 insertDataOption="INSERT_ROWS",
@@ -350,10 +435,9 @@ def append_google_sheets_row(payload: dict[str, Any], config: dict[str, Any]) ->
         if not updated_range:
             return {"ok": False, "reason": "append_unverified"}
         read_back = (
-            service.spreadsheets()
-            .values()
+            values_api
             .get(
-                spreadsheetId=str(sheets["spreadsheet_id"]),
+                spreadsheetId=spreadsheet_id,
                 range=updated_range,
                 majorDimension="ROWS",
             )

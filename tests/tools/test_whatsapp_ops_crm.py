@@ -23,15 +23,19 @@ def _config() -> dict:
     return {
         "crm": {
             "enabled": True,
+            "read_only": False,
             "write_enabled": True,
+            "append_after_send_enabled": True,
             "backend": "google_sheets_append",
             "mode": "append_only",
             "allowed_event_types": ["send_completed"],
             "google_sheets": {
                 "spreadsheet_id": "sheet-prod-01",
                 "range": "'Interacoes'!A:G",
+                "lead_lookup_range": "'Leads'!A1:Z501",
                 "allowed_spreadsheet_ids": ["sheet-prod-01"],
                 "allowed_ranges": ["'Interacoes'!A:G"],
+                "allowed_lead_lookup_ranges": ["'Leads'!A1:Z501"],
                 "credentials_env": "GOOGLE_SERVICE_ACCOUNT_JSON",
                 "timeout_seconds": 10,
             },
@@ -92,14 +96,18 @@ def test_crm_defaults_are_fail_closed_and_schema_is_stable():
     defaults = default_crm_config()
     assert defaults == _default_config()["crm"]
     assert defaults["enabled"] is False
+    assert defaults["read_only"] is True
     assert defaults["write_enabled"] is False
+    assert defaults["append_after_send_enabled"] is False
     assert defaults["backend"] == "google_sheets_append"
     assert defaults["mode"] == "append_only"
     assert defaults["allowed_event_types"] == ["send_completed"]
     assert defaults["google_sheets"]["spreadsheet_id"] == ""
     assert defaults["google_sheets"]["range"] == ""
+    assert defaults["google_sheets"]["lead_lookup_range"] == ""
     assert defaults["google_sheets"]["allowed_spreadsheet_ids"] == []
     assert defaults["google_sheets"]["allowed_ranges"] == []
+    assert defaults["google_sheets"]["allowed_lead_lookup_ranges"] == []
     assert tuple(CRM_ROW_HEADER) == CRM_HEADER
 
 
@@ -107,12 +115,21 @@ def test_crm_defaults_are_fail_closed_and_schema_is_stable():
     ("mutate", "reason"),
     [
         (lambda c: c["crm"].update(enabled=False), "crm_disabled"),
+        (lambda c: c["crm"].update(read_only=True), "crm_read_only"),
         (lambda c: c["crm"].update(write_enabled=False), "crm_write_disabled"),
+        (
+            lambda c: c["crm"].update(append_after_send_enabled=False),
+            "crm_append_after_send_disabled",
+        ),
         (lambda c: c["crm"].update(backend="other"), "crm_backend_invalid"),
         (lambda c: c["crm"].update(mode="upsert"), "crm_mode_invalid"),
         (lambda c: c["crm"].update(allowed_event_types=[]), "crm_event_type_not_allowed"),
         (lambda c: c["crm"]["google_sheets"].update(spreadsheet_id=""), "crm_spreadsheet_missing"),
         (lambda c: c["crm"]["google_sheets"].update(range=""), "crm_range_missing"),
+        (
+            lambda c: c["crm"]["google_sheets"].update(lead_lookup_range=""),
+            "crm_lead_lookup_range_missing",
+        ),
         (lambda c: c["crm"]["google_sheets"].update(timeout_seconds=0), "crm_timeout_invalid"),
         (lambda c: c["crm"]["google_sheets"].update(timeout_seconds=61), "crm_timeout_invalid"),
         (
@@ -122,6 +139,12 @@ def test_crm_defaults_are_fail_closed_and_schema_is_stable():
         (
             lambda c: c["crm"]["google_sheets"].update(allowed_ranges=["Other!A:G"]),
             "crm_range_not_allowed",
+        ),
+        (
+            lambda c: c["crm"]["google_sheets"].update(
+                allowed_lead_lookup_ranges=["'Other'!A1:Z501"]
+            ),
+            "crm_lead_lookup_range_not_allowed",
         ),
         (
             lambda c: c["crm"]["google_sheets"].update(
@@ -270,7 +293,7 @@ def test_default_google_client_uses_append_raw_insert_rows_and_exact_scope(tmp_p
     info = {"type": "service_account", "private_key": "secret-key", "client_email": "svc@example.invalid"}
     monkeypatch.setenv("GOOGLE_SERVICE_ACCOUNT_JSON", json.dumps(info))
     calls = {}
-    row = [f"v{index}" for index in range(len(CRM_HEADER))]
+    row = ["INT-0123456789ab", "L-001", "C-001", "WhatsApp", "2026-08-14", "Resumo", "Próximo passo"]
 
     class Credentials:
         @classmethod
@@ -292,7 +315,11 @@ def test_default_google_client_uses_append_raw_insert_rows_and_exact_scope(tmp_p
             return Request({"updates": {"updatedRows": 1, "updatedRange": "'Interacoes'!A2:G2"}})
 
         def get(self, **kwargs):
-            calls["get"] = kwargs
+            calls.setdefault("get", []).append(kwargs)
+            if kwargs["range"] == "'Interacoes'!A1:G1":
+                return Request({"values": [list(CRM_HEADER)]})
+            if kwargs["range"] == "'Leads'!A1:Z501":
+                return Request({"values": [["ID Lead", "Nome"], ["L-001", "Safe"]]})
             return Request({"values": [row]})
 
         def update(self, **kwargs):  # pragma: no cover - must never be reached
@@ -357,12 +384,91 @@ def test_default_google_client_uses_append_raw_insert_rows_and_exact_scope(tmp_p
         "includeValuesInResponse": True,
         "body": {"values": [row]},
     }
-    assert calls["get"] == {
-        "spreadsheetId": "sheet-prod-01",
-        "range": "'Interacoes'!A2:G2",
-        "majorDimension": "ROWS",
-    }
-    assert calls["executed"] == 2
+    assert calls["get"] == [
+        {
+            "spreadsheetId": "sheet-prod-01",
+            "range": "'Interacoes'!A1:G1",
+            "majorDimension": "ROWS",
+        },
+        {
+            "spreadsheetId": "sheet-prod-01",
+            "range": "'Leads'!A1:Z501",
+            "majorDimension": "ROWS",
+        },
+        {
+            "spreadsheetId": "sheet-prod-01",
+            "range": "'Interacoes'!A2:G2",
+            "majorDimension": "ROWS",
+        },
+    ]
+    assert calls["executed"] == 4
+
+
+@pytest.mark.parametrize(
+    ("interaction_header", "lead_values", "reason"),
+    [
+        (["wrong", "header"], [["ID Lead"], ["L-001"]], "crm_interacoes_schema_mismatch"),
+        (list(CRM_HEADER), [["ID Lead"], ["L-999"]], "crm_lead_not_found"),
+        (list(CRM_HEADER), [["ID Lead"], ["L-001"], ["L-001"]], "crm_lead_ambiguous"),
+    ],
+)
+def test_default_google_client_blocks_before_append_when_schema_or_lead_is_invalid(
+    tmp_path, monkeypatch, interaction_header, lead_values, reason
+):
+    import tools.whatsapp_ops_crm as crm
+
+    config = _config()["crm"]
+    monkeypatch.setenv(
+        "GOOGLE_SERVICE_ACCOUNT_JSON",
+        json.dumps({"type": "service_account", "private_key": "secret-key", "client_email": "svc@example.invalid"}),
+    )
+    append_calls = []
+
+    class Credentials:
+        @classmethod
+        def from_service_account_info(cls, supplied_info, scopes):
+            return "credentials-object"
+
+    class Request:
+        def __init__(self, response):
+            self.response = response
+
+        def execute(self):
+            return self.response
+
+    class Values:
+        def get(self, **kwargs):
+            if kwargs["range"] == "'Interacoes'!A1:G1":
+                return Request({"values": [interaction_header]})
+            if kwargs["range"] == "'Leads'!A1:Z501":
+                return Request({"values": lead_values})
+            raise AssertionError("unexpected read-back")
+
+        def append(self, **kwargs):
+            append_calls.append(kwargs)
+            raise AssertionError("append must be blocked")
+
+    class Service:
+        def spreadsheets(self):
+            return self
+
+        def values(self):
+            return Values()
+
+    monkeypatch.setattr(
+        crm,
+        "_google_dependencies",
+        lambda: (Credentials, lambda *a, **k: Service(), lambda credentials, http: "authorized", lambda **k: object()),
+    )
+    row = ["INT-0123456789ab", "L-001", "C-001", "WhatsApp", "2026-08-14", "Resumo", "Próximo passo"]
+    token = set_hermes_home_override(tmp_path)
+    try:
+        result = crm.append_google_sheets_row({"header": list(CRM_HEADER), "row": row}, config)
+    finally:
+        reset_hermes_home_override(token)
+
+    assert result == {"ok": False, "reason": reason}
+    assert append_calls == []
 
 
 @pytest.mark.parametrize(
