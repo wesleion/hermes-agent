@@ -2,6 +2,8 @@ import json
 import sqlite3
 from datetime import datetime, timedelta, timezone
 
+import pytest
+
 from hermes_constants import set_hermes_home_override, reset_hermes_home_override
 
 
@@ -36,6 +38,8 @@ def test_init_db_creates_required_tables_idempotently(tmp_path):
         "outbox",
         "inbound_events",
         "audit_log",
+        "mission_envelopes",
+        "autonomy_runs",
     }.issubset(tables)
     assert get_db_path(tmp_path) == tmp_path / "wpp_ops.sqlite"
 
@@ -1205,3 +1209,324 @@ def test_inbound_burst_status_collecting_single_message_without_draft(tmp_path):
     assert status["bursts"][0]["state"] == "collecting"
     assert status["bursts"][0]["primary_action"] == "wait_for_more_inbound"
     assert status["draft_created"] is False
+
+
+def test_mission_ledger_migration_is_idempotent_atomic_and_preserves_outer_transaction():
+    from tools.whatsapp_ops_store import _migrate_mission_ledger
+
+    conn = sqlite3.connect(":memory:")
+    try:
+        conn.execute("CREATE TABLE caller_state (value TEXT)")
+        conn.execute("INSERT INTO caller_state VALUES ('pending')")
+        assert conn.in_transaction is True
+        _migrate_mission_ledger(conn)
+        _migrate_mission_ledger(conn)
+        assert conn.in_transaction is True
+        tables = {
+            row[0]
+            for row in conn.execute(
+                "SELECT name FROM sqlite_master WHERE type='table'"
+            )
+        }
+        assert {"mission_envelopes", "autonomy_runs"}.issubset(tables)
+        assert not any("commercial" in name for name in tables)
+    finally:
+        conn.close()
+
+    class FailingConnection(sqlite3.Connection):
+        failed = False
+
+        def execute(self, sql, parameters=()):
+            if "CREATE TABLE IF NOT EXISTS autonomy_runs" in sql and not self.failed:
+                self.failed = True
+                raise sqlite3.OperationalError("synthetic migration failure")
+            return super().execute(sql, parameters)
+
+    failing = sqlite3.connect(":memory:", factory=FailingConnection)
+    try:
+        with pytest.raises(sqlite3.OperationalError, match="synthetic migration failure"):
+            _migrate_mission_ledger(failing)
+        tables_after_failure = {
+            row[0]
+            for row in failing.execute(
+                "SELECT name FROM sqlite_master WHERE type='table'"
+            )
+        }
+        assert "mission_envelopes" not in tables_after_failure
+        assert "autonomy_runs" not in tables_after_failure
+        _migrate_mission_ledger(failing)
+        tables_after_retry = {
+            row[0]
+            for row in failing.execute(
+                "SELECT name FROM sqlite_master WHERE type='table'"
+            )
+        }
+        assert {"mission_envelopes", "autonomy_runs"}.issubset(tables_after_retry)
+    finally:
+        failing.close()
+
+
+def test_mission_envelope_run_idempotency_fence_and_safe_completion(tmp_path):
+    from tools.whatsapp_ops_store import (
+        complete_autonomy_run,
+        register_mission_envelope,
+        reserve_autonomy_run,
+    )
+
+    token = set_hermes_home_override(tmp_path)
+    try:
+        envelope = register_mission_envelope(
+            project_ref="project_demo_01",
+            sales_pack_digest="a" * 64,
+            mode="safe_auto",
+            max_items=3,
+            max_local_writes=1,
+            window_ref="window_demo_01",
+            expires_at=(datetime.now(timezone.utc) + timedelta(hours=1)).isoformat(),
+        )
+        first = reserve_autonomy_run(
+            envelope["envelope_digest"],
+            "run_demo_01",
+            requires_local_write=True,
+        )
+        duplicate = reserve_autonomy_run(
+            envelope["envelope_digest"],
+            "run_demo_01",
+            requires_local_write=True,
+        )
+        stale = complete_autonomy_run(
+            "run_demo_01",
+            "wrong_fence_01",
+            counters={"items": 2, "local_writes": 1},
+            result_class="success",
+        )
+        over_caps = complete_autonomy_run(
+            "run_demo_01",
+            first["fence"],
+            counters={"items": 4, "local_writes": 1},
+            result_class="success",
+        )
+        completed = complete_autonomy_run(
+            "run_demo_01",
+            first["fence"],
+            counters={"items": 2, "local_writes": 1},
+            result_class="success",
+        )
+        with sqlite3.connect(tmp_path / "wpp_ops.sqlite") as conn:
+            run_count = conn.execute(
+                "SELECT COUNT(*) FROM autonomy_runs WHERE run_key='run_demo_01'"
+            ).fetchone()[0]
+            stored_payload = conn.execute(
+                "SELECT payload_json FROM mission_envelopes WHERE envelope_digest=?",
+                (envelope["envelope_digest"],),
+            ).fetchone()[0]
+            stored_fence_hash = conn.execute(
+                "SELECT fence_hash FROM autonomy_runs WHERE run_key='run_demo_01'"
+            ).fetchone()[0]
+    finally:
+        reset_hermes_home_override(token)
+
+    assert envelope["ok"] is True
+    assert first["ok"] is True
+    assert first["status"] == "started"
+    assert first["fence"]
+    assert duplicate["ok"] is True
+    assert duplicate["deduped"] is True
+    assert "fence" not in duplicate
+    assert stale == {"ok": False, "error": "autonomy_run_fence_stale"}
+    assert over_caps == {"ok": False, "error": "autonomy_run_caps_exceeded"}
+    assert completed["ok"] is True
+    assert completed["status"] == "completed"
+    assert completed["counters"] == {"items": 2, "local_writes": 1}
+    assert completed["result_class"] == "success"
+    assert run_count == 1
+    assert first["fence"] not in stored_fence_hash
+    assert len(stored_fence_hash) == 64
+    assert set(json.loads(stored_payload)) == {
+        "active",
+        "caps",
+        "expires_at",
+        "kill_switch",
+        "mode",
+        "project_ref",
+        "sales_pack_digest",
+        "window_ref",
+    }
+
+
+def test_mission_envelope_caps_are_bounded_to_dossier_and_local_queue_scale(tmp_path):
+    from tools.whatsapp_ops_store import register_mission_envelope
+
+    token = set_hermes_home_override(tmp_path)
+    try:
+        expires_at = (datetime.now(timezone.utc) + timedelta(hours=1)).isoformat()
+        boundary = register_mission_envelope(
+            project_ref="project_caps_01",
+            sales_pack_digest="f" * 64,
+            mode="safe_auto",
+            max_items=50,
+            max_local_writes=5,
+            window_ref="window_caps_01",
+            expires_at=expires_at,
+        )
+        too_many_items = register_mission_envelope(
+            project_ref="project_caps_02",
+            sales_pack_digest="1" * 64,
+            mode="safe_auto",
+            max_items=51,
+            max_local_writes=5,
+            window_ref="window_caps_02",
+            expires_at=expires_at,
+        )
+        too_many_writes = register_mission_envelope(
+            project_ref="project_caps_03",
+            sales_pack_digest="2" * 64,
+            mode="safe_auto",
+            max_items=50,
+            max_local_writes=6,
+            window_ref="window_caps_03",
+            expires_at=expires_at,
+        )
+    finally:
+        reset_hermes_home_override(token)
+
+    assert boundary["ok"] is True
+    assert boundary["max_items"] == 50
+    assert boundary["max_local_writes"] == 5
+    assert too_many_items == {"ok": False, "error": "mission_envelope_caps_invalid"}
+    assert too_many_writes == {"ok": False, "error": "mission_envelope_caps_invalid"}
+
+
+def test_mission_envelope_kill_expiry_changed_digest_and_lease_fail_closed(tmp_path, monkeypatch):
+    import tools.whatsapp_ops_store as store
+
+    token = set_hermes_home_override(tmp_path)
+    try:
+        expires_at = datetime.now(timezone.utc) + timedelta(hours=1)
+        killed_envelope = store.register_mission_envelope(
+            project_ref="project_kill_01",
+            sales_pack_digest="b" * 64,
+            mode="safe_auto",
+            max_items=2,
+            max_local_writes=1,
+            window_ref="window_kill_01",
+            expires_at=expires_at.isoformat(),
+        )
+        active_run = store.reserve_autonomy_run(
+            killed_envelope["envelope_digest"], "run_kill_01"
+        )
+        killed = store.kill_mission_envelope(killed_envelope["envelope_digest"])
+        blocked_completion = store.complete_autonomy_run(
+            "run_kill_01",
+            active_run["fence"],
+            counters={"items": 0, "local_writes": 0},
+            result_class="policy_blocked",
+        )
+
+        expiring_envelope = store.register_mission_envelope(
+            project_ref="project_expiry_01",
+            sales_pack_digest="c" * 64,
+            mode="assist",
+            max_items=1,
+            max_local_writes=0,
+            window_ref="window_expiry_01",
+            expires_at=expires_at.isoformat(),
+        )
+        local_write_denied = store.reserve_autonomy_run(
+            expiring_envelope["envelope_digest"],
+            "run_local_write_denied_01",
+            requires_local_write=True,
+        )
+        monkeypatch.setattr(
+            store,
+            "utc_now",
+            lambda: (expires_at + timedelta(seconds=1)).isoformat(),
+        )
+        expired = store.reserve_autonomy_run(
+            expiring_envelope["envelope_digest"], "run_expiry_01"
+        )
+        monkeypatch.undo()
+
+        changed_expires_at = (datetime.now(timezone.utc) + timedelta(hours=1)).isoformat()
+        changed_envelope = store.register_mission_envelope(
+            project_ref="project_changed_01",
+            sales_pack_digest="d" * 64,
+            mode="assist",
+            max_items=1,
+            max_local_writes=0,
+            window_ref="window_changed_01",
+            expires_at=changed_expires_at,
+        )
+        with sqlite3.connect(tmp_path / "wpp_ops.sqlite") as conn:
+            conn.execute(
+                "UPDATE mission_envelopes SET project_ref='project_tampered_01' "
+                "WHERE envelope_digest=?",
+                (changed_envelope["envelope_digest"],),
+            )
+        changed = store.reserve_autonomy_run(
+            changed_envelope["envelope_digest"], "run_changed_01"
+        )
+        changed_readback = store.register_mission_envelope(
+            project_ref="project_changed_01",
+            sales_pack_digest="d" * 64,
+            mode="assist",
+            max_items=1,
+            max_local_writes=0,
+            window_ref="window_changed_01",
+            expires_at=changed_expires_at,
+        )
+        unknown = store.reserve_autonomy_run("0" * 64, "run_unknown_01")
+
+        lease_envelope = store.register_mission_envelope(
+            project_ref="project_lease_01",
+            sales_pack_digest="e" * 64,
+            mode="assist",
+            max_items=1,
+            max_local_writes=0,
+            window_ref="window_lease_01",
+            expires_at=(datetime.now(timezone.utc) + timedelta(hours=1)).isoformat(),
+        )
+        leased = store.reserve_autonomy_run(
+            lease_envelope["envelope_digest"], "run_lease_01"
+        )
+        with sqlite3.connect(tmp_path / "wpp_ops.sqlite") as conn:
+            conn.execute(
+                "UPDATE autonomy_runs SET lease_expires_at=? WHERE run_key='run_lease_01'",
+                ((datetime.now(timezone.utc) - timedelta(seconds=1)).isoformat(),),
+            )
+        expired_duplicate = store.reserve_autonomy_run(
+            lease_envelope["envelope_digest"], "run_lease_01"
+        )
+        renewed = store.reserve_autonomy_run(
+            lease_envelope["envelope_digest"],
+            "run_lease_01",
+            renew_expired=True,
+        )
+        old_fence = store.complete_autonomy_run(
+            "run_lease_01",
+            leased["fence"],
+            counters={"items": 0, "local_writes": 0},
+            result_class="no_op",
+        )
+    finally:
+        reset_hermes_home_override(token)
+
+    assert killed["ok"] is True
+    assert killed["killed"] is True
+    assert blocked_completion == {"ok": False, "error": "mission_envelope_killed"}
+    assert local_write_denied == {
+        "ok": False,
+        "error": "mission_envelope_local_write_denied",
+    }
+    assert expired == {"ok": False, "error": "mission_envelope_expired"}
+    assert changed == {"ok": False, "error": "mission_envelope_changed"}
+    assert changed_readback == {"ok": False, "error": "mission_envelope_changed"}
+    assert unknown == {"ok": False, "error": "mission_envelope_not_found"}
+    assert expired_duplicate["ok"] is True
+    assert expired_duplicate["deduped"] is True
+    assert expired_duplicate["lease_expired"] is True
+    assert "fence" not in expired_duplicate
+    assert renewed["ok"] is True
+    assert renewed["renewed"] is True
+    assert renewed["fence"] != leased["fence"]
+    assert old_fence == {"ok": False, "error": "autonomy_run_fence_stale"}

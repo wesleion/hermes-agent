@@ -18,6 +18,7 @@ from pathlib import Path
 from typing import Any
 
 from hermes_constants import get_hermes_home
+from tools.whatsapp_ops_sales import is_opaque_ref
 
 try:
     import yaml
@@ -31,6 +32,15 @@ _STAGING_TTL = timedelta(minutes=5)
 _STAGING_TTL_MIN_SECONDS = 60
 _STAGING_TTL_MAX_SECONDS = 7 * 24 * 60 * 60
 _CRM_BINDING_ID_RE = re.compile(r"^[A-Za-z][A-Za-z0-9_.:-]{0,39}$")
+_MISSION_DIGEST_RE = re.compile(r"^[0-9a-f]{64}$")
+_MISSION_MODES = frozenset({"assist", "safe_auto"})
+_AUTONOMY_RESULT_CLASSES = frozenset(
+    {"success", "no_op", "policy_blocked", "safe_failure"}
+)
+_MISSION_MAX_ITEMS = 50
+_MISSION_MAX_LOCAL_WRITES = 5
+_AUTONOMY_MIN_LEASE_SECONDS = 30
+_AUTONOMY_MAX_LEASE_SECONDS = 3600
 
 
 def utc_now() -> str:
@@ -146,6 +156,74 @@ def _connect() -> sqlite3.Connection:
     conn = sqlite3.connect(db_path)
     conn.row_factory = sqlite3.Row
     return conn
+
+
+def _migrate_mission_ledger(conn: sqlite3.Connection) -> None:
+    """Atomically add the bounded mission ledger without owning the connection.
+
+    The savepoint keeps caller-owned transactions open and makes a partially
+    applied DDL sequence retryable on the same SQLite database.
+    """
+
+    savepoint = "whatsapp_ops_mission_ledger_v1"
+    conn.execute(f"SAVEPOINT {savepoint}")
+    try:
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS mission_envelopes (
+                envelope_digest TEXT PRIMARY KEY,
+                project_ref TEXT NOT NULL,
+                sales_pack_digest TEXT NOT NULL,
+                mode TEXT NOT NULL CHECK(mode IN ('assist', 'safe_auto')),
+                max_items INTEGER NOT NULL CHECK(max_items BETWEEN 1 AND 50),
+                max_local_writes INTEGER NOT NULL
+                    CHECK(max_local_writes BETWEEN 0 AND 5),
+                window_ref TEXT NOT NULL,
+                expires_at TEXT NOT NULL,
+                active INTEGER NOT NULL CHECK(active IN (0, 1)),
+                killed INTEGER NOT NULL CHECK(killed IN (0, 1)),
+                payload_json TEXT NOT NULL,
+                created_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL
+            )
+            """
+        )
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS autonomy_runs (
+                run_id TEXT PRIMARY KEY,
+                envelope_digest TEXT NOT NULL REFERENCES mission_envelopes(envelope_digest),
+                run_key TEXT NOT NULL UNIQUE,
+                status TEXT NOT NULL CHECK(status IN ('started', 'completed')),
+                fence_hash TEXT NOT NULL,
+                lease_expires_at TEXT NOT NULL,
+                started_at TEXT NOT NULL,
+                completed_at TEXT,
+                items_count INTEGER NOT NULL DEFAULT 0 CHECK(items_count >= 0),
+                local_write_count INTEGER NOT NULL DEFAULT 0 CHECK(local_write_count >= 0),
+                result_class TEXT,
+                updated_at TEXT NOT NULL
+            )
+            """
+        )
+        conn.execute(
+            """
+            CREATE INDEX IF NOT EXISTS ix_autonomy_runs_envelope_status
+            ON autonomy_runs(envelope_digest, status)
+            """
+        )
+    except BaseException:
+        try:
+            conn.execute(f"ROLLBACK TO {savepoint}")
+        except BaseException:
+            pass
+        try:
+            conn.execute(f"RELEASE {savepoint}")
+        except BaseException:
+            pass
+        raise
+    else:
+        conn.execute(f"RELEASE {savepoint}")
 
 
 def init_db() -> Path:
@@ -328,6 +406,7 @@ def init_db() -> Path:
         _migrate_legacy_contact_channels(conn)
         _ensure_registration_staging_columns(conn)
         _backfill_registration_staging_metadata(conn)
+        _migrate_mission_ledger(conn)
     return db_path
 
 
@@ -4874,3 +4953,484 @@ def update_draft_status(draft_id: str, status: str, send_at: str | None = None) 
                 "UPDATE drafts SET status=?, send_at=?, updated_at=? WHERE id=?",
                 (status, send_at, utc_now(), draft_id),
             )
+
+
+# ---------------------------------------------------------------------------
+# Mission envelope and autonomy-run ledger (internal, no tool registration)
+# ---------------------------------------------------------------------------
+
+
+def _mission_error(code: str) -> dict[str, Any]:
+    return {"ok": False, "error": code}
+
+
+def _strict_utc_timestamp(value: Any) -> tuple[str, datetime] | None:
+    if type(value) is not str or not value.strip():
+        return None
+    try:
+        parsed = datetime.fromisoformat(value.replace("Z", "+00:00"))
+    except ValueError:
+        return None
+    if parsed.tzinfo is None or parsed.utcoffset() != timedelta(0):
+        return None
+    parsed = parsed.astimezone(timezone.utc)
+    return parsed.isoformat(), parsed
+
+
+def _mission_now() -> datetime:
+    parsed = _strict_utc_timestamp(utc_now())
+    if parsed is None:  # pragma: no cover - utc_now is internal and UTC by contract
+        raise RuntimeError("mission clock invalid")
+    return parsed[1]
+
+
+def _canonical_mission_json(payload: dict[str, Any]) -> str:
+    return json.dumps(
+        payload,
+        ensure_ascii=False,
+        sort_keys=True,
+        separators=(",", ":"),
+        allow_nan=False,
+    )
+
+
+def _safe_mission_envelope(row: dict[str, Any]) -> dict[str, Any]:
+    return {
+        "ok": True,
+        "envelope_digest": str(row["envelope_digest"]),
+        "project_ref": str(row["project_ref"]),
+        "sales_pack_digest": str(row["sales_pack_digest"]),
+        "mode": str(row["mode"]),
+        "max_items": int(row["max_items"]),
+        "max_local_writes": int(row["max_local_writes"]),
+        "window_ref": str(row["window_ref"]),
+        "expires_at": str(row["expires_at"]),
+        "active": bool(row["active"]),
+        "killed": bool(row["killed"]),
+    }
+
+
+def register_mission_envelope(
+    *,
+    project_ref: str,
+    sales_pack_digest: str,
+    mode: str,
+    max_items: int,
+    max_local_writes: int,
+    window_ref: str,
+    expires_at: str,
+    active: bool = True,
+    kill_switch: bool = False,
+) -> dict[str, Any]:
+    """Persist one immutable, sanitized mission manifest and its control state."""
+
+    if not is_opaque_ref(project_ref) or not is_opaque_ref(window_ref):
+        return _mission_error("mission_envelope_ref_invalid")
+    if type(sales_pack_digest) is not str or not _MISSION_DIGEST_RE.fullmatch(
+        sales_pack_digest
+    ):
+        return _mission_error("sales_pack_digest_invalid")
+    if type(mode) is not str or mode not in _MISSION_MODES:
+        return _mission_error("mission_envelope_mode_invalid")
+    if (
+        type(max_items) is not int
+        or type(max_local_writes) is not int
+        or not 1 <= max_items <= _MISSION_MAX_ITEMS
+        or not 0 <= max_local_writes <= _MISSION_MAX_LOCAL_WRITES
+        or max_local_writes > max_items
+        or (mode != "safe_auto" and max_local_writes != 0)
+    ):
+        return _mission_error("mission_envelope_caps_invalid")
+    if type(active) is not bool or type(kill_switch) is not bool:
+        return _mission_error("mission_envelope_flags_invalid")
+    expiry = _strict_utc_timestamp(expires_at)
+    if expiry is None:
+        return _mission_error("mission_envelope_expiry_invalid")
+    expires_canonical, expires_dt = expiry
+    if expires_dt <= _mission_now():
+        return _mission_error("mission_envelope_expired")
+
+    effective_active = bool(active and not kill_switch)
+    payload = {
+        "project_ref": project_ref,
+        "sales_pack_digest": sales_pack_digest,
+        "mode": mode,
+        "caps": {
+            "max_items": max_items,
+            "max_local_writes": max_local_writes,
+        },
+        "window_ref": window_ref,
+        "expires_at": expires_canonical,
+        "active": effective_active,
+        "kill_switch": kill_switch,
+    }
+    payload_json = _canonical_mission_json(payload)
+    envelope_digest = hash_text(payload_json)
+    now = utc_now()
+    init_db()
+    with _connect() as conn:
+        conn.execute(
+            """
+            INSERT OR IGNORE INTO mission_envelopes (
+                envelope_digest, project_ref, sales_pack_digest, mode,
+                max_items, max_local_writes, window_ref, expires_at,
+                active, killed, payload_json, created_at, updated_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                envelope_digest,
+                project_ref,
+                sales_pack_digest,
+                mode,
+                max_items,
+                max_local_writes,
+                window_ref,
+                expires_canonical,
+                int(effective_active),
+                int(kill_switch),
+                payload_json,
+                now,
+                now,
+            ),
+        )
+        row = conn.execute(
+            "SELECT * FROM mission_envelopes WHERE envelope_digest=?",
+            (envelope_digest,),
+        ).fetchone()
+        validated, error = _validated_mission_envelope(
+            conn,
+            envelope_digest,
+            allow_inactive=True,
+        )
+    if row is None:  # pragma: no cover - protected by the insert/select transaction
+        return _mission_error("mission_envelope_write_failed")
+    if error is not None or validated is None:
+        return _mission_error(error or "mission_envelope_changed")
+    return _safe_mission_envelope(validated)
+
+
+def _validated_mission_envelope(
+    conn: sqlite3.Connection,
+    envelope_digest: str,
+    *,
+    requires_local_write: bool = False,
+    allow_inactive: bool = False,
+) -> tuple[dict[str, Any] | None, str | None]:
+    row = conn.execute(
+        "SELECT * FROM mission_envelopes WHERE envelope_digest=?",
+        (envelope_digest,),
+    ).fetchone()
+    if row is None:
+        return None, "mission_envelope_not_found"
+    stored = dict(row)
+    try:
+        payload = json.loads(str(stored["payload_json"]))
+        if type(payload) is not dict:
+            raise ValueError
+        caps = payload.get("caps")
+        if type(caps) is not dict:
+            raise ValueError
+        payload_keys = {
+            "project_ref",
+            "sales_pack_digest",
+            "mode",
+            "caps",
+            "window_ref",
+            "expires_at",
+            "active",
+            "kill_switch",
+        }
+        if set(payload) != payload_keys or set(caps) != {
+            "max_items",
+            "max_local_writes",
+        }:
+            raise ValueError
+        if hash_text(_canonical_mission_json(payload)) != envelope_digest:
+            raise ValueError
+        immutable_pairs = (
+            (payload["project_ref"], stored["project_ref"]),
+            (payload["sales_pack_digest"], stored["sales_pack_digest"]),
+            (payload["mode"], stored["mode"]),
+            (payload["window_ref"], stored["window_ref"]),
+            (payload["expires_at"], stored["expires_at"]),
+            (caps["max_items"], stored["max_items"]),
+            (caps["max_local_writes"], stored["max_local_writes"]),
+        )
+        if any(left != right for left, right in immutable_pairs):
+            raise ValueError
+        if type(payload["active"]) is not bool or type(payload["kill_switch"]) is not bool:
+            raise ValueError
+        runtime_active = int(stored["active"])
+        runtime_killed = int(stored["killed"])
+        if runtime_active not in {0, 1} or runtime_killed not in {0, 1}:
+            raise ValueError
+        initial_controls = (
+            int(payload["active"]),
+            int(payload["kill_switch"]),
+        )
+        runtime_controls = (runtime_active, runtime_killed)
+        if runtime_controls != initial_controls and runtime_controls != (0, 1):
+            raise ValueError
+        if not is_opaque_ref(stored["project_ref"]) or not is_opaque_ref(
+            stored["window_ref"]
+        ):
+            raise ValueError
+        if not _MISSION_DIGEST_RE.fullmatch(str(stored["sales_pack_digest"])):
+            raise ValueError
+        if str(stored["mode"]) not in _MISSION_MODES:
+            raise ValueError
+        expiry = _strict_utc_timestamp(stored["expires_at"])
+        if expiry is None:
+            raise ValueError
+    except (KeyError, TypeError, ValueError, json.JSONDecodeError):
+        return None, "mission_envelope_changed"
+
+    if not allow_inactive:
+        if bool(stored["killed"]):
+            return None, "mission_envelope_killed"
+        if not bool(stored["active"]):
+            return None, "mission_envelope_inactive"
+    if expiry[1] <= _mission_now():
+        return None, "mission_envelope_expired"
+    if requires_local_write and (
+        stored["mode"] != "safe_auto" or int(stored["max_local_writes"]) < 1
+    ):
+        return None, "mission_envelope_local_write_denied"
+    return stored, None
+
+
+def kill_mission_envelope(envelope_digest: str) -> dict[str, Any]:
+    """Idempotently stop one exact mission envelope without rewriting its digest."""
+
+    if type(envelope_digest) is not str or not _MISSION_DIGEST_RE.fullmatch(
+        envelope_digest
+    ):
+        return _mission_error("mission_envelope_digest_invalid")
+    init_db()
+    with _connect() as conn:
+        conn.execute("BEGIN IMMEDIATE")
+        row = conn.execute(
+            "SELECT * FROM mission_envelopes WHERE envelope_digest=?",
+            (envelope_digest,),
+        ).fetchone()
+        if row is None:
+            return _mission_error("mission_envelope_not_found")
+        conn.execute(
+            "UPDATE mission_envelopes SET active=0, killed=1, updated_at=? "
+            "WHERE envelope_digest=?",
+            (utc_now(), envelope_digest),
+        )
+        updated = conn.execute(
+            "SELECT * FROM mission_envelopes WHERE envelope_digest=?",
+            (envelope_digest,),
+        ).fetchone()
+    return _safe_mission_envelope(dict(updated))
+
+
+def _safe_autonomy_run(row: dict[str, Any]) -> dict[str, Any]:
+    return {
+        "ok": True,
+        "run_id": str(row["run_id"]),
+        "envelope_digest": str(row["envelope_digest"]),
+        "run_key": str(row["run_key"]),
+        "status": str(row["status"]),
+        "lease_expires_at": str(row["lease_expires_at"]),
+        "started_at": str(row["started_at"]),
+        "completed_at": row["completed_at"],
+        "counters": {
+            "items": int(row["items_count"]),
+            "local_writes": int(row["local_write_count"]),
+        },
+        "result_class": row["result_class"],
+    }
+
+
+def reserve_autonomy_run(
+    envelope_digest: str,
+    run_key: str,
+    lease_seconds: int = 300,
+    *,
+    requires_local_write: bool = False,
+    renew_expired: bool = False,
+) -> dict[str, Any]:
+    """Reserve one idempotent run, optionally renewing an expired lease."""
+
+    if type(envelope_digest) is not str or not _MISSION_DIGEST_RE.fullmatch(
+        envelope_digest
+    ):
+        return _mission_error("mission_envelope_not_found")
+    if not is_opaque_ref(run_key):
+        return _mission_error("autonomy_run_key_invalid")
+    if (
+        type(lease_seconds) is not int
+        or not _AUTONOMY_MIN_LEASE_SECONDS
+        <= lease_seconds
+        <= _AUTONOMY_MAX_LEASE_SECONDS
+    ):
+        return _mission_error("autonomy_run_lease_invalid")
+    if type(requires_local_write) is not bool or type(renew_expired) is not bool:
+        return _mission_error("autonomy_run_local_write_flag_invalid")
+
+    init_db()
+    now_dt = _mission_now()
+    now = now_dt.isoformat()
+    lease_expires_at = (now_dt + timedelta(seconds=lease_seconds)).isoformat()
+    with _connect() as conn:
+        conn.execute("BEGIN IMMEDIATE")
+        envelope, error = _validated_mission_envelope(
+            conn,
+            envelope_digest,
+            requires_local_write=requires_local_write,
+        )
+        if error is not None:
+            return _mission_error(error)
+        existing = conn.execute(
+            "SELECT * FROM autonomy_runs WHERE run_key=?", (run_key,)
+        ).fetchone()
+        if existing is not None:
+            existing_dict = dict(existing)
+            if existing_dict["envelope_digest"] != envelope_digest:
+                return _mission_error("autonomy_run_key_conflict")
+            if existing_dict["status"] == "completed":
+                result = _safe_autonomy_run(existing_dict)
+                result["deduped"] = True
+                return result
+            existing_lease = _strict_utc_timestamp(existing_dict["lease_expires_at"])
+            if existing_lease is None:
+                return _mission_error("autonomy_run_state_changed")
+            if existing_lease[1] > now_dt or not renew_expired:
+                result = _safe_autonomy_run(existing_dict)
+                result["deduped"] = True
+                if existing_lease[1] <= now_dt:
+                    result["lease_expired"] = True
+                return result
+
+            fence = secrets.token_urlsafe(32)
+            conn.execute(
+                "UPDATE autonomy_runs SET fence_hash=?, lease_expires_at=?, "
+                "updated_at=? WHERE run_key=? AND status='started'",
+                (hash_text(fence), lease_expires_at, now, run_key),
+            )
+            renewed_row = conn.execute(
+                "SELECT * FROM autonomy_runs WHERE run_key=?", (run_key,)
+            ).fetchone()
+            result = _safe_autonomy_run(dict(renewed_row))
+            result.update(
+                {"deduped": True, "renewed": True, "fence": fence}
+            )
+            return result
+
+        fence = secrets.token_urlsafe(32)
+        run_id = "autonomy_" + hash_text(envelope_digest + ":" + run_key)[:20]
+        conn.execute(
+            """
+            INSERT INTO autonomy_runs (
+                run_id, envelope_digest, run_key, status, fence_hash,
+                lease_expires_at, started_at, completed_at, items_count,
+                local_write_count, result_class, updated_at
+            ) VALUES (?, ?, ?, 'started', ?, ?, ?, NULL, 0, 0, NULL, ?)
+            """,
+            (
+                run_id,
+                envelope_digest,
+                run_key,
+                hash_text(fence),
+                lease_expires_at,
+                now,
+                now,
+            ),
+        )
+        created = conn.execute(
+            "SELECT * FROM autonomy_runs WHERE run_key=?", (run_key,)
+        ).fetchone()
+    result = _safe_autonomy_run(dict(created))
+    result.update({"deduped": False, "renewed": False, "fence": fence})
+    return result
+
+
+def _validated_run_counters(counters: Any) -> dict[str, int] | None:
+    if type(counters) is not dict or set(counters) != {"items", "local_writes"}:
+        return None
+    items = counters["items"]
+    local_writes = counters["local_writes"]
+    if (
+        type(items) is not int
+        or type(local_writes) is not int
+        or items < 0
+        or local_writes < 0
+    ):
+        return None
+    return {"items": items, "local_writes": local_writes}
+
+
+def complete_autonomy_run(
+    run_key: str,
+    fence: str,
+    *,
+    counters: dict[str, Any],
+    result_class: str,
+) -> dict[str, Any]:
+    """Complete one leased run once; stale fences and changed envelopes fail closed."""
+
+    if not is_opaque_ref(run_key):
+        return _mission_error("autonomy_run_key_invalid")
+    if type(fence) is not str or not fence:
+        return _mission_error("autonomy_run_fence_stale")
+    safe_counters = _validated_run_counters(counters)
+    if safe_counters is None:
+        return _mission_error("autonomy_run_counters_invalid")
+    if type(result_class) is not str or result_class not in _AUTONOMY_RESULT_CLASSES:
+        return _mission_error("autonomy_run_result_class_invalid")
+
+    init_db()
+    now_dt = _mission_now()
+    now = now_dt.isoformat()
+    with _connect() as conn:
+        conn.execute("BEGIN IMMEDIATE")
+        row = conn.execute(
+            "SELECT * FROM autonomy_runs WHERE run_key=?", (run_key,)
+        ).fetchone()
+        if row is None:
+            return _mission_error("autonomy_run_not_found")
+        run = dict(row)
+        if not secrets.compare_digest(str(run["fence_hash"]), hash_text(fence)):
+            return _mission_error("autonomy_run_fence_stale")
+        envelope, error = _validated_mission_envelope(
+            conn, str(run["envelope_digest"])
+        )
+        if error is not None:
+            return _mission_error(error)
+        if run["status"] == "completed":
+            result = _safe_autonomy_run(run)
+            result["deduped"] = True
+            return result
+        lease = _strict_utc_timestamp(run["lease_expires_at"])
+        if lease is None or lease[1] <= now_dt:
+            return _mission_error("autonomy_run_lease_expired")
+        if (
+            safe_counters["items"] > int(envelope["max_items"])
+            or safe_counters["local_writes"]
+            > int(envelope["max_local_writes"])
+        ):
+            return _mission_error("autonomy_run_caps_exceeded")
+        conn.execute(
+            """
+            UPDATE autonomy_runs
+            SET status='completed', completed_at=?, items_count=?,
+                local_write_count=?, result_class=?, updated_at=?
+            WHERE run_key=? AND status='started' AND fence_hash=?
+            """,
+            (
+                now,
+                safe_counters["items"],
+                safe_counters["local_writes"],
+                result_class,
+                now,
+                run_key,
+                hash_text(fence),
+            ),
+        )
+        completed = conn.execute(
+            "SELECT * FROM autonomy_runs WHERE run_key=?", (run_key,)
+        ).fetchone()
+    return _safe_autonomy_run(dict(completed))

@@ -120,6 +120,27 @@ def test_unknown_action_and_bad_config_shapes_fail_closed_without_exception():
     assert "area_not_allowlisted" in malformed.reasons
 
 
+def test_non_finite_policy_bounds_fail_closed_without_exception():
+    from tools.whatsapp_ops_autonomy import autonomy_status, evaluate_autonomy
+
+    config = _config(mode="safe_auto")
+    config["autonomy"]["max_items_per_run"] = float("inf")
+    config["autonomy"]["min_confidence"] = float("nan")
+
+    decision = evaluate_autonomy(
+        config,
+        action="opportunity.score",
+        requested_items=float("-inf"),
+    )
+    status = autonomy_status(config)
+
+    assert decision.max_items == 1
+    assert decision.min_confidence == 0.75
+    assert status["max_items_per_run"] == 1
+    assert status["min_confidence"] == 0.75
+
+
+
 def test_status_is_sanitized_and_explicit_about_hard_denies():
     from tools.whatsapp_ops_autonomy import HARD_DENIED_ACTIONS, autonomy_status
 
@@ -137,3 +158,86 @@ def test_status_is_sanitized_and_explicit_about_hard_denies():
     assert status["external_effects_allowed"] is False
     assert status["approval_resolution_allowed"] is False
     assert "credentials" not in status
+
+
+def test_commercial_state_transitions_are_pure_deterministic_and_payload_free():
+    from tools.whatsapp_ops_autonomy import transition_sales_stage
+
+    state = {
+        "project_ref": "project_demo_01",
+        "lead_ref": "lead_demo_01",
+        "stage": "BDR",
+    }
+    expected = (
+        ("lead_qualified", "SDR"),
+        ("opportunity_qualified", "Closer"),
+        ("deal_won", "Support"),
+    )
+    lifecycle = ["BDR"]
+    for event, stage in expected:
+        result = transition_sales_stage(
+            project_ref=state["project_ref"],
+            lead_ref=state["lead_ref"],
+            stage=state["stage"],
+            event=event,
+        )
+        assert result.transitioned is True
+        assert result.code == "sales_stage_transitioned"
+        assert result.from_stage == state["stage"]
+        assert result.to_stage == stage
+        state["stage"] = stage
+        lifecycle.append(stage)
+
+    assert lifecycle == ["BDR", "SDR", "Closer", "Support"]
+    assert result.as_dict() == {
+        "transitioned": True,
+        "code": "sales_stage_transitioned",
+        "project_ref": "project_demo_01",
+        "lead_ref": "lead_demo_01",
+        "from_stage": "Closer",
+        "to_stage": "Support",
+        "event": "deal_won",
+    }
+
+
+def test_commercial_state_invalid_stage_event_or_ref_fails_closed_without_echo():
+    import json
+
+    from tools.whatsapp_ops_autonomy import transition_sales_stage
+
+    bad_stage = transition_sales_stage(
+        project_ref="project_demo_01",
+        lead_ref="lead_demo_01",
+        stage="Unknown",
+        event="lead_qualified",
+    )
+    bad_event = transition_sales_stage(
+        project_ref="project_demo_01",
+        lead_ref="lead_demo_01",
+        stage="BDR",
+        event="deal_won",
+    )
+    unknown_event = transition_sales_stage(
+        project_ref="project_demo_01",
+        lead_ref="lead_demo_01",
+        stage="BDR",
+        event="free_text_payload_canary",
+    )
+    raw_ref = "551199998888@s.whatsapp.net"
+    bad_ref = transition_sales_stage(
+        project_ref="project_demo_01",
+        lead_ref=raw_ref,
+        stage="BDR",
+        event="lead_qualified",
+    )
+
+    assert bad_stage.transitioned is False
+    assert bad_stage.code == "sales_stage_invalid"
+    assert bad_event.transitioned is False
+    assert bad_event.code == "sales_transition_denied"
+    assert unknown_event.transitioned is False
+    assert unknown_event.code == "sales_event_invalid"
+    assert "free_text_payload_canary" not in json.dumps(unknown_event.as_dict())
+    assert bad_ref.transitioned is False
+    assert bad_ref.code == "sales_ref_invalid"
+    assert raw_ref not in json.dumps(bad_ref.as_dict())

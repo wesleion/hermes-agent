@@ -8,8 +8,11 @@ paths remain separate and external effects retain their existing hard gates.
 
 from __future__ import annotations
 
+import math
 from dataclasses import dataclass
 from typing import Any
+
+from tools.whatsapp_ops_sales import is_opaque_ref
 
 VALID_AUTONOMY_MODES = frozenset({"off", "assist", "safe_auto"})
 
@@ -76,7 +79,7 @@ def _string_set(value: Any) -> set[str]:
 def _bounded_int(value: Any, default: int = 1, minimum: int = 1, maximum: int = 20) -> int:
     try:
         parsed = int(value)
-    except (TypeError, ValueError):
+    except (TypeError, ValueError, OverflowError):
         parsed = default
     return max(minimum, min(parsed, maximum))
 
@@ -84,7 +87,9 @@ def _bounded_int(value: Any, default: int = 1, minimum: int = 1, maximum: int = 
 def _bounded_float(value: Any, default: float = 0.75) -> float:
     try:
         parsed = float(value)
-    except (TypeError, ValueError):
+    except (TypeError, ValueError, OverflowError):
+        parsed = default
+    if not math.isfinite(parsed):
         parsed = default
     return max(0.0, min(parsed, 1.0))
 
@@ -108,7 +113,7 @@ def evaluate_autonomy(
     *,
     action: str,
     area: str = "",
-    requested_items: int = 1,
+    requested_items: Any = 1,
 ) -> AutonomyDecision:
     """Return a deterministic decision for one explicitly named action.
 
@@ -186,3 +191,97 @@ def autonomy_status(config: dict[str, Any] | None) -> dict[str, Any]:
         "approval_resolution_allowed": False,
         "deny_by_default": True,
     }
+
+
+# Commercial lifecycle persistence is intentionally deferred to the campaign
+# slice.  This pure transition seam avoids a speculative third SQLite table.
+SALES_STAGES = frozenset({"BDR", "SDR", "Closer", "Support"})
+SALES_STAGE_TRANSITIONS = {
+    ("BDR", "lead_qualified"): "SDR",
+    ("SDR", "opportunity_qualified"): "Closer",
+    ("Closer", "deal_won"): "Support",
+}
+_SALES_EVENTS = frozenset(event for _, event in SALES_STAGE_TRANSITIONS)
+
+
+@dataclass(frozen=True)
+class SalesTransition:
+    transitioned: bool
+    code: str
+    project_ref: str
+    lead_ref: str
+    from_stage: str
+    to_stage: str
+    event: str
+
+    def as_dict(self) -> dict[str, Any]:
+        return {
+            "transitioned": self.transitioned,
+            "code": self.code,
+            "project_ref": self.project_ref,
+            "lead_ref": self.lead_ref,
+            "from_stage": self.from_stage,
+            "to_stage": self.to_stage,
+            "event": self.event,
+        }
+
+
+def transition_sales_stage(
+    *,
+    project_ref: object,
+    lead_ref: object,
+    stage: object,
+    event: object,
+) -> SalesTransition:
+    """Apply one deterministic BDR→SDR→Closer→Support lifecycle event.
+
+    Only opaque project/lead refs and closed enum values can appear in output.
+    Unknown or out-of-order input fails closed without returning text payloads.
+    """
+
+    if not is_opaque_ref(project_ref) or not is_opaque_ref(lead_ref):
+        return SalesTransition(False, "sales_ref_invalid", "", "", "", "", "")
+
+    project = str(project_ref)
+    lead = str(lead_ref)
+    if type(stage) is not str or stage not in SALES_STAGES:
+        return SalesTransition(
+            False,
+            "sales_stage_invalid",
+            project,
+            lead,
+            "",
+            "",
+            event if type(event) is str and event in _SALES_EVENTS else "",
+        )
+    if type(event) is not str or event not in _SALES_EVENTS:
+        return SalesTransition(
+            False,
+            "sales_event_invalid",
+            project,
+            lead,
+            stage,
+            stage,
+            "",
+        )
+
+    next_stage = SALES_STAGE_TRANSITIONS.get((stage, event))
+    if next_stage is None:
+        return SalesTransition(
+            False,
+            "sales_transition_denied",
+            project,
+            lead,
+            stage,
+            stage,
+            event,
+        )
+    return SalesTransition(
+        True,
+        "sales_stage_transitioned",
+        project,
+        lead,
+        stage,
+        next_stage,
+        event,
+    )
