@@ -16,6 +16,7 @@ import uuid
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any
+from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 from hermes_constants import get_hermes_home
 from tools.whatsapp_ops_sales import is_opaque_ref
@@ -41,6 +42,37 @@ _MISSION_MAX_ITEMS = 50
 _MISSION_MAX_LOCAL_WRITES = 5
 _AUTONOMY_MIN_LEASE_SECONDS = 30
 _AUTONOMY_MAX_LEASE_SECONDS = 3600
+_CAMPAIGN_SCHEMA = "wpp-campaign-manifest/v1"
+_CAMPAIGN_DIGEST_RE = re.compile(r"^[0-9a-f]{64}$")
+_CAMPAIGN_CLASSIFICATIONS = frozenset({"cold", "warm", "reactivation"})
+_CAMPAIGN_SUPPRESSION_REASONS = frozenset(
+    {"opt_out", "inbound_after_approval", "manual_required", "channel_revoked"}
+)
+_CAMPAIGN_MIN_LEASE_SECONDS = 30
+_CAMPAIGN_MAX_LEASE_SECONDS = 3600
+_CAMPAIGN_TRANSITIONS = {
+    "queued": frozenset({"pending_approval", "blocked", "failed", "killed"}),
+    "pending_approval": frozenset({"approved", "blocked", "failed", "killed"}),
+    "approved": frozenset({"executing", "blocked", "failed", "killed"}),
+    "executing": frozenset(
+        {"sent", "partial", "blocked", "failed", "failed_unknown", "killed"}
+    ),
+    "partial": frozenset({"executing", "blocked", "failed", "failed_unknown", "killed"}),
+    "blocked": frozenset({"killed"}),
+    "failed_unknown": frozenset({"killed"}),
+    "sent": frozenset(),
+    "failed": frozenset(),
+    "killed": frozenset(),
+}
+_CAMPAIGN_ITEM_TRANSITIONS = {
+    "staged": frozenset({"approved", "suppressed", "failed"}),
+    "approved": frozenset({"leased", "suppressed", "failed"}),
+    "leased": frozenset({"sent", "suppressed", "failed", "failed_unknown"}),
+    "sent": frozenset(),
+    "suppressed": frozenset(),
+    "failed": frozenset(),
+    "failed_unknown": frozenset(),
+}
 
 
 def utc_now() -> str:
@@ -240,6 +272,112 @@ def _migrate_mission_ledger(conn: sqlite3.Connection) -> None:
         conn.execute(f"RELEASE {savepoint}")
 
 
+def _migrate_campaign_ledger(conn: sqlite3.Connection) -> None:
+    """Add the campaign ledger atomically without owning the caller transaction."""
+
+    savepoint = f"whatsapp_ops_campaign_ledger_{secrets.token_hex(8)}"
+    statements = (
+        """
+        CREATE TABLE IF NOT EXISTS campaigns (
+            campaign_id TEXT PRIMARY KEY,
+            manifest_digest TEXT NOT NULL UNIQUE,
+            campaign_ref TEXT NOT NULL UNIQUE,
+            project_ref TEXT NOT NULL,
+            start_at TEXT NOT NULL,
+            end_at TEXT NOT NULL,
+            timezone TEXT NOT NULL,
+            sales_pack_digest TEXT NOT NULL,
+            max_followups INTEGER NOT NULL CHECK(max_followups BETWEEN 0 AND 3),
+            state TEXT NOT NULL CHECK(state IN (
+                'queued', 'pending_approval', 'approved', 'executing', 'sent',
+                'partial', 'blocked', 'failed', 'failed_unknown', 'killed'
+            )),
+            paused INTEGER NOT NULL DEFAULT 0 CHECK(paused IN (0, 1)),
+            killed INTEGER NOT NULL DEFAULT 0 CHECK(killed IN (0, 1)),
+            manifest_json TEXT NOT NULL,
+            created_at TEXT NOT NULL,
+            updated_at TEXT NOT NULL
+        )
+        """,
+        """
+        CREATE TABLE IF NOT EXISTS campaign_items (
+            campaign_item_id TEXT PRIMARY KEY,
+            campaign_id TEXT NOT NULL REFERENCES campaigns(campaign_id),
+            ordinal INTEGER NOT NULL CHECK(ordinal BETWEEN 1 AND 3),
+            draft_id TEXT NOT NULL UNIQUE REFERENCES drafts(id),
+            approval_id TEXT NOT NULL UNIQUE REFERENCES approvals(id),
+            contact_id TEXT NOT NULL REFERENCES contacts(id),
+            channel_id TEXT NOT NULL REFERENCES contact_channels(id),
+            classification TEXT NOT NULL CHECK(classification IN ('cold', 'warm', 'reactivation')),
+            segment TEXT NOT NULL,
+            draft_hash TEXT NOT NULL,
+            message_hash TEXT NOT NULL,
+            state TEXT NOT NULL CHECK(state IN (
+                'staged', 'approved', 'leased', 'sent', 'suppressed',
+                'failed', 'failed_unknown'
+            )),
+            suppression_reason TEXT,
+            followup_count INTEGER NOT NULL DEFAULT 0 CHECK(followup_count BETWEEN 0 AND 3),
+            lease_fence_hash TEXT,
+            lease_expires_at TEXT,
+            leased_at TEXT,
+            created_at TEXT NOT NULL,
+            updated_at TEXT NOT NULL,
+            UNIQUE(campaign_id, ordinal),
+            UNIQUE(campaign_id, contact_id),
+            UNIQUE(campaign_id, channel_id)
+        )
+        """,
+        """
+        CREATE TABLE IF NOT EXISTS campaign_events (
+            event_id TEXT PRIMARY KEY,
+            campaign_id TEXT NOT NULL REFERENCES campaigns(campaign_id),
+            campaign_item_id TEXT REFERENCES campaign_items(campaign_item_id),
+            event_type TEXT NOT NULL,
+            ordinal INTEGER,
+            state TEXT,
+            reason TEXT,
+            created_at TEXT NOT NULL
+        )
+        """,
+        """
+        CREATE INDEX IF NOT EXISTS ix_campaign_events_campaign_created
+        ON campaign_events(campaign_id, created_at, event_id)
+        """,
+        """
+        CREATE TRIGGER IF NOT EXISTS campaign_events_no_update
+        BEFORE UPDATE ON campaign_events
+        BEGIN
+            SELECT RAISE(ABORT, 'campaign_events append-only');
+        END
+        """,
+        """
+        CREATE TRIGGER IF NOT EXISTS campaign_events_no_delete
+        BEFORE DELETE ON campaign_events
+        BEGIN
+            SELECT RAISE(ABORT, 'campaign_events append-only');
+        END
+        """,
+    )
+
+    conn.execute(f"SAVEPOINT {savepoint}")
+    try:
+        for statement in statements:
+            conn.execute(statement)
+    except BaseException:
+        try:
+            conn.execute(f"ROLLBACK TO {savepoint}")
+        except BaseException:
+            pass
+        try:
+            conn.execute(f"RELEASE {savepoint}")
+        except BaseException:
+            pass
+        raise
+    else:
+        conn.execute(f"RELEASE {savepoint}")
+
+
 def init_db() -> Path:
     db_path = get_db_path()
     db_path.parent.mkdir(parents=True, exist_ok=True)
@@ -421,6 +559,7 @@ def init_db() -> Path:
         _ensure_registration_staging_columns(conn)
         _backfill_registration_staging_metadata(conn)
         _migrate_mission_ledger(conn)
+        _migrate_campaign_ledger(conn)
     return db_path
 
 
@@ -5624,3 +5763,840 @@ def complete_autonomy_run(
             "SELECT * FROM autonomy_runs WHERE run_key=?", (run_key,)
         ).fetchone()
     return _safe_autonomy_run(dict(completed))
+
+
+# ---------------------------------------------------------------------------
+# Exact-three campaign ledger (internal, local-only)
+# ---------------------------------------------------------------------------
+
+
+def _campaign_error(code: str) -> dict[str, Any]:
+    return {"ok": False, "error": code}
+
+
+def _canonical_campaign_json(payload: dict[str, Any]) -> str:
+    return json.dumps(
+        payload,
+        ensure_ascii=False,
+        sort_keys=True,
+        separators=(",", ":"),
+        allow_nan=False,
+    )
+
+
+def _campaign_item_ref_is_opaque(key: str, value: Any) -> bool:
+    """Accept generated local IDs without mistaking random hex digits for PII."""
+
+    if is_opaque_ref(value):
+        return True
+    if type(value) is not str:
+        return False
+    patterns = {
+        "draft_id": r"draft_[0-9a-f]{12}",
+        "approval_id": r"approval_[0-9a-f]{12}",
+        "contact_id": r"contact_[0-9a-f]{16}",
+        "channel_id": r"channel_[0-9a-f]{20}",
+    }
+    pattern = patterns.get(key)
+    return pattern is not None and re.fullmatch(pattern, value) is not None
+
+
+def _normalize_campaign_manifest(
+    manifest: Any, *, require_open_window: bool
+) -> tuple[dict[str, Any] | None, str | None]:
+    top_keys = {
+        "schema",
+        "campaign_ref",
+        "project_ref",
+        "start_at",
+        "end_at",
+        "timezone",
+        "sales_pack_digest",
+        "max_followups",
+        "items",
+    }
+    item_keys = {
+        "ordinal",
+        "draft_id",
+        "approval_id",
+        "contact_id",
+        "channel_id",
+        "classification",
+        "segment",
+        "draft_hash",
+        "message_hash",
+    }
+    if type(manifest) is not dict or set(manifest) != top_keys:
+        return None, "campaign_manifest_invalid"
+    if manifest.get("schema") != _CAMPAIGN_SCHEMA:
+        return None, "campaign_manifest_schema_invalid"
+    if not is_opaque_ref(manifest.get("campaign_ref")) or not is_opaque_ref(
+        manifest.get("project_ref")
+    ):
+        return None, "campaign_manifest_ref_invalid"
+    start = _strict_utc_timestamp(manifest.get("start_at"))
+    end = _strict_utc_timestamp(manifest.get("end_at"))
+    if start is None or end is None or start[1] >= end[1]:
+        return None, "campaign_window_invalid"
+    if require_open_window and end[1] <= _mission_now():
+        return None, "campaign_window_expired"
+    timezone_name = manifest.get("timezone")
+    if type(timezone_name) is not str or not 1 <= len(timezone_name) <= 64:
+        return None, "campaign_timezone_invalid"
+    try:
+        ZoneInfo(timezone_name)
+    except (ValueError, ZoneInfoNotFoundError):
+        return None, "campaign_timezone_invalid"
+    sales_pack_digest = manifest.get("sales_pack_digest")
+    if type(sales_pack_digest) is not str or not _CAMPAIGN_DIGEST_RE.fullmatch(
+        sales_pack_digest
+    ):
+        return None, "campaign_sales_pack_digest_invalid"
+    max_followups = manifest.get("max_followups")
+    if type(max_followups) is not int or not 0 <= max_followups <= 3:
+        return None, "campaign_followups_invalid"
+    items = manifest.get("items")
+    if type(items) is not list or len(items) != 3:
+        return None, "campaign_items_exact_three_required"
+
+    normalized_items: list[dict[str, Any]] = []
+    uniques = {key: set() for key in ("draft_id", "approval_id", "contact_id", "channel_id")}
+    for expected_ordinal, item in enumerate(items, 1):
+        if type(item) is not dict or set(item) != item_keys:
+            return None, "campaign_item_invalid"
+        if type(item.get("ordinal")) is not int or item["ordinal"] != expected_ordinal:
+            return None, "campaign_item_order_invalid"
+        for key in ("draft_id", "approval_id", "contact_id", "channel_id"):
+            value = item.get(key)
+            if not _campaign_item_ref_is_opaque(key, value) or value in uniques[key]:
+                return None, "campaign_item_ref_invalid"
+            uniques[key].add(value)
+        if item.get("classification") not in _CAMPAIGN_CLASSIFICATIONS:
+            return None, "campaign_item_classification_invalid"
+        segment = item.get("segment")
+        if not is_opaque_ref(segment) or len(segment) > 64:
+            return None, "campaign_item_segment_invalid"
+        if any(
+            type(item.get(key)) is not str
+            or _CAMPAIGN_DIGEST_RE.fullmatch(item[key]) is None
+            for key in ("draft_hash", "message_hash")
+        ):
+            return None, "campaign_item_hash_invalid"
+        normalized_items.append(dict(item))
+
+    return {
+        "schema": _CAMPAIGN_SCHEMA,
+        "campaign_ref": manifest["campaign_ref"],
+        "project_ref": manifest["project_ref"],
+        "start_at": start[0],
+        "end_at": end[0],
+        "timezone": timezone_name,
+        "sales_pack_digest": sales_pack_digest,
+        "max_followups": max_followups,
+        "items": normalized_items,
+    }, None
+
+
+def campaign_manifest_digest(manifest: dict[str, Any]) -> dict[str, Any]:
+    """Validate and digest the strict manifest without touching local state."""
+
+    normalized, error = _normalize_campaign_manifest(
+        manifest, require_open_window=True
+    )
+    if error is not None or normalized is None:
+        return _campaign_error(error or "campaign_manifest_invalid")
+    return {
+        "ok": True,
+        "schema": _CAMPAIGN_SCHEMA,
+        "manifest_digest": hash_text(_canonical_campaign_json(normalized)),
+        "item_count": 3,
+    }
+
+
+def _append_campaign_event(
+    conn: sqlite3.Connection,
+    *,
+    campaign_id: str,
+    event_type: str,
+    campaign_item_id: str | None = None,
+    ordinal: int | None = None,
+    state: str | None = None,
+    reason: str | None = None,
+    created_at: str | None = None,
+) -> None:
+    conn.execute(
+        """
+        INSERT INTO campaign_events (
+            event_id, campaign_id, campaign_item_id, event_type,
+            ordinal, state, reason, created_at
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+        """,
+        (
+            "campaign_event_" + uuid.uuid4().hex[:16],
+            campaign_id,
+            campaign_item_id,
+            event_type,
+            ordinal,
+            state,
+            reason,
+            created_at or utc_now(),
+        ),
+    )
+
+
+def _safe_campaign_item(row: dict[str, Any]) -> dict[str, Any]:
+    return {
+        "ordinal": int(row["ordinal"]),
+        "classification": str(row["classification"]),
+        "segment": str(row["segment"]),
+        "state": str(row["state"]),
+        "suppression_reason": row.get("suppression_reason"),
+        "followup_count": int(row["followup_count"]),
+        "lease_expires_at": row.get("lease_expires_at"),
+    }
+
+
+def _validated_campaign_locked(
+    conn: sqlite3.Connection, campaign_id: str
+) -> tuple[dict[str, Any] | None, list[dict[str, Any]] | None, str | None]:
+    row = conn.execute(
+        "SELECT * FROM campaigns WHERE campaign_id=?", (str(campaign_id),)
+    ).fetchone()
+    if row is None:
+        return None, None, "campaign_not_found"
+    campaign = dict(row)
+    try:
+        manifest_raw = json.loads(str(campaign["manifest_json"]))
+    except (TypeError, json.JSONDecodeError):
+        return None, None, "campaign_manifest_changed"
+    manifest, error = _normalize_campaign_manifest(
+        manifest_raw, require_open_window=False
+    )
+    if error is not None or manifest is None:
+        return None, None, "campaign_manifest_changed"
+    canonical = _canonical_campaign_json(manifest)
+    immutable = (
+        (hash_text(canonical), campaign["manifest_digest"]),
+        (manifest["campaign_ref"], campaign["campaign_ref"]),
+        (manifest["project_ref"], campaign["project_ref"]),
+        (manifest["start_at"], campaign["start_at"]),
+        (manifest["end_at"], campaign["end_at"]),
+        (manifest["timezone"], campaign["timezone"]),
+        (manifest["sales_pack_digest"], campaign["sales_pack_digest"]),
+        (manifest["max_followups"], campaign["max_followups"]),
+    )
+    if any(left != right for left, right in immutable):
+        return None, None, "campaign_manifest_changed"
+    items = [
+        dict(item)
+        for item in conn.execute(
+            "SELECT * FROM campaign_items WHERE campaign_id=? ORDER BY ordinal",
+            (campaign_id,),
+        ).fetchall()
+    ]
+    if len(items) != 3:
+        return None, None, "campaign_manifest_changed"
+    immutable_item_keys = (
+        "ordinal",
+        "draft_id",
+        "approval_id",
+        "contact_id",
+        "channel_id",
+        "classification",
+        "segment",
+        "draft_hash",
+        "message_hash",
+    )
+    for stored, expected in zip(items, manifest["items"], strict=True):
+        if any(stored[key] != expected[key] for key in immutable_item_keys):
+            return None, None, "campaign_manifest_changed"
+    return campaign, items, None
+
+
+def _safe_campaign(
+    campaign: dict[str, Any], items: list[dict[str, Any]], *, deduped: bool = False
+) -> dict[str, Any]:
+    return {
+        "ok": True,
+        "campaign_id": str(campaign["campaign_id"]),
+        "manifest_digest": str(campaign["manifest_digest"]),
+        "campaign_ref": str(campaign["campaign_ref"]),
+        "project_ref": str(campaign["project_ref"]),
+        "start_at": str(campaign["start_at"]),
+        "end_at": str(campaign["end_at"]),
+        "timezone": str(campaign["timezone"]),
+        "sales_pack_digest": str(campaign["sales_pack_digest"]),
+        "max_followups": int(campaign["max_followups"]),
+        "state": str(campaign["state"]),
+        "paused": bool(campaign["paused"]),
+        "killed": bool(campaign["killed"]),
+        "item_count": len(items),
+        "items": [_safe_campaign_item(item) for item in items],
+        "deduped": deduped,
+    }
+
+
+def register_campaign_manifest(manifest: dict[str, Any]) -> dict[str, Any]:
+    """Atomically admit exactly three pre-created pending 1:1 drafts."""
+
+    normalized, error = _normalize_campaign_manifest(
+        manifest, require_open_window=True
+    )
+    if error is not None or normalized is None:
+        return _campaign_error(error or "campaign_manifest_invalid")
+    init_db()
+    try:
+        with _connect() as conn:
+            conn.execute("BEGIN IMMEDIATE")
+            normalized, error = _normalize_campaign_manifest(
+                manifest, require_open_window=True
+            )
+            if error is not None or normalized is None:
+                return _campaign_error(error or "campaign_manifest_invalid")
+            manifest_json = _canonical_campaign_json(normalized)
+            manifest_digest = hash_text(manifest_json)
+            existing = conn.execute(
+                "SELECT campaign_id FROM campaigns WHERE manifest_digest=?",
+                (manifest_digest,),
+            ).fetchone()
+            if existing is None:
+                conflict = conn.execute(
+                    "SELECT 1 FROM campaigns WHERE campaign_ref=?",
+                    (normalized["campaign_ref"],),
+                ).fetchone()
+                if conflict is not None:
+                    return _campaign_error("campaign_ref_conflict")
+
+            now_dt = _mission_now()
+            now = now_dt.isoformat()
+            for item in normalized["items"]:
+                draft_row = conn.execute(
+                    "SELECT * FROM drafts WHERE id=?", (item["draft_id"],)
+                ).fetchone()
+                if draft_row is None:
+                    return _campaign_error("campaign_draft_not_found")
+                draft = dict(draft_row)
+                if (
+                    draft["status"] != "pending_approval"
+                    or draft["message_hash"] != item["message_hash"]
+                    or draft["idempotency_key"] != item["draft_hash"]
+                    or not draft_signature_matches(draft)
+                ):
+                    return _campaign_error("campaign_draft_changed")
+                try:
+                    targets = json.loads(str(draft["targets_json"]))
+                except (TypeError, json.JSONDecodeError):
+                    targets = None
+                if (
+                    type(targets) is not list
+                    or len(targets) != 1
+                    or type(targets[0]) is not dict
+                    or set(targets[0]) != {"type", "contact_id"}
+                    or targets[0].get("type") != "contact"
+                    or targets[0].get("contact_id") != item["contact_id"]
+                ):
+                    return _campaign_error("campaign_draft_not_one_to_one")
+
+                approval_row = conn.execute(
+                    "SELECT * FROM approvals WHERE id=?", (item["approval_id"],)
+                ).fetchone()
+                if approval_row is None:
+                    return _campaign_error("campaign_approval_not_found")
+                approval = dict(approval_row)
+                expiry = _strict_utc_timestamp(approval["expires_at"])
+                if (
+                    approval["draft_id"] != item["draft_id"]
+                    or approval["status"] != "pending"
+                    or approval["message_hash"] != draft["message_hash"]
+                    or approval["draft_idempotency_key"] != draft["idempotency_key"]
+                    or expiry is None
+                    or expiry[1] <= now_dt
+                ):
+                    return _campaign_error("campaign_approval_changed")
+
+                contact = conn.execute(
+                    "SELECT whitelisted FROM contacts WHERE id=?",
+                    (item["contact_id"],),
+                ).fetchone()
+                channel = conn.execute(
+                    "SELECT * FROM contact_channels WHERE id=?",
+                    (item["channel_id"],),
+                ).fetchone()
+                if (
+                    contact is None
+                    or not bool(contact["whitelisted"])
+                    or channel is None
+                    or channel["contact_id"] != item["contact_id"]
+                    or channel["channel_type"] != "whatsapp"
+                    or not bool(channel["is_active"])
+                    or channel["validation_status"] != "validated"
+                    or not bool(channel["allow_send"])
+                    or channel["revoked_at"] is not None
+                ):
+                    return _campaign_error("campaign_channel_ineligible")
+
+            if existing is not None:
+                campaign, items, changed = _validated_campaign_locked(
+                    conn, str(existing["campaign_id"])
+                )
+                if changed is not None or campaign is None or items is None:
+                    return _campaign_error(changed or "campaign_manifest_changed")
+                return _safe_campaign(campaign, items, deduped=True)
+
+            campaign_id = "campaign_" + manifest_digest[:20]
+            conn.execute(
+                """
+                INSERT INTO campaigns (
+                    campaign_id, manifest_digest, campaign_ref, project_ref,
+                    start_at, end_at, timezone, sales_pack_digest, max_followups,
+                    state, paused, killed, manifest_json, created_at, updated_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 'queued', 0, 0, ?, ?, ?)
+                """,
+                (
+                    campaign_id,
+                    manifest_digest,
+                    normalized["campaign_ref"],
+                    normalized["project_ref"],
+                    normalized["start_at"],
+                    normalized["end_at"],
+                    normalized["timezone"],
+                    normalized["sales_pack_digest"],
+                    normalized["max_followups"],
+                    manifest_json,
+                    now,
+                    now,
+                ),
+            )
+            for item in normalized["items"]:
+                item_id = f"{campaign_id}_item_{item['ordinal']}"
+                conn.execute(
+                    """
+                    INSERT INTO campaign_items (
+                        campaign_item_id, campaign_id, ordinal, draft_id, approval_id,
+                        contact_id, channel_id, classification, segment, draft_hash,
+                        message_hash, state, suppression_reason, followup_count,
+                        lease_fence_hash, lease_expires_at, leased_at, created_at, updated_at
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'staged', NULL, 0,
+                              NULL, NULL, NULL, ?, ?)
+                    """,
+                    (
+                        item_id,
+                        campaign_id,
+                        item["ordinal"],
+                        item["draft_id"],
+                        item["approval_id"],
+                        item["contact_id"],
+                        item["channel_id"],
+                        item["classification"],
+                        item["segment"],
+                        item["draft_hash"],
+                        item["message_hash"],
+                        now,
+                        now,
+                    ),
+                )
+            _append_campaign_event(
+                conn,
+                campaign_id=campaign_id,
+                event_type="campaign_registered",
+                state="queued",
+                created_at=now,
+            )
+            campaign, items, changed = _validated_campaign_locked(conn, campaign_id)
+            if changed is not None or campaign is None or items is None:
+                raise ValueError(changed or "campaign_manifest_changed")
+        return _safe_campaign(campaign, items)
+    except sqlite3.IntegrityError:
+        return _campaign_error("campaign_item_reservation_conflict")
+
+
+def get_campaign(campaign_id: str) -> dict[str, Any]:
+    init_db()
+    with _connect() as conn:
+        campaign, items, error = _validated_campaign_locked(conn, campaign_id)
+    if error is not None or campaign is None or items is None:
+        return _campaign_error(error or "campaign_manifest_changed")
+    return _safe_campaign(campaign, items)
+
+
+def _safe_one_campaign_item(row: dict[str, Any]) -> dict[str, Any]:
+    result = _safe_campaign_item(row)
+    result["ok"] = True
+    return result
+
+
+def transition_campaign(campaign_id: str, state: str) -> dict[str, Any]:
+    if type(state) is not str or state not in _CAMPAIGN_TRANSITIONS:
+        return _campaign_error("campaign_state_invalid")
+    init_db()
+    with _connect() as conn:
+        conn.execute("BEGIN IMMEDIATE")
+        campaign, items, error = _validated_campaign_locked(conn, campaign_id)
+        if error is not None or campaign is None or items is None:
+            return _campaign_error(error or "campaign_manifest_changed")
+        current = str(campaign["state"])
+        if state not in _CAMPAIGN_TRANSITIONS[current]:
+            return _campaign_error("campaign_transition_illegal")
+        if bool(campaign["killed"]):
+            return _campaign_error("campaign_killed")
+        now = utc_now()
+        conn.execute(
+            "UPDATE campaigns SET state=?, killed=?, updated_at=? WHERE campaign_id=?",
+            (state, int(state == "killed"), now, campaign_id),
+        )
+        _append_campaign_event(
+            conn,
+            campaign_id=campaign_id,
+            event_type="campaign_state_changed",
+            state=state,
+            created_at=now,
+        )
+        updated, updated_items, changed = _validated_campaign_locked(conn, campaign_id)
+    if changed is not None or updated is None or updated_items is None:
+        return _campaign_error(changed or "campaign_manifest_changed")
+    return _safe_campaign(updated, updated_items)
+
+
+def transition_campaign_item(
+    campaign_id: str, ordinal: int, state: str, *, fence: str = ""
+) -> dict[str, Any]:
+    if type(ordinal) is not int or ordinal not in {1, 2, 3}:
+        return _campaign_error("campaign_item_ordinal_invalid")
+    if type(state) is not str or state not in _CAMPAIGN_ITEM_TRANSITIONS:
+        return _campaign_error("campaign_item_state_invalid")
+    if state == "leased":
+        return _campaign_error("campaign_item_transition_illegal")
+    init_db()
+    with _connect() as conn:
+        conn.execute("BEGIN IMMEDIATE")
+        campaign, _, error = _validated_campaign_locked(conn, campaign_id)
+        if error is not None or campaign is None:
+            return _campaign_error(error or "campaign_manifest_changed")
+        if bool(campaign["killed"]):
+            return _campaign_error("campaign_killed")
+        row = conn.execute(
+            "SELECT * FROM campaign_items WHERE campaign_id=? AND ordinal=?",
+            (campaign_id, ordinal),
+        ).fetchone()
+        if row is None:
+            return _campaign_error("campaign_item_not_found")
+        item = dict(row)
+        current = str(item["state"])
+        if state not in _CAMPAIGN_ITEM_TRANSITIONS[current]:
+            return _campaign_error("campaign_item_transition_illegal")
+        if current == "staged" and state == "approved":
+            if bool(campaign["paused"]):
+                return _campaign_error("campaign_paused")
+            if campaign["state"] not in {"approved", "executing"}:
+                return _campaign_error("campaign_parent_not_executable")
+        now_dt = _mission_now()
+        if current == "leased":
+            if type(fence) is not str or not fence or not secrets.compare_digest(
+                str(item["lease_fence_hash"] or ""), hash_text(fence)
+            ):
+                return _campaign_error("campaign_item_fence_stale")
+            expiry = _strict_utc_timestamp(item["lease_expires_at"])
+            if expiry is None or expiry[1] <= now_dt:
+                return _campaign_error("campaign_item_lease_expired")
+        now = now_dt.isoformat()
+        conn.execute(
+            "UPDATE campaign_items SET state=?, updated_at=? WHERE campaign_item_id=?",
+            (state, now, item["campaign_item_id"]),
+        )
+        _append_campaign_event(
+            conn,
+            campaign_id=campaign_id,
+            campaign_item_id=item["campaign_item_id"],
+            event_type="campaign_item_state_changed",
+            ordinal=ordinal,
+            state=state,
+            created_at=now,
+        )
+        updated = conn.execute(
+            "SELECT * FROM campaign_items WHERE campaign_item_id=?",
+            (item["campaign_item_id"],),
+        ).fetchone()
+    return _safe_one_campaign_item(dict(updated))
+
+
+def acquire_campaign_item_lease(
+    campaign_id: str,
+    ordinal: int,
+    *,
+    fence: str,
+    lease_seconds: int = 300,
+) -> dict[str, Any]:
+    if type(ordinal) is not int or ordinal not in {1, 2, 3}:
+        return _campaign_error("campaign_item_ordinal_invalid")
+    if type(fence) is not str or not 8 <= len(fence) <= 256:
+        return _campaign_error("campaign_item_fence_invalid")
+    if (
+        type(lease_seconds) is not int
+        or not _CAMPAIGN_MIN_LEASE_SECONDS <= lease_seconds <= _CAMPAIGN_MAX_LEASE_SECONDS
+    ):
+        return _campaign_error("campaign_item_lease_invalid")
+    init_db()
+    with _connect() as conn:
+        conn.execute("BEGIN IMMEDIATE")
+        campaign, _, error = _validated_campaign_locked(conn, campaign_id)
+        if error is not None or campaign is None:
+            return _campaign_error(error or "campaign_manifest_changed")
+        if bool(campaign["killed"]):
+            return _campaign_error("campaign_killed")
+        if bool(campaign["paused"]):
+            return _campaign_error("campaign_paused")
+        if campaign["state"] not in {"approved", "executing"}:
+            return _campaign_error("campaign_parent_not_executable")
+        row = conn.execute(
+            "SELECT * FROM campaign_items WHERE campaign_id=? AND ordinal=?",
+            (campaign_id, ordinal),
+        ).fetchone()
+        if row is None:
+            return _campaign_error("campaign_item_not_found")
+        item = dict(row)
+        if item["state"] == "suppressed":
+            return _campaign_error("campaign_item_suppressed")
+        now_dt = _mission_now()
+        start = _strict_utc_timestamp(campaign["start_at"])
+        end = _strict_utc_timestamp(campaign["end_at"])
+        if (
+            start is None
+            or end is None
+            or not start[1] <= now_dt < end[1]
+        ):
+            return _campaign_error("campaign_window_not_open")
+        if item["state"] == "leased":
+            expiry = _strict_utc_timestamp(item["lease_expires_at"])
+            if expiry is None or expiry[1] <= now_dt:
+                return _campaign_error("campaign_item_lease_expired")
+            return _campaign_error("campaign_item_not_leasable")
+        if item["state"] != "approved":
+            return _campaign_error("campaign_item_not_leasable")
+        channel = conn.execute(
+            "SELECT * FROM contact_channels WHERE id=?", (item["channel_id"],)
+        ).fetchone()
+        if (
+            channel is None
+            or channel["contact_id"] != item["contact_id"]
+            or not bool(channel["is_active"])
+            or channel["validation_status"] != "validated"
+            or not bool(channel["allow_send"])
+            or channel["revoked_at"] is not None
+        ):
+            return _campaign_error("campaign_channel_ineligible")
+        now = now_dt.isoformat()
+        lease_expires_at = (now_dt + timedelta(seconds=lease_seconds)).isoformat()
+        conn.execute(
+            """
+            UPDATE campaign_items
+            SET state='leased', lease_fence_hash=?, lease_expires_at=?,
+                leased_at=?, updated_at=?
+            WHERE campaign_item_id=? AND state='approved'
+            """,
+            (
+                hash_text(fence),
+                lease_expires_at,
+                now,
+                now,
+                item["campaign_item_id"],
+            ),
+        )
+        _append_campaign_event(
+            conn,
+            campaign_id=campaign_id,
+            campaign_item_id=item["campaign_item_id"],
+            event_type="campaign_item_leased",
+            ordinal=ordinal,
+            state="leased",
+            created_at=now,
+        )
+        updated = conn.execute(
+            "SELECT * FROM campaign_items WHERE campaign_item_id=?",
+            (item["campaign_item_id"],),
+        ).fetchone()
+    return _safe_one_campaign_item(dict(updated))
+
+
+def suppress_campaign_item(
+    campaign_id: str, ordinal: int, *, reason: str
+) -> dict[str, Any]:
+    if type(ordinal) is not int or ordinal not in {1, 2, 3}:
+        return _campaign_error("campaign_item_ordinal_invalid")
+    if type(reason) is not str or reason not in _CAMPAIGN_SUPPRESSION_REASONS:
+        return _campaign_error("campaign_suppression_reason_invalid")
+    init_db()
+    with _connect() as conn:
+        conn.execute("BEGIN IMMEDIATE")
+        campaign, _, error = _validated_campaign_locked(conn, campaign_id)
+        if error is not None or campaign is None:
+            return _campaign_error(error or "campaign_manifest_changed")
+        if bool(campaign["killed"]):
+            return _campaign_error("campaign_killed")
+        row = conn.execute(
+            "SELECT * FROM campaign_items WHERE campaign_id=? AND ordinal=?",
+            (campaign_id, ordinal),
+        ).fetchone()
+        if row is None:
+            return _campaign_error("campaign_item_not_found")
+        item = dict(row)
+        if item["state"] == "suppressed":
+            return _safe_one_campaign_item(item)
+        if item["state"] not in {"staged", "approved", "leased"}:
+            return _campaign_error("campaign_item_transition_illegal")
+        now = utc_now()
+        conn.execute(
+            """
+            UPDATE campaign_items
+            SET state='suppressed', suppression_reason=?, lease_fence_hash=NULL,
+                lease_expires_at=NULL, updated_at=? WHERE campaign_item_id=?
+            """,
+            (reason, now, item["campaign_item_id"]),
+        )
+        _append_campaign_event(
+            conn,
+            campaign_id=campaign_id,
+            campaign_item_id=item["campaign_item_id"],
+            event_type="campaign_item_suppressed",
+            ordinal=ordinal,
+            state="suppressed",
+            reason=reason,
+            created_at=now,
+        )
+        updated = conn.execute(
+            "SELECT * FROM campaign_items WHERE campaign_item_id=?",
+            (item["campaign_item_id"],),
+        ).fetchone()
+    return _safe_one_campaign_item(dict(updated))
+
+
+def increment_campaign_item_followup(campaign_id: str, ordinal: int) -> dict[str, Any]:
+    if type(ordinal) is not int or ordinal not in {1, 2, 3}:
+        return _campaign_error("campaign_item_ordinal_invalid")
+    init_db()
+    with _connect() as conn:
+        conn.execute("BEGIN IMMEDIATE")
+        campaign, _, error = _validated_campaign_locked(conn, campaign_id)
+        if error is not None or campaign is None:
+            return _campaign_error(error or "campaign_manifest_changed")
+        if bool(campaign["killed"]) or bool(campaign["paused"]):
+            return _campaign_error("campaign_reservations_blocked")
+        row = conn.execute(
+            "SELECT * FROM campaign_items WHERE campaign_id=? AND ordinal=?",
+            (campaign_id, ordinal),
+        ).fetchone()
+        if row is None:
+            return _campaign_error("campaign_item_not_found")
+        item = dict(row)
+        if item["state"] not in {"approved", "leased", "sent"}:
+            return _campaign_error("campaign_followup_state_invalid")
+        if int(item["followup_count"]) >= min(int(campaign["max_followups"]), 3):
+            return _campaign_error("campaign_followup_limit_reached")
+        now = utc_now()
+        conn.execute(
+            "UPDATE campaign_items SET followup_count=followup_count+1, updated_at=? "
+            "WHERE campaign_item_id=?",
+            (now, item["campaign_item_id"]),
+        )
+        _append_campaign_event(
+            conn,
+            campaign_id=campaign_id,
+            campaign_item_id=item["campaign_item_id"],
+            event_type="campaign_followup_incremented",
+            ordinal=ordinal,
+            state=item["state"],
+            created_at=now,
+        )
+        updated = conn.execute(
+            "SELECT * FROM campaign_items WHERE campaign_item_id=?",
+            (item["campaign_item_id"],),
+        ).fetchone()
+    return _safe_one_campaign_item(dict(updated))
+
+
+def pause_campaign(campaign_id: str) -> dict[str, Any]:
+    init_db()
+    with _connect() as conn:
+        conn.execute("BEGIN IMMEDIATE")
+        campaign, items, error = _validated_campaign_locked(conn, campaign_id)
+        if error is not None or campaign is None or items is None:
+            return _campaign_error(error or "campaign_manifest_changed")
+        if bool(campaign["killed"]):
+            return _campaign_error("campaign_killed")
+        if not bool(campaign["paused"]):
+            now = utc_now()
+            next_state = (
+                campaign["state"]
+                if campaign["state"] in {"sent", "failed", "failed_unknown", "killed"}
+                else "blocked"
+            )
+            conn.execute(
+                "UPDATE campaigns SET paused=1, state=?, updated_at=? WHERE campaign_id=?",
+                (next_state, now, campaign_id),
+            )
+            _append_campaign_event(
+                conn,
+                campaign_id=campaign_id,
+                event_type="campaign_paused",
+                state=next_state,
+                reason="manual_required",
+                created_at=now,
+            )
+        updated, updated_items, changed = _validated_campaign_locked(conn, campaign_id)
+    if changed is not None or updated is None or updated_items is None:
+        return _campaign_error(changed or "campaign_manifest_changed")
+    return _safe_campaign(updated, updated_items)
+
+
+def kill_campaign(campaign_id: str) -> dict[str, Any]:
+    init_db()
+    with _connect() as conn:
+        conn.execute("BEGIN IMMEDIATE")
+        campaign, items, error = _validated_campaign_locked(conn, campaign_id)
+        if error is not None or campaign is None or items is None:
+            return _campaign_error(error or "campaign_manifest_changed")
+        if not bool(campaign["killed"]):
+            if "killed" not in _CAMPAIGN_TRANSITIONS[str(campaign["state"])]:
+                return _campaign_error("campaign_transition_illegal")
+            now = utc_now()
+            conn.execute(
+                "UPDATE campaigns SET paused=1, killed=1, state='killed', updated_at=? "
+                "WHERE campaign_id=?",
+                (now, campaign_id),
+            )
+            _append_campaign_event(
+                conn,
+                campaign_id=campaign_id,
+                event_type="campaign_killed",
+                state="killed",
+                created_at=now,
+            )
+        updated, updated_items, changed = _validated_campaign_locked(conn, campaign_id)
+    if changed is not None or updated is None or updated_items is None:
+        return _campaign_error(changed or "campaign_manifest_changed")
+    return _safe_campaign(updated, updated_items)
+
+
+def list_campaign_events(campaign_id: str) -> list[dict[str, Any]]:
+    init_db()
+    with _connect() as conn:
+        campaign, _, error = _validated_campaign_locked(conn, campaign_id)
+        if error is not None or campaign is None:
+            return []
+        rows = conn.execute(
+            """
+            SELECT event_id, event_type, ordinal, state, reason, created_at
+            FROM campaign_events WHERE campaign_id=? ORDER BY created_at, event_id
+            """,
+            (campaign_id,),
+        ).fetchall()
+    return [
+        {
+            "event_id": str(row["event_id"]),
+            "event_type": str(row["event_type"]),
+            "ordinal": row["ordinal"],
+            "state": row["state"],
+            "reason": row["reason"],
+            "created_at": str(row["created_at"]),
+        }
+        for row in rows
+    ]

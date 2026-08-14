@@ -41,6 +41,9 @@ def test_init_db_creates_required_tables_idempotently(tmp_path):
         "audit_log",
         "mission_envelopes",
         "autonomy_runs",
+        "campaigns",
+        "campaign_items",
+        "campaign_events",
     }.issubset(tables)
     assert get_db_path(tmp_path) == tmp_path / "wpp_ops.sqlite"
 
@@ -1728,3 +1731,609 @@ def test_atomic_autonomy_write_rechecks_lease_after_acquiring_write_lock(tmp_pat
     assert drafts == 0
     assert approvals == 0
     assert local_writes == 0
+
+
+def _make_exact_campaign(store, *, max_followups=2, campaign_ref="campaign_demo_01"):
+    now = datetime.now(timezone.utc)
+    items = []
+    for ordinal in range(1, 4):
+        contact_id = f"contact_campaign_{ordinal}"
+        store.upsert_contact(
+            contact_id=contact_id,
+            display_name=f"Lead {ordinal}",
+        )
+        channel = store.upsert_channel(
+            contact_id=contact_id,
+            address=f"+55119999000{ordinal}",
+            validation_status="validated",
+            is_primary=True,
+        )
+        store.authorize_channel(channel["channel_id"])
+        draft = store.create_draft(
+            targets=[{"type": "contact", "contact_id": contact_id}],
+            message=f"Mensagem comercial segura {campaign_ref} {ordinal}",
+        )
+        approval = store.create_approval(draft["draft_id"])
+        items.append(
+            {
+                "ordinal": ordinal,
+                "draft_id": draft["draft_id"],
+                "approval_id": approval["approval_id"],
+                "contact_id": contact_id,
+                "channel_id": channel["channel_id"],
+                "classification": ("cold", "warm", "reactivation")[ordinal - 1],
+                "segment": f"segment_{ordinal}",
+                "draft_hash": draft["idempotency_key"],
+                "message_hash": draft["message_hash"],
+            }
+        )
+    return {
+        "schema": "wpp-campaign-manifest/v1",
+        "campaign_ref": campaign_ref,
+        "project_ref": "project_campaign_01",
+        "start_at": (now + timedelta(minutes=5)).isoformat(),
+        "end_at": (now + timedelta(hours=1)).isoformat(),
+        "timezone": "America/Sao_Paulo",
+        "sales_pack_digest": "a" * 64,
+        "max_followups": max_followups,
+        "items": items,
+    }
+
+
+def test_campaign_manifest_registers_exact_three_idempotently_and_migrates(tmp_path):
+    import tools.whatsapp_ops_store as store
+
+    token = set_hermes_home_override(tmp_path)
+    try:
+        manifest = _make_exact_campaign(store)
+        first = store.register_campaign_manifest(manifest)
+        assert first["ok"] is True, first
+        duplicate = store.register_campaign_manifest(json.loads(json.dumps(manifest)))
+        inspected = store.get_campaign(first["campaign_id"])
+        with sqlite3.connect(store.get_db_path()) as conn:
+            tables = {
+                row[0]
+                for row in conn.execute("SELECT name FROM sqlite_master WHERE type='table'")
+            }
+            counts = {
+                table: conn.execute(f"SELECT COUNT(*) FROM {table}").fetchone()[0]
+                for table in ("campaigns", "campaign_items", "campaign_events")
+            }
+            stored_manifest = conn.execute(
+                "SELECT manifest_json FROM campaigns WHERE campaign_id=?",
+                (first["campaign_id"],),
+            ).fetchone()[0]
+    finally:
+        reset_hermes_home_override(token)
+
+    assert {"campaigns", "campaign_items", "campaign_events"}.issubset(tables)
+    assert first["ok"] is True
+    assert first["state"] == "queued"
+    assert first["item_count"] == 3
+    assert duplicate["campaign_id"] == first["campaign_id"]
+    assert duplicate["deduped"] is True
+    assert inspected["items"] == first["items"]
+    assert counts == {"campaigns": 1, "campaign_items": 3, "campaign_events": 1}
+    assert first["manifest_digest"] == store.hash_text(stored_manifest)
+    serialized = json.dumps(first, ensure_ascii=False)
+    for item in manifest["items"]:
+        assert item["draft_id"] not in serialized
+        assert item["approval_id"] not in serialized
+        assert item["contact_id"] not in serialized
+        assert item["channel_id"] not in serialized
+    assert "fence" not in serialized
+
+
+def test_campaign_ledger_migration_preserves_outer_transaction_and_is_idempotent():
+    from tools.whatsapp_ops_store import _migrate_campaign_ledger
+
+    conn = sqlite3.connect(":memory:")
+    try:
+        conn.execute("CREATE TABLE caller_state (value TEXT)")
+        conn.execute("INSERT INTO caller_state VALUES ('pending')")
+        assert conn.in_transaction is True
+
+        _migrate_campaign_ledger(conn)
+        _migrate_campaign_ledger(conn)
+
+        assert conn.in_transaction is True
+        assert conn.execute("SELECT value FROM caller_state").fetchone()[0] == "pending"
+        objects = {
+            row[0]
+            for row in conn.execute(
+                "SELECT name FROM sqlite_master "
+                "WHERE type IN ('table', 'index', 'trigger')"
+            )
+        }
+        assert {
+            "campaigns",
+            "campaign_items",
+            "campaign_events",
+            "ix_campaign_events_campaign_created",
+            "campaign_events_no_update",
+            "campaign_events_no_delete",
+        }.issubset(objects)
+
+        conn.rollback()
+        assert conn.in_transaction is False
+        assert conn.execute("SELECT COUNT(*) FROM caller_state").fetchone()[0] == 0
+    finally:
+        conn.close()
+
+
+@pytest.mark.parametrize("fail_at", [1, 3, 6])
+def test_campaign_ledger_migration_rolls_back_each_ddl_phase_and_reopens(
+    tmp_path, fail_at
+):
+    from tools.whatsapp_ops_store import _migrate_campaign_ledger
+
+    campaign_ddl_markers = (
+        "CREATE TABLE IF NOT EXISTS campaigns",
+        "CREATE TABLE IF NOT EXISTS campaign_items",
+        "CREATE TABLE IF NOT EXISTS campaign_events",
+        "CREATE INDEX IF NOT EXISTS ix_campaign_events_campaign_created",
+        "CREATE TRIGGER IF NOT EXISTS campaign_events_no_update",
+        "CREATE TRIGGER IF NOT EXISTS campaign_events_no_delete",
+    )
+    campaign_objects = {
+        "campaigns",
+        "campaign_items",
+        "campaign_events",
+        "ix_campaign_events_campaign_created",
+        "campaign_events_no_update",
+        "campaign_events_no_delete",
+    }
+
+    class FailingConnection(sqlite3.Connection):
+        def execute(self, sql, parameters=()):
+            if any(marker in sql for marker in campaign_ddl_markers):
+                count = getattr(self, "campaign_ddl_count", 0) + 1
+                self.campaign_ddl_count = count
+                if count == fail_at:
+                    raise sqlite3.OperationalError(f"synthetic campaign ddl failure {fail_at}")
+            return super().execute(sql, parameters)
+
+    db_path = tmp_path / "campaign_migration.sqlite"
+    failing = sqlite3.connect(db_path, factory=FailingConnection)
+    try:
+        with pytest.raises(
+            sqlite3.OperationalError,
+            match=f"synthetic campaign ddl failure {fail_at}",
+        ):
+            _migrate_campaign_ledger(failing)
+        objects_after_failure = {
+            row[0]
+            for row in failing.execute(
+                "SELECT name FROM sqlite_master "
+                "WHERE type IN ('table', 'index', 'trigger')"
+            )
+        }
+        assert not campaign_objects & objects_after_failure
+    finally:
+        failing.close()
+    with pytest.raises(sqlite3.ProgrammingError, match="closed"):
+        failing.execute("SELECT 1")
+
+    reopened = sqlite3.connect(db_path)
+    try:
+        _migrate_campaign_ledger(reopened)
+        objects_after_retry = {
+            row[0]
+            for row in reopened.execute(
+                "SELECT name FROM sqlite_master "
+                "WHERE type IN ('table', 'index', 'trigger')"
+            )
+        }
+        assert campaign_objects.issubset(objects_after_retry)
+    finally:
+        reopened.close()
+    with pytest.raises(sqlite3.ProgrammingError, match="closed"):
+        reopened.execute("SELECT 1")
+
+
+def test_campaign_ledger_migration_preserves_primary_error_when_cleanup_fails():
+    from tools.whatsapp_ops_store import _migrate_campaign_ledger
+
+    class CleanupFailingConnection(sqlite3.Connection):
+        def execute(self, sql, parameters=()):
+            if "CREATE TABLE IF NOT EXISTS campaign_events" in sql:
+                raise sqlite3.OperationalError("primary campaign ddl failure")
+            if sql.lstrip().startswith(("ROLLBACK TO", "RELEASE")):
+                raise sqlite3.OperationalError("secondary cleanup failure")
+            return super().execute(sql, parameters)
+
+    conn = sqlite3.connect(":memory:", factory=CleanupFailingConnection)
+    try:
+        with pytest.raises(
+            sqlite3.OperationalError, match="primary campaign ddl failure"
+        ):
+            _migrate_campaign_ledger(conn)
+    finally:
+        conn.close()
+    with pytest.raises(sqlite3.ProgrammingError, match="closed"):
+        conn.execute("SELECT 1")
+
+
+def test_campaign_manifest_strict_negatives_are_atomic(tmp_path):
+    import tools.whatsapp_ops_store as store
+
+    token = set_hermes_home_override(tmp_path)
+    try:
+        manifest = _make_exact_campaign(store)
+        with sqlite3.connect(store.get_db_path()) as conn:
+            before = {
+                table: conn.execute(f"SELECT COUNT(*) FROM {table}").fetchone()[0]
+                for table in ("drafts", "approvals", "outbox")
+            }
+
+        invalid = []
+        candidate = json.loads(json.dumps(manifest)); candidate["extra"] = True; invalid.append(candidate)
+        candidate = json.loads(json.dumps(manifest)); candidate["items"] = candidate["items"][:2]; invalid.append(candidate)
+        candidate = json.loads(json.dumps(manifest)); candidate["items"][0]["extra"] = "x"; invalid.append(candidate)
+        candidate = json.loads(json.dumps(manifest)); candidate["items"][1]["ordinal"] = 1; invalid.append(candidate)
+        candidate = json.loads(json.dumps(manifest)); candidate["items"][1]["channel_id"] = candidate["items"][0]["channel_id"]; invalid.append(candidate)
+        candidate = json.loads(json.dumps(manifest)); candidate["items"][1]["contact_id"] = candidate["items"][0]["contact_id"]; invalid.append(candidate)
+        candidate = json.loads(json.dumps(manifest)); candidate["items"][1]["draft_id"] = candidate["items"][0]["draft_id"]; invalid.append(candidate)
+        candidate = json.loads(json.dumps(manifest)); candidate["items"][1]["approval_id"] = candidate["items"][0]["approval_id"]; invalid.append(candidate)
+        candidate = json.loads(json.dumps(manifest)); candidate["items"][0]["contact_id"] = "+551199999999"; invalid.append(candidate)
+        candidate = json.loads(json.dumps(manifest)); candidate["items"][0]["contact_id"] = "551199999999@s.whatsapp.net"; invalid.append(candidate)
+        candidate = json.loads(json.dumps(manifest)); candidate["items"][0]["draft_id"] = "https://unsafe.invalid/draft"; invalid.append(candidate)
+        candidate = json.loads(json.dumps(manifest)); candidate["items"][0]["contact_id"] = "contact_token_secret"; invalid.append(candidate)
+        candidate = json.loads(json.dumps(manifest)); candidate["items"][0]["classification"] = "group"; invalid.append(candidate)
+        candidate = json.loads(json.dumps(manifest)); candidate["items"][0]["segment"] = "https://unsafe.invalid"; invalid.append(candidate)
+        candidate = json.loads(json.dumps(manifest)); candidate["items"][0]["segment"] = "x" * 65; invalid.append(candidate)
+        candidate = json.loads(json.dumps(manifest)); candidate["items"][0]["draft_hash"] = "bad"; invalid.append(candidate)
+        candidate = json.loads(json.dumps(manifest)); candidate["items"][0]["message_hash"] = "bad"; invalid.append(candidate)
+        candidate = json.loads(json.dumps(manifest)); candidate["start_at"] = candidate["end_at"]; invalid.append(candidate)
+        candidate = json.loads(json.dumps(manifest)); candidate["start_at"] = "2026-08-14T10:00:00-03:00"; invalid.append(candidate)
+        candidate = json.loads(json.dumps(manifest)); candidate["timezone"] = "Mars/Olympus"; invalid.append(candidate)
+        candidate = json.loads(json.dumps(manifest)); candidate["max_followups"] = 4; invalid.append(candidate)
+        candidate = json.loads(json.dumps(manifest)); candidate["max_followups"] = True; invalid.append(candidate)
+
+        for candidate in invalid:
+            rejected = store.register_campaign_manifest(candidate)
+            assert rejected["ok"] is False
+
+        group_draft = store.create_draft(
+            targets=[{"type": "group", "list_id": "group_unsafe_01"}],
+            message="Grupo não pode entrar em campanha",
+        )
+        group_approval = store.create_approval(group_draft["draft_id"])
+        group_manifest = json.loads(json.dumps(manifest))
+        group_manifest["items"][0].update(
+            {
+                "draft_id": group_draft["draft_id"],
+                "approval_id": group_approval["approval_id"],
+                "draft_hash": group_draft["idempotency_key"],
+                "message_hash": group_draft["message_hash"],
+            }
+        )
+        assert store.register_campaign_manifest(group_manifest)["ok"] is False
+
+        with sqlite3.connect(store.get_db_path()) as conn:
+            after = {
+                table: conn.execute(f"SELECT COUNT(*) FROM {table}").fetchone()[0]
+                for table in ("drafts", "approvals", "outbox")
+            }
+            campaign_counts = tuple(
+                conn.execute(f"SELECT COUNT(*) FROM {table}").fetchone()[0]
+                for table in ("campaigns", "campaign_items", "campaign_events")
+            )
+    finally:
+        reset_hermes_home_override(token)
+
+    assert after["drafts"] == before["drafts"] + 1
+    assert after["approvals"] == before["approvals"] + 1
+    assert after["outbox"] == before["outbox"]
+    assert campaign_counts == (0, 0, 0)
+
+
+def test_campaign_registration_revalidates_approval_signature_identity_and_conflict(tmp_path):
+    import tools.whatsapp_ops_store as store
+
+    token = set_hermes_home_override(tmp_path)
+    try:
+        manifest = _make_exact_campaign(store)
+        first = store.register_campaign_manifest(manifest)
+        changed = json.loads(json.dumps(manifest))
+        changed["sales_pack_digest"] = "b" * 64
+        conflict = store.register_campaign_manifest(changed)
+        reused_items = json.loads(json.dumps(manifest))
+        reused_items["campaign_ref"] = "campaign_demo_reuse_01"
+        reservation_conflict = store.register_campaign_manifest(reused_items)
+
+        second = _make_exact_campaign(store, campaign_ref="campaign_demo_02")
+        with sqlite3.connect(store.get_db_path()) as conn:
+            conn.execute(
+                "UPDATE approvals SET message_hash=? WHERE id=?",
+                ("f" * 64, second["items"][0]["approval_id"]),
+            )
+        signature_reject = store.register_campaign_manifest(second)
+
+        third = _make_exact_campaign(store, campaign_ref="campaign_demo_03")
+        store.revoke_channel(third["items"][0]["channel_id"])
+        identity_reject = store.register_campaign_manifest(third)
+        with sqlite3.connect(store.get_db_path()) as conn:
+            conn.execute(
+                "UPDATE approvals SET status='approved' WHERE id=?",
+                (manifest["items"][0]["approval_id"],),
+            )
+        duplicate_after_approval_change = store.register_campaign_manifest(manifest)
+        with sqlite3.connect(store.get_db_path()) as conn:
+            registered = conn.execute("SELECT COUNT(*) FROM campaigns").fetchone()[0]
+            duplicate_reject_counts = {
+                table: conn.execute(f"SELECT COUNT(*) FROM {table}").fetchone()[0]
+                for table in ("campaigns", "campaign_items", "campaign_events")
+            }
+    finally:
+        reset_hermes_home_override(token)
+
+    assert first["ok"] is True
+    assert conflict == {"ok": False, "error": "campaign_ref_conflict"}
+    assert reservation_conflict == {
+        "ok": False,
+        "error": "campaign_item_reservation_conflict",
+    }
+    assert signature_reject == {"ok": False, "error": "campaign_approval_changed"}
+    assert identity_reject == {"ok": False, "error": "campaign_channel_ineligible"}
+    assert duplicate_after_approval_change == {
+        "ok": False,
+        "error": "campaign_approval_changed",
+    }
+    assert registered == 1
+    assert duplicate_reject_counts == {
+        "campaigns": 1,
+        "campaign_items": 3,
+        "campaign_events": 1,
+    }
+
+
+@pytest.mark.parametrize(
+    ("parent_state", "paused", "killed", "expected_error"),
+    [
+        ("queued", 0, 0, "campaign_parent_not_executable"),
+        ("pending_approval", 0, 0, "campaign_parent_not_executable"),
+        ("partial", 0, 0, "campaign_parent_not_executable"),
+        ("blocked", 0, 0, "campaign_parent_not_executable"),
+        ("sent", 0, 0, "campaign_parent_not_executable"),
+        ("failed", 0, 0, "campaign_parent_not_executable"),
+        ("failed_unknown", 0, 0, "campaign_parent_not_executable"),
+        ("approved", 1, 0, "campaign_paused"),
+        ("killed", 1, 1, "campaign_killed"),
+    ],
+)
+def test_campaign_item_approval_and_lease_require_executable_parent(
+    tmp_path, parent_state, paused, killed, expected_error
+):
+    import tools.whatsapp_ops_store as store
+
+    token = set_hermes_home_override(tmp_path)
+    try:
+        campaign = store.register_campaign_manifest(_make_exact_campaign(store))
+        campaign_id = campaign["campaign_id"]
+        with sqlite3.connect(store.get_db_path()) as conn:
+            conn.execute(
+                "UPDATE campaigns SET state=?, paused=?, killed=? WHERE campaign_id=?",
+                (parent_state, paused, killed, campaign_id),
+            )
+        approval = store.transition_campaign_item(campaign_id, 1, "approved")
+        with sqlite3.connect(store.get_db_path()) as conn:
+            conn.execute(
+                "UPDATE campaign_items SET state='approved' "
+                "WHERE campaign_id=? AND ordinal=1",
+                (campaign_id,),
+            )
+        lease = store.acquire_campaign_item_lease(
+            campaign_id, 1, fence="parent_guard_fence_01", lease_seconds=60
+        )
+        with sqlite3.connect(store.get_db_path()) as conn:
+            event_count = conn.execute(
+                "SELECT COUNT(*) FROM campaign_events WHERE campaign_id=?",
+                (campaign_id,),
+            ).fetchone()[0]
+    finally:
+        reset_hermes_home_override(token)
+
+    assert approval == {"ok": False, "error": expected_error}
+    assert lease == {"ok": False, "error": expected_error}
+    assert event_count == 1
+
+
+def test_campaign_lease_requires_open_execution_window(tmp_path, monkeypatch):
+    import tools.whatsapp_ops_store as store
+
+    token = set_hermes_home_override(tmp_path)
+    try:
+        manifest = _make_exact_campaign(store)
+        campaign = store.register_campaign_manifest(manifest)
+        campaign_id = campaign["campaign_id"]
+        store.transition_campaign(campaign_id, "pending_approval")
+        store.transition_campaign(campaign_id, "approved")
+        approved = store.transition_campaign_item(campaign_id, 1, "approved")
+        before_window = store.acquire_campaign_item_lease(
+            campaign_id, 1, fence="window_guard_fence_01", lease_seconds=60
+        )
+
+        inside_window = datetime.fromisoformat(manifest["start_at"]) + timedelta(seconds=1)
+        monkeypatch.setattr(store, "_mission_now", lambda: inside_window)
+        leased = store.acquire_campaign_item_lease(
+            campaign_id, 1, fence="window_guard_fence_02", lease_seconds=60
+        )
+        store.transition_campaign_item(campaign_id, 2, "approved")
+        end_boundary = datetime.fromisoformat(manifest["end_at"])
+        monkeypatch.setattr(store, "_mission_now", lambda: end_boundary)
+        at_end = store.acquire_campaign_item_lease(
+            campaign_id, 2, fence="window_guard_fence_03", lease_seconds=60
+        )
+    finally:
+        reset_hermes_home_override(token)
+
+    assert approved["state"] == "approved"
+    assert before_window == {"ok": False, "error": "campaign_window_not_open"}
+    assert leased["state"] == "leased"
+    assert at_end == {"ok": False, "error": "campaign_window_not_open"}
+
+
+@pytest.mark.parametrize("terminal_state", ["sent", "failed"])
+def test_campaign_kill_respects_terminal_parent_fsm(tmp_path, terminal_state):
+    import tools.whatsapp_ops_store as store
+
+    token = set_hermes_home_override(tmp_path)
+    try:
+        campaign = store.register_campaign_manifest(_make_exact_campaign(store))
+        campaign_id = campaign["campaign_id"]
+        if terminal_state == "sent":
+            for state in ("pending_approval", "approved", "executing", "sent"):
+                assert store.transition_campaign(campaign_id, state)["ok"] is True
+        else:
+            assert store.transition_campaign(campaign_id, "failed")["ok"] is True
+        before_events = len(store.list_campaign_events(campaign_id))
+        killed = store.kill_campaign(campaign_id)
+        current = store.get_campaign(campaign_id)
+        after_events = len(store.list_campaign_events(campaign_id))
+    finally:
+        reset_hermes_home_override(token)
+
+    assert killed == {"ok": False, "error": "campaign_transition_illegal"}
+    assert current["state"] == terminal_state
+    assert current["killed"] is False
+    assert after_events == before_events
+
+
+def test_campaign_state_lease_fence_pause_kill_and_suppression(tmp_path):
+    import tools.whatsapp_ops_store as store
+
+    token = set_hermes_home_override(tmp_path)
+    try:
+        manifest = _make_exact_campaign(store, max_followups=2)
+        manifest["start_at"] = (
+            datetime.now(timezone.utc) - timedelta(minutes=1)
+        ).isoformat()
+        campaign = store.register_campaign_manifest(manifest)
+        campaign_id = campaign["campaign_id"]
+        illegal = store.transition_campaign(campaign_id, "sent")
+        store.transition_campaign(campaign_id, "pending_approval")
+        store.transition_campaign(campaign_id, "approved")
+        store.transition_campaign(campaign_id, "executing")
+
+        store.transition_campaign_item(campaign_id, 1, "approved")
+        leased = store.acquire_campaign_item_lease(
+            campaign_id, 1, fence="worker_fence_01", lease_seconds=60
+        )
+        concurrent = store.acquire_campaign_item_lease(
+            campaign_id, 1, fence="worker_fence_02", lease_seconds=60
+        )
+        stale = store.transition_campaign_item(
+            campaign_id, 1, "sent", fence="worker_fence_02"
+        )
+        sent = store.transition_campaign_item(
+            campaign_id, 1, "sent", fence="worker_fence_01"
+        )
+
+        suppressed = store.suppress_campaign_item(
+            campaign_id, 2, reason="inbound_after_approval"
+        )
+        suppressed_lease = store.acquire_campaign_item_lease(
+            campaign_id, 2, fence="worker_fence_03", lease_seconds=60
+        )
+        store.transition_campaign_item(campaign_id, 3, "approved")
+        lease_bypass = store.transition_campaign_item(campaign_id, 3, "leased")
+        followups = [store.increment_campaign_item_followup(campaign_id, 3) for _ in range(2)]
+        over_followups = store.increment_campaign_item_followup(campaign_id, 3)
+        paused = store.pause_campaign(campaign_id)
+        paused_lease = store.acquire_campaign_item_lease(
+            campaign_id, 3, fence="worker_fence_04", lease_seconds=60
+        )
+        killed = store.kill_campaign(campaign_id)
+        events = store.list_campaign_events(campaign_id)
+    finally:
+        reset_hermes_home_override(token)
+
+    assert illegal == {"ok": False, "error": "campaign_transition_illegal"}
+    assert leased["state"] == "leased"
+    assert "fence" not in json.dumps(leased)
+    assert concurrent == {"ok": False, "error": "campaign_item_not_leasable"}
+    assert stale == {"ok": False, "error": "campaign_item_fence_stale"}
+    assert sent["state"] == "sent"
+    assert suppressed["state"] == "suppressed"
+    assert suppressed_lease == {"ok": False, "error": "campaign_item_suppressed"}
+    assert lease_bypass == {"ok": False, "error": "campaign_item_transition_illegal"}
+    assert [result["followup_count"] for result in followups] == [1, 2]
+    assert over_followups == {"ok": False, "error": "campaign_followup_limit_reached"}
+    assert paused["paused"] is True
+    assert paused_lease == {"ok": False, "error": "campaign_paused"}
+    assert killed["state"] == "killed"
+    serialized = json.dumps(events, ensure_ascii=False)
+    assert "worker_fence" not in serialized
+    assert "Mensagem comercial" not in serialized
+    assert all(set(event) <= {"event_id", "event_type", "ordinal", "state", "reason", "created_at"} for event in events)
+
+
+def test_campaign_expired_lease_never_renews_and_manifest_tamper_fails_closed(tmp_path):
+    import tools.whatsapp_ops_store as store
+
+    token = set_hermes_home_override(tmp_path)
+    try:
+        manifest = _make_exact_campaign(store)
+        manifest["start_at"] = (
+            datetime.now(timezone.utc) - timedelta(minutes=1)
+        ).isoformat()
+        campaign = store.register_campaign_manifest(manifest)
+        campaign_id = campaign["campaign_id"]
+        store.transition_campaign(campaign_id, "pending_approval")
+        store.transition_campaign(campaign_id, "approved")
+        store.transition_campaign(campaign_id, "executing")
+        store.transition_campaign_item(campaign_id, 1, "approved")
+        store.acquire_campaign_item_lease(
+            campaign_id, 1, fence="expiring_fence_01", lease_seconds=60
+        )
+        expired = (datetime.now(timezone.utc) - timedelta(seconds=1)).isoformat()
+        with sqlite3.connect(store.get_db_path()) as conn:
+            conn.execute(
+                "UPDATE campaign_items SET lease_expires_at=? WHERE campaign_id=? AND ordinal=1",
+                (expired, campaign_id),
+            )
+        reacquire = store.acquire_campaign_item_lease(
+            campaign_id, 1, fence="replacement_fence_01", lease_seconds=60
+        )
+        finish = store.transition_campaign_item(
+            campaign_id, 1, "failed_unknown", fence="expiring_fence_01"
+        )
+        with sqlite3.connect(store.get_db_path()) as conn:
+            stored_hash = conn.execute(
+                "SELECT lease_fence_hash FROM campaign_items WHERE campaign_id=? AND ordinal=1",
+                (campaign_id,),
+            ).fetchone()[0]
+            conn.execute(
+                "UPDATE campaigns SET manifest_json='{}' WHERE campaign_id=?",
+                (campaign_id,),
+            )
+        tampered = store.get_campaign(campaign_id)
+    finally:
+        reset_hermes_home_override(token)
+
+    assert reacquire == {"ok": False, "error": "campaign_item_lease_expired"}
+    assert finish == {"ok": False, "error": "campaign_item_lease_expired"}
+    assert stored_hash == store.hash_text("expiring_fence_01")
+    assert tampered == {"ok": False, "error": "campaign_manifest_changed"}
+
+
+def test_campaign_events_are_sqlite_append_only(tmp_path):
+    import tools.whatsapp_ops_store as store
+
+    token = set_hermes_home_override(tmp_path)
+    try:
+        campaign = store.register_campaign_manifest(_make_exact_campaign(store))
+        with sqlite3.connect(store.get_db_path()) as conn:
+            with pytest.raises(sqlite3.IntegrityError, match="append-only"):
+                conn.execute(
+                    "UPDATE campaign_events SET state='failed' WHERE campaign_id=?",
+                    (campaign["campaign_id"],),
+                )
+            with pytest.raises(sqlite3.IntegrityError, match="append-only"):
+                conn.execute(
+                    "DELETE FROM campaign_events WHERE campaign_id=?",
+                    (campaign["campaign_id"],),
+                )
+    finally:
+        reset_hermes_home_override(token)
