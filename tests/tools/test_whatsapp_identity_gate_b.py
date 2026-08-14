@@ -199,6 +199,45 @@ def test_authorize_requires_active_validated_channel_and_is_explicit(tmp_path):
         reset_hermes_home_override(token)
 
 
+def test_revoked_channel_requires_explicit_audited_prepare_before_reauthorization(tmp_path):
+    from tools.whatsapp_ops_store import (
+        authorize_channel,
+        prepare_revoked_channel_for_reauthorization,
+        revoke_channel,
+        upsert_channel,
+        upsert_contact,
+    )
+
+    raw_ref = "12025550109@s.whatsapp.net"
+    token = set_hermes_home_override(tmp_path)
+    try:
+        upsert_contact(contact_id="contact_reauth", display_name="Reauth")
+        channel = upsert_channel(
+            contact_id="contact_reauth",
+            address=raw_ref,
+            is_primary=True,
+            validation_status="validated",
+        )
+        authorize_channel(channel["channel_id"])
+        revoke_channel(channel["channel_id"])
+        prepared = prepare_revoked_channel_for_reauthorization(channel["channel_id"])
+        with sqlite3.connect(tmp_path / "wpp_ops.sqlite") as conn:
+            audit_count = conn.execute(
+                "SELECT count(*) FROM audit_log WHERE event_type=? AND entity_id=?",
+                ("contact_channel_reactivation_prepared", channel["channel_id"]),
+            ).fetchone()[0]
+        authorized = authorize_channel(channel["channel_id"])
+    finally:
+        reset_hermes_home_override(token)
+
+    assert prepared["is_active"] is True
+    assert prepared["allow_send"] is False
+    assert prepared["revoked_at"] is None
+    assert prepared["authorized_at"] is None
+    assert audit_count == 1
+    assert authorized["allow_send"] is True
+
+
 def test_transport_resolution_requires_one_exact_sendable_channel(tmp_path):
     upsert_contact, upsert_channel, authorize, _, _, _, resolve_ref, _ = _store_api()
     ref_a = "12025550104@s.whatsapp.net"

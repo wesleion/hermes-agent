@@ -1596,6 +1596,62 @@ def revoke_channel(channel_id: str) -> dict[str, Any]:
     return _safe_contact_channel(dict(updated))
 
 
+def prepare_revoked_channel_for_reauthorization(channel_id: str) -> dict[str, Any]:
+    """Explicitly reopen one validated revoked channel without granting send.
+
+    Ordinary upserts still cannot reactivate revoked channels. This operator-only
+    recovery step is one-shot, audited, and must be followed by authorize_channel.
+    """
+    init_db()
+    now = utc_now()
+    channel_key = str(channel_id or "").strip()
+    with _connect() as conn:
+        row = conn.execute(
+            "SELECT * FROM contact_channels WHERE id=?", (channel_key,)
+        ).fetchone()
+        if row is None:
+            raise ValueError("contact channel does not exist")
+        if not row["revoked_at"] or bool(row["is_active"]) or bool(row["allow_send"]):
+            raise ValueError("contact channel is not safely revoked")
+        if str(row["validation_status"]) != "validated":
+            raise ValueError("contact channel must be validated")
+        if bool(row["is_primary"]):
+            conflict = conn.execute(
+                "SELECT 1 FROM contact_channels WHERE contact_id=? "
+                "AND channel_type='whatsapp' AND is_active=1 AND is_primary=1 AND id<>? LIMIT 1",
+                (str(row["contact_id"]), channel_key),
+            ).fetchone()
+            if conflict is not None:
+                raise ValueError("active primary contact channel conflict")
+        conn.execute(
+            "UPDATE contact_channels SET is_active=1, allow_send=0, authorized_at=NULL, "
+            "revoked_at=NULL, updated_at=? WHERE id=?",
+            (now, channel_key),
+        )
+        conn.execute(
+            """
+            INSERT INTO audit_log (
+                id, event_type, entity_type, entity_id, actor_ref_hash,
+                safe_summary, metadata_redacted_json, created_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                "audit_" + uuid.uuid4().hex[:12],
+                "contact_channel_reactivation_prepared",
+                "contact_channel",
+                channel_key,
+                None,
+                "validated revoked channel prepared for explicit reauthorization",
+                json.dumps({"send_granted": False}, sort_keys=True),
+                now,
+            ),
+        )
+        updated = conn.execute(
+            "SELECT * FROM contact_channels WHERE id=?", (channel_key,)
+        ).fetchone()
+    return _safe_contact_channel(dict(updated))
+
+
 def get_contact_channel(channel_id: str) -> dict[str, Any] | None:
     init_db()
     with _connect() as conn:
