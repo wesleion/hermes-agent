@@ -32,8 +32,10 @@ try:  # config loading is best-effort; tool remains fail-closed if unavailable
 except Exception:  # pragma: no cover - defensive for stripped runtimes
     load_config = None
 from tools.whatsapp_ops_store import (
+    complete_autonomy_run,
     consume_latest_raw_ref,
     create_approval,
+    create_autonomy_draft_approval,
     create_draft,
     draft_signature_matches,
     get_actionable_queue,
@@ -47,6 +49,7 @@ from tools.whatsapp_ops_store import (
     get_transport_group_ref,
     import_contact_list_local,
     ignore_staging_item,
+    inspect_mission_envelope,
     list_contact_segment_members,
     list_contact_segments,
     registration_staging_diagnostics,
@@ -66,6 +69,7 @@ from tools.whatsapp_ops_store import (
     register_contact_local,
     register_group_local,
     request_media_transcription,
+    reserve_autonomy_run,
     reserve_outbox_send,
     resolve_conversation_target,
     _payload_from_self,
@@ -1577,6 +1581,7 @@ def wpp_proactive_draft_queue(
     mode: str = "preview",
     execution_context: str = "operator",
     config: dict[str, Any] | None = None,
+    local_writer: Callable[..., dict[str, Any]] | None = None,
 ) -> str:
     """Preview or create local proactive commercial drafts + approval rows.
 
@@ -1710,14 +1715,30 @@ def wpp_proactive_draft_queue(
             continue
         try:
             assert target is not None
-            draft = create_draft(targets=[target], message=message, created_by="hunter_proactive_draft_queue")
-            drafts_created += 1
             approval: dict[str, Any] = {}
             status = "draft"
-            if create_approvals:
-                approval = create_approval(draft["draft_id"])
+            if local_writer is not None:
+                if not create_approvals:
+                    raise ValueError("autonomy_local_writer_requires_approval")
+                created = local_writer(target=target, message=message)
+                if not isinstance(created, dict):
+                    raise ValueError("autonomy_local_writer_invalid_result")
+                draft_value = created.get("draft")
+                approval_value = created.get("approval")
+                if not isinstance(draft_value, dict) or not isinstance(approval_value, dict):
+                    raise ValueError("autonomy_local_writer_invalid_result")
+                draft = draft_value
+                approval = approval_value
+                drafts_created += 1
                 approvals_created += 1
                 status = "pending_approval"
+            else:
+                draft = create_draft(targets=[target], message=message, created_by="hunter_proactive_draft_queue")
+                drafts_created += 1
+                if create_approvals:
+                    approval = create_approval(draft["draft_id"])
+                    approvals_created += 1
+                    status = "pending_approval"
             items.append({
                 **base_item,
                 "status": status,
@@ -1769,6 +1790,430 @@ def wpp_proactive_draft_queue(
         response["autonomy"] = autonomy_decision.as_dict()
     response["read_only"] = False if drafts_created or approvals_created else True
     return _json(response)
+
+
+_AUTONOMOUS_EXTERNAL_FLAGS: dict[str, bool] = {
+    "send_performed": False,
+    "crm_write_performed": False,
+    "provider_history_used": False,
+    "approval_resolved": False,
+    "telegram_notification_sent": False,
+    "cron_activation": False,
+}
+
+
+def _autonomous_error_payload(error: str) -> dict[str, Any]:
+    return {"ok": False, "error": str(error or "autonomous_run_refused"), **_AUTONOMOUS_EXTERNAL_FLAGS}
+
+
+def _autonomous_json_object(value: Any) -> dict[str, Any] | None:
+    if isinstance(value, dict):
+        return value
+    if not isinstance(value, str):
+        return None
+    try:
+        parsed = json.loads(value)
+    except (TypeError, json.JSONDecodeError):
+        return None
+    return parsed if isinstance(parsed, dict) else None
+
+
+def _autonomous_input_blocks(lead_inputs: list[dict[str, Any]]) -> dict[str, list[str]]:
+    blocked: dict[str, list[str]] = {}
+    for lead in lead_inputs:
+        lead_id = _safe_lead_id(
+            lead.get("lead_id") or lead.get("candidate_id") or lead.get("id") or lead.get("name")
+        )
+        reasons: list[str] = []
+        target = lead.get("target")
+        targets = lead.get("targets")
+        if isinstance(target, dict):
+            kind = str(target.get("type") or "contact").strip().lower()
+            if kind in {"group", "grupo", "list"}:
+                reasons.append("contact_only_v1")
+            if _safe_target_for_draft(target) is None:
+                reasons.append("unsafe_target")
+        elif target is not None:
+            reasons.append("unsafe_target")
+        if isinstance(targets, list) and targets:
+            for alternate_target in targets:
+                if not isinstance(alternate_target, dict):
+                    reasons.append("unsafe_target")
+                    continue
+                alternate_kind = str(alternate_target.get("type") or "contact").strip().lower()
+                if alternate_kind in {"group", "grupo", "list"}:
+                    reasons.append("contact_only_v1")
+                if _safe_target_for_draft(alternate_target) is None:
+                    reasons.append("unsafe_target")
+        elif targets is not None:
+            reasons.append("unsafe_target")
+        if bool(lead.get("manual_required")) or str(
+            lead.get("recommended_action") or ""
+        ).strip().lower() in {"manual_required", "ask_operator", "wait"}:
+            reasons.append("operator_review")
+        if bool(lead.get("awaiting_reply")) or str(
+            lead.get("last_direction") or ""
+        ).strip().lower() in {"outgoing", "sent", "from_me"}:
+            reasons.append("awaiting_reply")
+        reasons.extend(
+            _commercial_raw_risk_reasons(
+                lead.get("lead_id"),
+                lead.get("candidate_id"),
+                lead.get("id"),
+                lead.get("name"),
+                lead.get("status"),
+                lead.get("status_pipeline"),
+                lead.get("pipeline_status"),
+                lead.get("context"),
+                lead.get("message"),
+                lead.get("draft_message"),
+                lead.get("rationale"),
+                lead.get("reason"),
+                lead.get("objective"),
+                lead.get("source_context"),
+                target,
+                targets,
+            )
+        )
+        if reasons:
+            blocked[lead_id] = list(dict.fromkeys(reasons))
+    return blocked
+
+
+def _apply_autonomous_input_blocks(
+    opportunities: list[dict[str, Any]],
+    input_blocks: dict[str, list[str]],
+) -> list[dict[str, Any]]:
+    sanitized: list[dict[str, Any]] = []
+    for item in opportunities:
+        safe_item = dict(item)
+        lead_id = _safe_lead_id(item.get("lead_id") or item.get("candidate_id"))
+        reasons = input_blocks.get(lead_id, [])
+        if reasons:
+            safe_item["manual_required"] = True
+            safe_item["recommended_action"] = "manual_required"
+            safe_item["recommended_next_action"] = "manual_required"
+            safe_item["manual_reasons"] = list(
+                dict.fromkeys(list(safe_item.get("manual_reasons") or []) + reasons)
+            )
+            safe_item["missing_context"] = list(
+                dict.fromkeys(list(safe_item.get("missing_context") or []) + reasons)
+            )
+            safe_item["risk_flags"] = list(
+                dict.fromkeys(list(safe_item.get("risk_flags") or []) + reasons)
+            )
+            safe_item["requires_gate"] = ["operator_review"]
+        sanitized.append(safe_item)
+    return sanitized
+
+
+def _autonomous_stored_run_response(
+    run: dict[str, Any],
+    *,
+    deduped: bool,
+    error: str = "",
+    partial_ambiguous: bool = False,
+    extra: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    raw_counters = run.get("counters")
+    counters: dict[str, Any] = raw_counters if isinstance(raw_counters, dict) else {}
+    payload: dict[str, Any] = {
+        "ok": bool(run.get("ok")) and not error,
+        "tool": "wpp_autonomous_run",
+        "mode": "queue",
+        "status": str(run.get("status") or "refused"),
+        "deduped": bool(deduped),
+        "counters": {
+            "items": _safe_int_value(counters.get("items"), 0, 0, 50),
+            "local_writes": _safe_int_value(counters.get("local_writes"), 0, 0, 5),
+        },
+        "result_class": run.get("result_class"),
+        **_AUTONOMOUS_EXTERNAL_FLAGS,
+    }
+    if error:
+        payload["error"] = error
+    if partial_ambiguous:
+        payload["partial_ambiguous"] = True
+    if extra:
+        payload.update(extra)
+    return payload
+
+
+def _complete_autonomous_composer_run(
+    run_key: str,
+    fence: str,
+    *,
+    items: int,
+    local_writes: int,
+    result_class: str,
+    error: str = "",
+    partial_ambiguous: bool = False,
+    extra: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    completed = complete_autonomy_run(
+        run_key,
+        fence,
+        counters={"items": items, "local_writes": local_writes},
+        result_class=result_class,
+    )
+    if completed.get("ok") is not True:
+        payload = _autonomous_error_payload(str(completed.get("error") or "autonomy_run_completion_refused"))
+        payload.update(
+            {
+                "tool": "wpp_autonomous_run",
+                "mode": "queue",
+                "status": "refused",
+                "result_class": result_class,
+                "partial_ambiguous": bool(partial_ambiguous),
+            }
+        )
+        return payload
+    return _autonomous_stored_run_response(
+        completed,
+        deduped=False,
+        error=error,
+        partial_ambiguous=partial_ambiguous,
+        extra=extra,
+    )
+
+
+def wpp_autonomous_run(
+    mission_envelope_digest: str,
+    run_key: str,
+    lead_inputs: list[dict[str, Any]],
+    mode: str = "preview",
+    config: dict[str, Any] | None = None,
+) -> str:
+    """Compose deterministic scoring and bounded local draft approval queueing.
+
+    Preview validates one exact active mission envelope but creates no run or
+    business rows. Queue reserves one exact fenced run internally, never exposes
+    the fence, and refuses automatic lease renewal or ambiguous retry.
+    """
+
+    normalized_mode = str(mode or "preview").strip().lower()
+    if normalized_mode not in {"preview", "queue"}:
+        return _json(_autonomous_error_payload("autonomous_run_mode_invalid"))
+    if not isinstance(lead_inputs, list) or len(lead_inputs) > 50 or any(
+        not isinstance(item, dict) for item in lead_inputs
+    ):
+        return _json(_autonomous_error_payload("autonomous_run_lead_inputs_invalid"))
+
+    requires_local_write = normalized_mode == "queue"
+    envelope = inspect_mission_envelope(
+        mission_envelope_digest,
+        requires_local_write=requires_local_write,
+    )
+    if envelope.get("ok") is not True:
+        return _json(_autonomous_error_payload(str(envelope.get("error") or "mission_envelope_not_found")))
+
+    cfg = _runtime_config() if config is None else _deep_merge(_default_config(), config)
+    fence = ""
+    if requires_local_write:
+        reserved = reserve_autonomy_run(
+            mission_envelope_digest,
+            run_key,
+            requires_local_write=True,
+        )
+        if reserved.get("ok") is not True:
+            return _json(_autonomous_error_payload(str(reserved.get("error") or "autonomy_run_refused")))
+        raw_fence = reserved.get("fence")
+        if not isinstance(raw_fence, str) or not raw_fence:
+            if reserved.get("status") == "completed":
+                return _json(
+                    _autonomous_stored_run_response(reserved, deduped=True)
+                )
+            error = (
+                "autonomy_run_lease_expired"
+                if reserved.get("lease_expired")
+                else "autonomy_run_in_progress"
+            )
+            payload = _autonomous_stored_run_response(
+                reserved,
+                deduped=True,
+                error=error,
+            )
+            payload["status"] = "refused_expired" if reserved.get("lease_expired") else "in_progress"
+            return _json(payload)
+        fence = raw_fence
+
+    item_count = 0
+    try:
+        score_result = _autonomous_json_object(
+            wpp_opportunity_scores(
+                lead_inputs=lead_inputs,
+                limit=int(envelope["max_items"]),
+                execution_context="autonomous",
+                config=cfg,
+            )
+        )
+        if score_result is None or score_result.get("ok") is not True:
+            error = str((score_result or {}).get("error") or "autonomous_score_failed")
+            if not requires_local_write:
+                return _json(_autonomous_error_payload(error))
+            return _json(
+                _complete_autonomous_composer_run(
+                    run_key,
+                    fence,
+                    items=0,
+                    local_writes=0,
+                    result_class="policy_blocked" if error == "autonomy_denied" else "safe_failure",
+                    error=error,
+                )
+            )
+
+        raw_opportunities = score_result.get("opportunities")
+        opportunities = [dict(item) for item in raw_opportunities if isinstance(item, dict)] if isinstance(raw_opportunities, list) else []
+        opportunities = _apply_autonomous_input_blocks(
+            opportunities,
+            _autonomous_input_blocks(lead_inputs),
+        )
+        item_count = len(opportunities)
+        blocked_count = sum(1 for item in opportunities if bool(item.get("manual_required")))
+        actionable_count = item_count - blocked_count
+        preview_counters = {
+            "input_leads": len(lead_inputs),
+            "opportunities": item_count,
+            "actionable": actionable_count,
+            "blocked": blocked_count,
+            "local_writes": 0,
+        }
+
+        if not requires_local_write:
+            digest_payload = {
+                "schema": "wpp-autonomous-preview/v1",
+                "mission_envelope_digest": mission_envelope_digest,
+                "opportunities": opportunities,
+                "counters": preview_counters,
+            }
+            preview_digest = hash_text(
+                json.dumps(
+                    digest_payload,
+                    ensure_ascii=False,
+                    sort_keys=True,
+                    separators=(",", ":"),
+                    allow_nan=False,
+                )
+            )
+            return _json(
+                {
+                    "ok": True,
+                    "tool": "wpp_autonomous_run",
+                    "mode": "preview",
+                    "status": "previewed",
+                    "read_only": True,
+                    "opportunities": opportunities,
+                    "counters": preview_counters,
+                    "preview_digest": preview_digest,
+                    **_AUTONOMOUS_EXTERNAL_FLAGS,
+                }
+            )
+
+        envelope_recheck = inspect_mission_envelope(
+            mission_envelope_digest,
+            requires_local_write=True,
+        )
+        if envelope_recheck.get("ok") is not True:
+            return _json(
+                _complete_autonomous_composer_run(
+                    run_key,
+                    fence,
+                    items=item_count,
+                    local_writes=0,
+                    result_class="policy_blocked",
+                    error=str(envelope_recheck.get("error") or "mission_envelope_changed"),
+                )
+            )
+
+        score_cap = _safe_int_value(score_result.get("limit"), 1, 1, 50)
+        queue_cap = min(int(envelope["max_local_writes"]), score_cap, 5)
+
+        def atomic_local_writer(*, target: dict[str, Any], message: str) -> dict[str, Any]:
+            return create_autonomy_draft_approval(
+                mission_envelope_digest,
+                run_key,
+                fence,
+                target=target,
+                message=message,
+            )
+
+        queue_result = _autonomous_json_object(
+            wpp_proactive_draft_queue(
+                opportunities=opportunities,
+                mode="create",
+                limit=queue_cap,
+                max_items=queue_cap,
+                min_confidence=score_result.get("min_confidence", 0.75),
+                create_approvals=True,
+                execution_context="autonomous",
+                config=cfg,
+                local_writer=atomic_local_writer,
+            )
+        )
+        if queue_result is None:
+            return _json(
+                _complete_autonomous_composer_run(
+                    run_key,
+                    fence,
+                    items=item_count,
+                    local_writes=0,
+                    result_class="safe_failure",
+                    error="autonomous_queue_invalid_result",
+                    partial_ambiguous=True,
+                )
+            )
+
+        drafts_created = _safe_int_value(queue_result.get("drafts_created"), 0, 0, queue_cap)
+        approvals_created = _safe_int_value(queue_result.get("approvals_created"), 0, 0, queue_cap)
+        local_writes = max(drafts_created, approvals_created)
+        manual_required_count = _safe_int_value(
+            queue_result.get("manual_required_count"), 0, 0, item_count
+        )
+        queue_error = str(queue_result.get("error") or "")
+        if queue_result.get("ok") is not True:
+            result_class = "policy_blocked" if queue_error == "autonomy_denied" else "safe_failure"
+        elif approvals_created != drafts_created:
+            result_class = "safe_failure"
+            queue_error = "autonomous_queue_partial_ambiguous"
+        elif drafts_created:
+            result_class = "success"
+        elif manual_required_count or blocked_count:
+            result_class = "policy_blocked"
+        else:
+            result_class = "no_op"
+        queue_items = queue_result.get("items") if isinstance(queue_result.get("items"), list) else []
+        extra = {
+            "drafts_created": drafts_created,
+            "approvals_created": approvals_created,
+            "manual_required_count": manual_required_count,
+            "items": queue_items,
+        }
+        return _json(
+            _complete_autonomous_composer_run(
+                run_key,
+                fence,
+                items=item_count,
+                local_writes=local_writes,
+                result_class=result_class,
+                error=queue_error,
+                partial_ambiguous=result_class == "safe_failure",
+                extra=extra,
+            )
+        )
+    except Exception:
+        if not requires_local_write or not fence:
+            return _json(_autonomous_error_payload("autonomous_run_safe_failure"))
+        return _json(
+            _complete_autonomous_composer_run(
+                run_key,
+                fence,
+                items=item_count,
+                local_writes=0,
+                result_class="safe_failure",
+                error="autonomous_run_safe_failure",
+                partial_ambiguous=True,
+            )
+        )
 
 
 def wpp_provider_history_pull(
@@ -2617,6 +3062,39 @@ registry.register(
         create_approvals=bool(args.get("create_approvals", True)),
         objective=args.get("objective", ""),
         execution_context=args.get("execution_context", "operator"),
+    ),
+    check_fn=check_whatsapp_ops_requirements,
+    emoji="📲",
+)
+
+registry.register(
+    name="wpp_autonomous_run",
+    toolset=TOOLSET,
+    schema=_schema(
+        "wpp_autonomous_run",
+        "Compose one exact active mission envelope into a read-only opportunity preview or a bounded local-only draft plus approval queue. Never sends WhatsApp, writes CRM, uses provider history, resolves approval, calls Telegram, activates cron, exposes a run fence, or renews an expired run automatically.",
+        {
+            "mission_envelope_digest": {
+                "type": "string",
+                "pattern": "^[0-9a-f]{64}$",
+                "minLength": 64,
+                "maxLength": 64,
+            },
+            "run_key": {"type": "string", "minLength": 1, "maxLength": 120},
+            "lead_inputs": {
+                "type": "array",
+                "items": {"type": "object"},
+                "maxItems": 50,
+            },
+            "mode": {"type": "string", "enum": ["preview", "queue"]},
+        },
+        ["mission_envelope_digest", "run_key", "lead_inputs"],
+    ),
+    handler=lambda args, **kw: wpp_autonomous_run(
+        mission_envelope_digest=args.get("mission_envelope_digest", ""),
+        run_key=args.get("run_key", ""),
+        lead_inputs=args.get("lead_inputs", []),
+        mode=args.get("mode", "preview"),
     ),
     check_fn=check_whatsapp_ops_requirements,
     emoji="📲",

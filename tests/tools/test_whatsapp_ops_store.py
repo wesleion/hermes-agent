@@ -1530,3 +1530,132 @@ def test_mission_envelope_kill_expiry_changed_digest_and_lease_fail_closed(tmp_p
     assert renewed["renewed"] is True
     assert renewed["fence"] != leased["fence"]
     assert old_fence == {"ok": False, "error": "autonomy_run_fence_stale"}
+
+
+def test_inspect_mission_envelope_is_exact_sanitized_and_read_only(tmp_path):
+    from tools.whatsapp_ops_store import (
+        get_db_path,
+        inspect_mission_envelope,
+        register_mission_envelope,
+    )
+
+    token = set_hermes_home_override(tmp_path)
+    try:
+        envelope = register_mission_envelope(
+            project_ref="project_inspect_01",
+            sales_pack_digest="9" * 64,
+            mode="safe_auto",
+            max_items=4,
+            max_local_writes=2,
+            window_ref="window_inspect_01",
+            expires_at=(datetime.now(timezone.utc) + timedelta(hours=1)).isoformat(),
+        )
+        db = get_db_path()
+        with sqlite3.connect(db) as conn:
+            before = {
+                table: conn.execute(f"SELECT COUNT(*) FROM {table}").fetchone()[0]
+                for table in ("mission_envelopes", "autonomy_runs", "drafts", "approvals", "outbox", "contacts")
+            }
+        inspected = inspect_mission_envelope(envelope["envelope_digest"])
+        with sqlite3.connect(db) as conn:
+            after = {
+                table: conn.execute(f"SELECT COUNT(*) FROM {table}").fetchone()[0]
+                for table in ("mission_envelopes", "autonomy_runs", "drafts", "approvals", "outbox", "contacts")
+            }
+    finally:
+        reset_hermes_home_override(token)
+
+    assert inspected == envelope
+    assert before == after
+    assert set(inspected) == {
+        "ok",
+        "envelope_digest",
+        "project_ref",
+        "sales_pack_digest",
+        "mode",
+        "max_items",
+        "max_local_writes",
+        "window_ref",
+        "expires_at",
+        "active",
+        "killed",
+    }
+
+
+def test_atomic_autonomy_write_rechecks_lease_after_acquiring_write_lock(tmp_path, monkeypatch):
+    import tools.whatsapp_ops_store as store
+
+    token = set_hermes_home_override(tmp_path)
+    try:
+        base = datetime.now(timezone.utc)
+        envelope = store.register_mission_envelope(
+            project_ref="project_atomic_lease_01",
+            sales_pack_digest="7" * 64,
+            mode="safe_auto",
+            max_items=1,
+            max_local_writes=1,
+            window_ref="window_atomic_lease_01",
+            expires_at=(base + timedelta(hours=1)).isoformat(),
+        )
+        run = store.reserve_autonomy_run(
+            envelope["envelope_digest"],
+            "run_atomic_lease_01",
+            requires_local_write=True,
+        )
+        with sqlite3.connect(store.get_db_path()) as conn:
+            conn.execute(
+                "UPDATE autonomy_runs SET lease_expires_at=? WHERE run_key=?",
+                ((base + timedelta(seconds=1)).isoformat(), "run_atomic_lease_01"),
+            )
+
+        original_connect = store._connect
+        fake_now = {"value": base}
+
+        class LockAdvancingConnection:
+            def __init__(self, conn):
+                self.conn = conn
+
+            def __enter__(self):
+                self.conn.__enter__()
+                return self
+
+            def __exit__(self, *args):
+                return self.conn.__exit__(*args)
+
+            def execute(self, sql, parameters=()):
+                if str(sql).strip().upper() == "BEGIN IMMEDIATE":
+                    fake_now["value"] = base + timedelta(seconds=2)
+                return self.conn.execute(sql, parameters)
+
+            def __getattr__(self, name):
+                return getattr(self.conn, name)
+
+        monkeypatch.setattr(store, "utc_now", lambda: fake_now["value"].isoformat())
+        monkeypatch.setattr(
+            store,
+            "_connect",
+            lambda: LockAdvancingConnection(original_connect()),
+        )
+
+        with pytest.raises(ValueError, match="autonomy_run_lease_expired"):
+            store.create_autonomy_draft_approval(
+                envelope["envelope_digest"],
+                "run_atomic_lease_01",
+                run["fence"],
+                target={"type": "contact", "contact_id": "lead_atomic_01"},
+                message="Oi! Podemos alinhar o próximo passo deste projeto?",
+            )
+
+        with sqlite3.connect(store.get_db_path()) as conn:
+            drafts = conn.execute("SELECT COUNT(*) FROM drafts").fetchone()[0]
+            approvals = conn.execute("SELECT COUNT(*) FROM approvals").fetchone()[0]
+            local_writes = conn.execute(
+                "SELECT local_write_count FROM autonomy_runs WHERE run_key=?",
+                ("run_atomic_lease_01",),
+            ).fetchone()[0]
+    finally:
+        reset_hermes_home_override(token)
+
+    assert drafts == 0
+    assert approvals == 0
+    assert local_writes == 0

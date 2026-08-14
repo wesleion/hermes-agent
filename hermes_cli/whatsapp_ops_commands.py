@@ -284,6 +284,7 @@ def render_mission_command(
     *,
     summary_loader: Callable[..., str] | None = None,
     target_resolver: Callable[..., dict[str, Any]] | None = None,
+    radar_loader: Callable[..., str] | None = None,
 ) -> str:
     """Render the read-only Hunter commercial mission cockpit."""
     tokens = [part.strip() for part in str(arg or "").split() if part.strip()]
@@ -389,6 +390,43 @@ def render_mission_command(
         ])
         return "\n".join(_safe_text(line, max_len=700) for line in lines)
 
+    if action == "radar" and radar_loader is not None:
+        try:
+            raw_radar = radar_loader()
+            radar = json.loads(raw_radar) if isinstance(raw_radar, str) else raw_radar
+        except Exception:
+            radar = None
+        if not isinstance(radar, dict) or radar.get("ok") is not True:
+            lines = [
+                "🎯 Missão Hunter — radar comercial",
+                "Estado: radar local indisponível; nenhuma ação foi executada.",
+                "Oportunidades: 0 · bloqueadas: 0 · ações seguras: 0.",
+                "Garantias: send_performed=false · crm_write=false · provider_history_used=false · approval_resolved=false · telegram_notification_sent=false · cron_activation=false.",
+            ]
+            return "\n".join(_safe_text(line, max_len=700) for line in lines)
+
+        raw_counts = radar.get("counters")
+        counts: dict[str, Any] = raw_counts if isinstance(raw_counts, dict) else {}
+
+        def safe_count(key: str) -> int:
+            try:
+                value = int(counts.get(key, 0))
+            except (TypeError, ValueError, OverflowError):
+                value = 0
+            return max(0, min(value, 9999))
+
+        opportunities = safe_count("opportunities")
+        blocked = safe_count("blocked")
+        actionable = safe_count("actionable")
+        lines = [
+            "🎯 Missão Hunter — radar comercial",
+            "Estado: preview local sanitizado, somente leitura.",
+            f"Oportunidades: {opportunities} · bloqueadas: {blocked} · ações seguras: {actionable}.",
+            "Nenhum alvo, telefone, URL, conteúdo bruto ou identificador interno é exibido neste painel.",
+            "Garantias: send_performed=false · crm_write=false · provider_history_used=false · approval_resolved=false · telegram_notification_sent=false · cron_activation=false.",
+        ]
+        return "\n".join(_safe_text(line, max_len=700) for line in lines)
+
     if action in {"attack", "atacar", "reativar", "radar"}:
         objective_raw = rest or ("radar comercial hoje" if action == "radar" else "base fria")
         objective = _safe_text(objective_raw, max_len=120) or "base fria"
@@ -418,7 +456,12 @@ def render_mission_command(
         return "\n".join(_safe_text(line, max_len=700) for line in lines)
 
     # Friendly default: treat unknown non-empty text as a review target.
-    return render_mission_command(f"revisar {arg}", summary_loader=summary_loader, target_resolver=target_resolver)
+    return render_mission_command(
+        f"revisar {arg}",
+        summary_loader=summary_loader,
+        target_resolver=target_resolver,
+        radar_loader=radar_loader,
+    )
 
 
 def render_thread_context_command(

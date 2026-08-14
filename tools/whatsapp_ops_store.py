@@ -5199,6 +5199,178 @@ def _validated_mission_envelope(
     return stored, None
 
 
+def inspect_mission_envelope(
+    envelope_digest: str,
+    *,
+    requires_local_write: bool = False,
+) -> dict[str, Any]:
+    """Inspect one exact active envelope without creating ledger/business rows.
+
+    The returned shape is the same sanitized immutable/control snapshot used by
+    registration.  Payload JSON, timestamps, fences, and internal row state are
+    never exposed.  Validation covers digest integrity, immutable-field tamper,
+    current active/kill controls, expiry, and the optional local-write gate.
+    """
+
+    if type(envelope_digest) is not str or not _MISSION_DIGEST_RE.fullmatch(
+        envelope_digest
+    ):
+        return _mission_error("mission_envelope_digest_invalid")
+    if type(requires_local_write) is not bool:
+        return _mission_error("mission_envelope_local_write_flag_invalid")
+    init_db()
+    with _connect() as conn:
+        envelope, error = _validated_mission_envelope(
+            conn,
+            envelope_digest,
+            requires_local_write=requires_local_write,
+        )
+    if error is not None or envelope is None:
+        return _mission_error(error or "mission_envelope_changed")
+    return _safe_mission_envelope(envelope)
+
+
+def _autonomy_draft_content_safe(message: Any) -> bool:
+    if type(message) is not str or not message.strip() or len(message) > 600:
+        return False
+    checks = (
+        r"(?i)https?://",
+        r"(?i)@(?:g\.us|lid|s\.whatsapp\.net|c\.us|whatsapp\.net)\b",
+        r"(?i)\b(?:api[_-]?key|secret|token|authorization|bearer)\s*[=:]",
+        r"(?<![\w-])\+?\d[\d\s().-]{7,}\d(?![\w-])",
+    )
+    return not any(re.search(pattern, message) for pattern in checks)
+
+
+def create_autonomy_draft_approval(
+    envelope_digest: str,
+    run_key: str,
+    fence: str,
+    *,
+    target: dict[str, Any],
+    message: str,
+) -> dict[str, Any]:
+    """Atomically validate the exact leased mission and queue one local item.
+
+    The envelope/run validation, draft insert, approval insert, and bounded
+    progress counter share one ``BEGIN IMMEDIATE`` transaction.  A concurrent
+    kill therefore happens either before validation (zero writes) or after the
+    complete local item commits; partial draft-without-approval state is never
+    created by this path.
+    """
+
+    if type(envelope_digest) is not str or not _MISSION_DIGEST_RE.fullmatch(
+        envelope_digest
+    ):
+        raise ValueError("mission_envelope_digest_invalid")
+    if not is_opaque_ref(run_key) or type(fence) is not str or not fence:
+        raise ValueError("autonomy_run_fence_stale")
+    if (
+        type(target) is not dict
+        or set(target) != {"type", "contact_id"}
+        or target.get("type") != "contact"
+        or not is_opaque_ref(target.get("contact_id"))
+        or not _autonomy_draft_content_safe(message)
+    ):
+        raise ValueError("autonomy_local_write_payload_invalid")
+
+    init_db()
+    targets = [dict(target)]
+    targets_json = json.dumps(targets, ensure_ascii=False, sort_keys=True)
+    message_hash = hash_text(message)
+    idempotency_key = hash_text(targets_json + "\n" + message + "\n\n")
+    draft_id = "draft_" + uuid.uuid4().hex[:12]
+    approval_id = "approval_" + uuid.uuid4().hex[:12]
+    approval_token_hash = hash_text(secrets.token_urlsafe(32))
+    approval_expires_at = ""
+
+    with _connect() as conn:
+        conn.execute("BEGIN IMMEDIATE")
+        now_dt = _mission_now()
+        now = now_dt.isoformat()
+        approval_expires_at = (now_dt + timedelta(minutes=60)).isoformat()
+        envelope, error = _validated_mission_envelope(
+            conn,
+            envelope_digest,
+            requires_local_write=True,
+        )
+        if error is not None or envelope is None:
+            raise ValueError(error or "mission_envelope_changed")
+        row = conn.execute(
+            "SELECT * FROM autonomy_runs WHERE run_key=?",
+            (run_key,),
+        ).fetchone()
+        if row is None:
+            raise ValueError("autonomy_run_not_found")
+        run = dict(row)
+        if run["envelope_digest"] != envelope_digest or run["status"] != "started":
+            raise ValueError("autonomy_run_state_changed")
+        if not secrets.compare_digest(str(run["fence_hash"]), hash_text(fence)):
+            raise ValueError("autonomy_run_fence_stale")
+        lease = _strict_utc_timestamp(run["lease_expires_at"])
+        if lease is None or lease[1] <= now_dt:
+            raise ValueError("autonomy_run_lease_expired")
+        local_write_count = int(run["local_write_count"])
+        if local_write_count >= min(int(envelope["max_local_writes"]), _MISSION_MAX_LOCAL_WRITES):
+            raise ValueError("autonomy_run_caps_exceeded")
+
+        conn.execute(
+            """
+            INSERT INTO drafts (
+                id, targets_json, message, message_hash, media_json, send_at,
+                status, idempotency_key, created_by, created_at, updated_at
+            ) VALUES (?, ?, ?, ?, NULL, NULL, 'pending_approval', ?, ?, ?, ?)
+            """,
+            (
+                draft_id,
+                targets_json,
+                message,
+                message_hash,
+                idempotency_key,
+                "hunter_autonomous:" + str(run["run_id"]),
+                now,
+                now,
+            ),
+        )
+        conn.execute(
+            """
+            INSERT INTO approvals (
+                id, draft_id, approval_token_hash, approver_ref_hash,
+                message_hash, draft_idempotency_key, status, expires_at,
+                created_at, resolved_at
+            ) VALUES (?, ?, ?, NULL, ?, ?, 'pending', ?, ?, NULL)
+            """,
+            (
+                approval_id,
+                draft_id,
+                approval_token_hash,
+                message_hash,
+                idempotency_key,
+                approval_expires_at,
+                now,
+            ),
+        )
+        conn.execute(
+            "UPDATE autonomy_runs SET local_write_count=local_write_count+1, "
+            "updated_at=? WHERE run_key=? AND status='started' AND fence_hash=?",
+            (now, run_key, hash_text(fence)),
+        )
+
+    return {
+        "draft": {
+            "draft_id": draft_id,
+            "status": "pending_approval",
+            "message_hash": message_hash,
+            "idempotency_key": idempotency_key,
+        },
+        "approval": {
+            "approval_id": approval_id,
+            "status": "pending",
+            "expires_at": approval_expires_at,
+        },
+    }
+
+
 def kill_mission_envelope(envelope_digest: str) -> dict[str, Any]:
     """Idempotently stop one exact mission envelope without rewriting its digest."""
 
@@ -5408,7 +5580,9 @@ def complete_autonomy_run(
         if lease is None or lease[1] <= now_dt:
             return _mission_error("autonomy_run_lease_expired")
         if (
-            safe_counters["items"] > int(envelope["max_items"])
+            safe_counters["local_writes"] > safe_counters["items"]
+            or safe_counters["local_writes"] < int(run["local_write_count"])
+            or safe_counters["items"] > int(envelope["max_items"])
             or safe_counters["local_writes"]
             > int(envelope["max_local_writes"])
         ):

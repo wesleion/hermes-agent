@@ -133,6 +133,45 @@ def test_render_mission_command_atacar_base_fria_is_blocked_plan_not_action():
     assert "provider_history_used=false" in rendered
 
 
+def test_render_mission_command_radar_loader_shows_only_sanitized_counts():
+    def fake_radar_loader():
+        return json.dumps(
+            {
+                "ok": True,
+                "status": "previewed",
+                "counters": {"opportunities": 7, "blocked": 3, "actionable": 4},
+                "opportunities": [
+                    {
+                        "lead_id": "RAW-LEAD-SECRET",
+                        "target": {"contact_id": "5511999999999@s.whatsapp.net"},
+                    }
+                ],
+            }
+        )
+
+    rendered = render_mission_command("radar comercial hoje", radar_loader=fake_radar_loader)
+
+    assert "Missão Hunter — radar comercial" in rendered
+    assert "Oportunidades: 7" in rendered
+    assert "bloqueadas: 3" in rendered
+    assert "ações seguras: 4" in rendered
+    assert "send_performed=false" in rendered
+    assert "crm_write=false" in rendered
+    assert "cron_activation=false" in rendered
+    assert "RAW-LEAD-SECRET" not in rendered
+    assert "5511999999999" not in rendered
+    assert "@s.whatsapp.net" not in rendered
+
+
+def test_render_mission_command_radar_without_loader_preserves_blocked_read_only_output():
+    rendered = render_mission_command("radar comercial hoje")
+
+    assert "Missão Hunter — ataque comercial gateado" in rendered
+    assert "não executada" in rendered
+    assert "cron/radar activation" in rendered
+    assert "whatsapp_send=false" in rendered
+
+
 def test_render_thread_context_command_redacts_transport_refs_and_media_blobs():
     def fake_loader(**kwargs):
         assert kwargs["mode"] == "operator"
