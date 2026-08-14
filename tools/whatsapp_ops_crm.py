@@ -365,6 +365,10 @@ def append_google_sheets_row(payload: dict[str, Any], config: dict[str, Any]) ->
         return {"ok": False, "reason": "crm_credentials_invalid_json"}
     if not isinstance(credentials_info, dict):
         return {"ok": False, "reason": "crm_credentials_invalid_shape"}
+    private_key = str(credentials_info.get("private_key") or "")
+    if "\\n" in private_key:
+        credentials_info = dict(credentials_info)
+        credentials_info["private_key"] = private_key.replace("\\n", "\n")
 
     try:
         credentials_class, build, authorized_http_class, http_class = _google_dependencies()

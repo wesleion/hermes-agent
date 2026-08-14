@@ -290,7 +290,11 @@ def test_default_google_client_uses_append_raw_insert_rows_and_exact_scope(tmp_p
     import tools.whatsapp_ops_crm as crm
 
     config = _config()["crm"]
-    info = {"type": "service_account", "private_key": "secret-key", "client_email": "svc@example.invalid"}
+    info = {
+        "type": "service_account",
+        "private_key": "secret-key\\nsecond-line",
+        "client_email": "svc@example.invalid",
+    }
     monkeypatch.setenv("GOOGLE_SERVICE_ACCOUNT_JSON", json.dumps(info))
     calls = {}
     row = ["INT-0123456789ab", "L-001", "C-001", "WhatsApp", "2026-08-14", "Resumo", "Próximo passo"]
@@ -366,8 +370,10 @@ def test_default_google_client_uses_append_raw_insert_rows_and_exact_scope(tmp_p
         reset_hermes_home_override(token)
 
     assert result["ok"] is True
+    normalized_info = dict(info)
+    normalized_info["private_key"] = "secret-key\nsecond-line"
     assert calls["credentials"] == (
-        info,
+        normalized_info,
         ["https://www.googleapis.com/auth/spreadsheets"],
     )
     assert calls["http_timeout"] == 10
