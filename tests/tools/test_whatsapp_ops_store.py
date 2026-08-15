@@ -1861,6 +1861,106 @@ def test_campaign_ledger_migration_preserves_outer_transaction_and_is_idempotent
         conn.close()
 
 
+def test_campaign_ledger_migrates_old_classification_check_without_data_loss():
+    from tools.whatsapp_ops_store import _migrate_campaign_ledger
+
+    conn = sqlite3.connect(":memory:")
+    try:
+        conn.executescript(
+            """
+            PRAGMA foreign_keys=ON;
+            CREATE TABLE campaigns (campaign_id TEXT PRIMARY KEY);
+            CREATE TABLE drafts (id TEXT PRIMARY KEY);
+            CREATE TABLE approvals (id TEXT PRIMARY KEY);
+            CREATE TABLE contacts (id TEXT PRIMARY KEY);
+            CREATE TABLE contact_channels (id TEXT PRIMARY KEY);
+            CREATE TABLE whatsapp_ops_schema_migrations (
+                id TEXT PRIMARY KEY,
+                applied_at TEXT NOT NULL
+            );
+            INSERT INTO campaigns VALUES ('campaign_old');
+            INSERT INTO drafts VALUES ('draft_old');
+            INSERT INTO approvals VALUES ('approval_old');
+            INSERT INTO contacts VALUES ('contact_old');
+            INSERT INTO contact_channels VALUES ('channel_old');
+            CREATE TABLE campaign_items (
+                campaign_item_id TEXT PRIMARY KEY,
+                campaign_id TEXT NOT NULL REFERENCES campaigns(campaign_id),
+                ordinal INTEGER NOT NULL CHECK(ordinal BETWEEN 1 AND 3),
+                draft_id TEXT NOT NULL UNIQUE REFERENCES drafts(id),
+                approval_id TEXT NOT NULL UNIQUE REFERENCES approvals(id),
+                contact_id TEXT NOT NULL REFERENCES contacts(id),
+                channel_id TEXT NOT NULL REFERENCES contact_channels(id),
+                classification TEXT NOT NULL
+                    CHECK(classification IN ('cold', 'warm', 'reactivation')),
+                segment TEXT NOT NULL,
+                draft_hash TEXT NOT NULL,
+                message_hash TEXT NOT NULL,
+                state TEXT NOT NULL,
+                suppression_reason TEXT,
+                followup_count INTEGER NOT NULL DEFAULT 0,
+                lease_fence_hash TEXT,
+                lease_expires_at TEXT,
+                leased_at TEXT,
+                created_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL,
+                UNIQUE(campaign_id, ordinal),
+                UNIQUE(campaign_id, contact_id),
+                UNIQUE(campaign_id, channel_id)
+            );
+            CREATE TABLE campaign_events (
+                event_id TEXT PRIMARY KEY,
+                campaign_id TEXT NOT NULL REFERENCES campaigns(campaign_id),
+                campaign_item_id TEXT REFERENCES campaign_items(campaign_item_id),
+                event_type TEXT NOT NULL,
+                ordinal INTEGER,
+                state TEXT,
+                reason TEXT,
+                created_at TEXT NOT NULL
+            );
+            INSERT INTO campaign_items VALUES (
+                'item_old', 'campaign_old', 1, 'draft_old', 'approval_old',
+                'contact_old', 'channel_old', 'warm', 'segment_old',
+                'draft_hash_old', 'message_hash_old', 'staged', NULL, 0,
+                NULL, NULL, NULL, 'created_old', 'updated_old'
+            );
+            INSERT INTO campaign_events VALUES (
+                'event_old', 'campaign_old', 'item_old', 'campaign_registered',
+                1, 'queued', NULL, 'created_old'
+            );
+            """
+        )
+
+        _migrate_campaign_ledger(conn)
+        _migrate_campaign_ledger(conn)
+
+        item_sql = conn.execute(
+            "SELECT sql FROM sqlite_master "
+            "WHERE type='table' AND name='campaign_items'"
+        ).fetchone()[0]
+        assert "'known'" in item_sql
+        assert conn.execute("SELECT COUNT(*) FROM campaign_items").fetchone()[0] == 1
+        assert conn.execute("SELECT COUNT(*) FROM campaign_events").fetchone()[0] == 1
+        assert conn.execute(
+            "SELECT classification FROM campaign_items "
+            "WHERE campaign_item_id='item_old'"
+        ).fetchone()[0] == "warm"
+        assert conn.execute(
+            "SELECT campaign_item_id FROM campaign_events WHERE event_id='event_old'"
+        ).fetchone()[0] == "item_old"
+        legacy_tables = conn.execute(
+            "SELECT COUNT(*) FROM sqlite_master "
+            "WHERE type='table' AND name LIKE '%legacy_classification%'"
+        ).fetchone()[0]
+        assert legacy_tables == 0
+        assert conn.execute(
+            "SELECT COUNT(*) FROM whatsapp_ops_schema_migrations "
+            "WHERE id='campaign_items_known_classification_v1'"
+        ).fetchone()[0] == 1
+    finally:
+        conn.close()
+
+
 @pytest.mark.parametrize("fail_at", [1, 3, 6])
 def test_campaign_ledger_migration_rolls_back_each_ddl_phase_and_reopens(
     tmp_path, fail_at

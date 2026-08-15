@@ -44,7 +44,11 @@ _AUTONOMY_MIN_LEASE_SECONDS = 30
 _AUTONOMY_MAX_LEASE_SECONDS = 3600
 _CAMPAIGN_SCHEMA = "wpp-campaign-manifest/v1"
 _CAMPAIGN_DIGEST_RE = re.compile(r"^[0-9a-f]{64}$")
+# The D1 ledger remains reusable for generic campaigns and therefore accepts
+# ``cold``. The Cash-Ready bridge is intentionally narrower and rejects cold
+# before registration, allowing only known/warm/reactivation.
 _CAMPAIGN_CLASSIFICATIONS = frozenset({"cold", "known", "warm", "reactivation"})
+_CAMPAIGN_KNOWN_CLASSIFICATION_MIGRATION = "campaign_items_known_classification_v1"
 _CAMPAIGN_SUPPRESSION_REASONS = frozenset(
     {"opt_out", "inbound_after_approval", "manual_required", "channel_revoked"}
 )
@@ -360,10 +364,75 @@ def _migrate_campaign_ledger(conn: sqlite3.Connection) -> None:
         """,
     )
 
+    existing_items_sql = conn.execute(
+        "SELECT sql FROM sqlite_master WHERE type='table' AND name='campaign_items'"
+    ).fetchone()
+    needs_known_classification = bool(
+        existing_items_sql
+        and "'known'" not in str(existing_items_sql[0] or "")
+    )
+    migration_ledger_exists = bool(
+        conn.execute(
+            "SELECT 1 FROM sqlite_master "
+            "WHERE type='table' AND name='whatsapp_ops_schema_migrations'"
+        ).fetchone()
+    )
+
     conn.execute(f"SAVEPOINT {savepoint}")
     try:
-        for statement in statements:
+        for statement in statements[:3]:
             conn.execute(statement)
+        if needs_known_classification:
+            conn.execute(
+                "ALTER TABLE campaign_events "
+                "RENAME TO campaign_events_legacy_classification"
+            )
+            conn.execute(
+                "ALTER TABLE campaign_items "
+                "RENAME TO campaign_items_legacy_classification"
+            )
+            conn.execute(
+                statements[1].replace(
+                    "CREATE TABLE IF NOT EXISTS campaign_items",
+                    "CREATE TABLE campaign_items",
+                    1,
+                )
+            )
+            item_columns = (
+                "campaign_item_id, campaign_id, ordinal, draft_id, approval_id, "
+                "contact_id, channel_id, classification, segment, draft_hash, "
+                "message_hash, state, suppression_reason, followup_count, "
+                "lease_fence_hash, lease_expires_at, leased_at, created_at, updated_at"
+            )
+            conn.execute(
+                f"INSERT INTO campaign_items ({item_columns}) "
+                f"SELECT {item_columns} FROM campaign_items_legacy_classification"
+            )
+            conn.execute(
+                statements[2].replace(
+                    "CREATE TABLE IF NOT EXISTS campaign_events",
+                    "CREATE TABLE campaign_events",
+                    1,
+                )
+            )
+            event_columns = (
+                "event_id, campaign_id, campaign_item_id, event_type, ordinal, "
+                "state, reason, created_at"
+            )
+            conn.execute(
+                f"INSERT INTO campaign_events ({event_columns}) "
+                f"SELECT {event_columns} FROM campaign_events_legacy_classification"
+            )
+            conn.execute("DROP TABLE campaign_events_legacy_classification")
+            conn.execute("DROP TABLE campaign_items_legacy_classification")
+        for statement in statements[3:]:
+            conn.execute(statement)
+        if migration_ledger_exists:
+            conn.execute(
+                "INSERT OR IGNORE INTO whatsapp_ops_schema_migrations(id, applied_at) "
+                "VALUES (?, ?)",
+                (_CAMPAIGN_KNOWN_CLASSIFICATION_MIGRATION, utc_now()),
+            )
     except BaseException:
         try:
             conn.execute(f"ROLLBACK TO {savepoint}")
@@ -5914,7 +5983,12 @@ def campaign_manifest_digest(manifest: dict[str, Any]) -> dict[str, Any]:
 
 
 def preview_campaign_manifest(manifest: dict[str, Any]) -> dict[str, Any]:
-    """Validate a cash-ready three-lead manifest without writing local state."""
+    """Validate a cash-ready three-lead manifest without writing local state.
+
+    Cash-Ready excludes ``cold`` even though the generic D1 campaign ledger
+    keeps supporting it. This narrower preflight always runs before the bridge
+    calls :func:`register_campaign_manifest`.
+    """
 
     normalized, error = _normalize_campaign_manifest(
         manifest, require_open_window=True
