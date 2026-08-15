@@ -40,6 +40,7 @@ from tools.whatsapp_ops_store import (
     draft_signature_matches,
     get_actionable_queue,
     get_cockpit_overview,
+    get_campaign,
     get_conversation_summary,
     get_inbound_burst_status,
     get_media_transcription_status,
@@ -65,9 +66,12 @@ from tools.whatsapp_ops_store import (
     mark_outbox_blocked,
     mark_outbox_result,
     peek_staging,
+    pause_campaign,
     preview_crm_identity_sync,
+    preview_campaign_manifest,
     register_contact_local,
     register_group_local,
+    register_campaign_manifest,
     request_media_transcription,
     reserve_autonomy_run,
     reserve_outbox_send,
@@ -85,6 +89,60 @@ TOOLSET = "whatsapp_ops"
 
 def _json(data: dict[str, Any]) -> str:
     return json.dumps(data, ensure_ascii=False, sort_keys=True)
+
+
+_CASH_SAFE_FLAGS: dict[str, bool] = {
+    "send_performed": False,
+    "crm_write": False,
+    "provider_history_used": False,
+    "approval_resolved": False,
+    "telegram_notification_sent": False,
+    "external_send": False,
+    "external_crm": False,
+}
+
+
+def _cash_result(payload: dict[str, Any]) -> str:
+    result = dict(payload)
+    for key, value in _CASH_SAFE_FLAGS.items():
+        result.setdefault(key, value)
+    return _json(result)
+
+
+def wpp_campaign_caixa_preview(manifest: dict[str, Any]) -> str:
+    """Read-only exact-three preflight for a supervised cash campaign."""
+
+    if type(manifest) is not dict:
+        return _cash_result({"ok": False, "error": "campaign_manifest_invalid"})
+    return _cash_result(preview_campaign_manifest(manifest))
+
+
+def wpp_campaign_caixa_prepare(manifest: dict[str, Any]) -> str:
+    """Atomically register three pre-created pending 1:1 draft approvals."""
+
+    if type(manifest) is not dict:
+        return _cash_result({"ok": False, "error": "campaign_manifest_invalid"})
+    preflight = preview_campaign_manifest(manifest)
+    if preflight.get("ok") is not True:
+        return _cash_result(preflight)
+    registered = register_campaign_manifest(manifest)
+    return _cash_result(registered)
+
+
+def wpp_campaign_caixa_status(campaign_id: str) -> str:
+    """Return only canonical campaign-ledger state; never infer delivery."""
+
+    result = get_campaign(str(campaign_id or "").strip())
+    if result.get("ok") is True:
+        result["delivery_reconciled"] = False
+        result["crm_reconciled"] = False
+    return _cash_result(result)
+
+
+def wpp_campaign_caixa_pause(campaign_id: str) -> str:
+    """Pause future campaign reservations without rewriting item history."""
+
+    return _cash_result(pause_campaign(str(campaign_id or "").strip()))
 
 
 def _default_config() -> dict[str, Any]:
@@ -3266,6 +3324,62 @@ registry.register(
     handler=lambda args, **kw: wpp_autonomy_status(),
     check_fn=check_whatsapp_ops_requirements,
     emoji="📲",
+)
+
+registry.register(
+    name="wpp_campaign_caixa_preview",
+    toolset=TOOLSET,
+    schema=_schema(
+        "wpp_campaign_caixa_preview",
+        "Read-only fail-closed validation of one exact three-lead supervised cash campaign. Never sends, resolves approvals, writes CRM, calls Telegram, or uses provider history.",
+        {"manifest": {"type": "object"}},
+        ["manifest"],
+    ),
+    handler=lambda args, **kw: wpp_campaign_caixa_preview(args.get("manifest", {})),
+    check_fn=check_whatsapp_ops_requirements,
+    emoji="💰",
+)
+
+registry.register(
+    name="wpp_campaign_caixa_prepare",
+    toolset=TOOLSET,
+    schema=_schema(
+        "wpp_campaign_caixa_prepare",
+        "Atomically register one exact three-lead campaign from pre-created pending 1:1 drafts and approvals. Local ledger only; never sends or writes CRM.",
+        {"manifest": {"type": "object"}},
+        ["manifest"],
+    ),
+    handler=lambda args, **kw: wpp_campaign_caixa_prepare(args.get("manifest", {})),
+    check_fn=check_whatsapp_ops_requirements,
+    emoji="💰",
+)
+
+registry.register(
+    name="wpp_campaign_caixa_status",
+    toolset=TOOLSET,
+    schema=_schema(
+        "wpp_campaign_caixa_status",
+        "Read sanitized canonical state for one supervised cash campaign without inferring delivery from parent state.",
+        {"campaign_id": {"type": "string"}},
+        ["campaign_id"],
+    ),
+    handler=lambda args, **kw: wpp_campaign_caixa_status(args.get("campaign_id", "")),
+    check_fn=check_whatsapp_ops_requirements,
+    emoji="💰",
+)
+
+registry.register(
+    name="wpp_campaign_caixa_pause",
+    toolset=TOOLSET,
+    schema=_schema(
+        "wpp_campaign_caixa_pause",
+        "Pause future reservations for one supervised cash campaign without rewriting item history or causing external effects.",
+        {"campaign_id": {"type": "string"}},
+        ["campaign_id"],
+    ),
+    handler=lambda args, **kw: wpp_campaign_caixa_pause(args.get("campaign_id", "")),
+    check_fn=check_whatsapp_ops_requirements,
+    emoji="💰",
 )
 
 registry.register(

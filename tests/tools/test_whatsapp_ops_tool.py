@@ -2870,3 +2870,319 @@ def test_wpp_group_create_never_appends_commercial_crm_interaction(tmp_path, mon
     assert raw_ref not in serialized
     assert "5511999990000" not in serialized
     assert "Grupo Privado" not in serialized
+
+
+def _make_caixa_fixture(store, tmp_path, campaign_ref="caixa_demo_01"):
+    """Create exactly 3 pre-approved 1:1 drafts eligible for caixa campaign."""
+    from datetime import datetime, timedelta, timezone
+
+    now = datetime.now(timezone.utc)
+    items = []
+    for ordinal in range(1, 4):
+        contact_id = f"contact_caixa_{ordinal}"
+        store.upsert_contact(
+            contact_id=contact_id,
+            display_name=f"Lead Caixa {ordinal}",
+            whitelisted=True,
+        )
+        channel = store.upsert_channel(
+            contact_id=contact_id,
+            address=f"+1202555010{ordinal}",
+            validation_status="validated",
+            is_primary=True,
+        )
+        store.authorize_channel(channel["channel_id"])
+        draft = store.create_draft(
+            targets=[{"type": "contact", "contact_id": contact_id}],
+            message=f"Mensagem caixa {campaign_ref} {ordinal}",
+        )
+        approval = store.create_approval(draft["draft_id"])
+        items.append(
+            {
+                "ordinal": ordinal,
+                "draft_id": draft["draft_id"],
+                "approval_id": approval["approval_id"],
+                "contact_id": contact_id,
+                "channel_id": channel["channel_id"],
+                "classification": ("known", "warm", "reactivation")[ordinal - 1],
+                "segment": f"segment_caixa_{ordinal}",
+                "draft_hash": draft["idempotency_key"],
+                "message_hash": draft["message_hash"],
+            }
+        )
+    return {
+        "schema": "wpp-campaign-manifest/v1",
+        "campaign_ref": campaign_ref,
+        "project_ref": "project_caixa_01",
+        "start_at": (now - timedelta(minutes=5)).isoformat(),
+        "end_at": (now + timedelta(hours=1)).isoformat(),
+        "timezone": "America/Sao_Paulo",
+        "sales_pack_digest": "c" * 64,
+        "max_followups": 2,
+        "items": items,
+    }
+
+
+def test_wpp_campaign_caixa_preview_validates_exact_three_no_mutation(tmp_path):
+    from tools.whatsapp_ops_store import init_db
+    from tools.whatsapp_ops_tool import wpp_campaign_caixa_preview
+
+    token = set_hermes_home_override(tmp_path)
+    try:
+        init_db()
+        import tools.whatsapp_ops_store as store_mod
+
+        manifest = _make_caixa_fixture(store_mod, tmp_path)
+        preview = _parse(wpp_campaign_caixa_preview(manifest))
+        with store_mod._connect_read_only() as conn:
+            counts = {
+                table: conn.execute(f"SELECT COUNT(*) FROM {table}").fetchone()[0]
+                for table in (
+                    "campaigns",
+                    "campaign_items",
+                    "campaign_events",
+                    "drafts",
+                    "approvals",
+                    "outbox",
+                )
+            }
+    finally:
+        reset_hermes_home_override(token)
+
+    assert preview["ok"] is True
+    assert preview["eligible_count"] == 3
+    assert preview["campaign_ref"] == "caixa_demo_01"
+    assert len(preview["items"]) == 3
+    for item in preview["items"]:
+        assert item["classification"] in {"known", "warm", "reactivation"}
+        assert item["ordinal"] in {1, 2, 3}
+        assert item["draft_id"].startswith("draft_")
+        assert item["approval_id"].startswith("approval_")
+        assert item["contact_id"].startswith("contact_")
+        assert item["channel_id"].startswith("channel_")
+        assert "draft_hash" in item
+        assert "message_hash" in item
+        assert "window" in item
+        assert "crm_context" in item
+    # Zero mutation
+    assert counts["campaigns"] == 0
+    assert counts["campaign_items"] == 0
+    assert counts["campaign_events"] == 0
+    assert counts["drafts"] == 3
+    assert counts["approvals"] == 3
+    assert counts["outbox"] == 0
+    # No sensitive data in output
+    serialized = json.dumps(preview, ensure_ascii=False)
+    assert "+55" not in serialized
+    assert "@s.whatsapp.net" not in serialized
+    assert "@lid" not in serialized
+    assert "@g.us" not in serialized
+
+
+def test_wpp_campaign_caixa_preview_rejects_invalid_items(tmp_path):
+    from tools.whatsapp_ops_store import init_db
+    from tools.whatsapp_ops_tool import wpp_campaign_caixa_preview
+    import tools.whatsapp_ops_store as store_mod
+
+    token = set_hermes_home_override(tmp_path)
+    try:
+        init_db()
+        manifest = _make_caixa_fixture(store_mod, tmp_path)
+        # Test 2 items instead of 3
+        manifest_2 = json.loads(json.dumps(manifest))
+        manifest_2["items"] = manifest_2["items"][:2]
+        rejected_2 = _parse(wpp_campaign_caixa_preview(manifest_2))
+        # Test cold classification
+        manifest_cold = json.loads(json.dumps(manifest))
+        manifest_cold["items"][0]["classification"] = "cold"
+        rejected_cold = _parse(wpp_campaign_caixa_preview(manifest_cold))
+        # Test group target
+        group_draft = store_mod.create_draft(
+            targets=[{"type": "group", "list_id": "group_unsafe_01"}],
+            message="Grupo não pode",
+        )
+        group_approval = store_mod.create_approval(group_draft["draft_id"])
+        manifest_group = json.loads(json.dumps(manifest))
+        manifest_group["items"][0].update(
+            {
+                "draft_id": group_draft["draft_id"],
+                "approval_id": group_approval["approval_id"],
+                "draft_hash": group_draft["idempotency_key"],
+                "message_hash": group_draft["message_hash"],
+            }
+        )
+        rejected_group = _parse(wpp_campaign_caixa_preview(manifest_group))
+        # Test denied approval
+        denied_draft = store_mod.create_draft(
+            targets=[{"type": "contact", "contact_id": manifest["items"][0]["contact_id"]}],
+            message="Denied",
+        )
+        denied_approval = store_mod.create_approval(denied_draft["draft_id"])
+        store_mod.resolve_approval(
+            denied_approval["approval_id"], "denied", approver_ref="human:test"
+        )
+        manifest_denied = json.loads(json.dumps(manifest))
+        manifest_denied["items"][0].update(
+            {
+                "draft_id": denied_draft["draft_id"],
+                "approval_id": denied_approval["approval_id"],
+                "draft_hash": denied_draft["idempotency_key"],
+                "message_hash": denied_draft["message_hash"],
+            }
+        )
+        rejected_denied = _parse(wpp_campaign_caixa_preview(manifest_denied))
+    finally:
+        reset_hermes_home_override(token)
+
+    assert rejected_2["ok"] is False
+    assert rejected_2["error"] == "campaign_items_exact_three_required"
+    assert rejected_cold["ok"] is False
+    assert rejected_cold["error"] == "campaign_item_classification_invalid"
+    assert rejected_group["ok"] is False
+    assert rejected_group["error"] == "campaign_draft_not_one_to_one"
+    assert rejected_denied["ok"] is False
+    assert rejected_denied["error"] in {
+        "campaign_approval_changed",
+        "campaign_item_not_eligible",
+    }
+
+
+def test_wpp_campaign_caixa_prepare_idempotent_and_atomic(tmp_path):
+    from tools.whatsapp_ops_store import init_db, get_campaign, get_db_path
+    from tools.whatsapp_ops_tool import wpp_campaign_caixa_prepare
+    import tools.whatsapp_ops_store as store_mod
+
+    token = set_hermes_home_override(tmp_path)
+    try:
+        init_db()
+        manifest = _make_caixa_fixture(store_mod, tmp_path)
+        first = _parse(wpp_campaign_caixa_prepare(manifest))
+        second = _parse(wpp_campaign_caixa_prepare(manifest))
+        campaign = store_mod.get_campaign(first["campaign_id"])
+        with store_mod._connect_read_only() as conn:
+            counts = {
+                table: conn.execute(f"SELECT COUNT(*) FROM {table}").fetchone()[0]
+                for table in ("campaigns", "campaign_items", "campaign_events")
+            }
+    finally:
+        reset_hermes_home_override(token)
+
+    assert first["ok"] is True
+    assert first["state"] == "queued"
+    assert first["item_count"] == 3
+    assert second["campaign_id"] == first["campaign_id"]
+    assert second["deduped"] is True
+    assert campaign["items"] == first["items"]
+    assert counts == {"campaigns": 1, "campaign_items": 3, "campaign_events": 1}
+    # No sensitive data
+    serialized = json.dumps(first, ensure_ascii=False)
+    assert "+55" not in serialized
+    assert "@s.whatsapp.net" not in serialized
+    assert "fence" not in serialized
+
+
+def test_wpp_campaign_caixa_prepare_conflict_on_changed_digest(tmp_path):
+    from tools.whatsapp_ops_store import init_db
+    from tools.whatsapp_ops_tool import wpp_campaign_caixa_prepare
+    import tools.whatsapp_ops_store as store_mod
+
+    token = set_hermes_home_override(tmp_path)
+    try:
+        init_db()
+        manifest = _make_caixa_fixture(store_mod, tmp_path)
+        first = _parse(wpp_campaign_caixa_prepare(manifest))
+        # Changed sales_pack_digest with same campaign_ref
+        changed = json.loads(json.dumps(manifest))
+        changed["sales_pack_digest"] = "d" * 64
+        conflict = _parse(wpp_campaign_caixa_prepare(changed))
+        with store_mod._connect_read_only() as conn:
+            registered = conn.execute("SELECT COUNT(*) FROM campaigns").fetchone()[0]
+    finally:
+        reset_hermes_home_override(token)
+
+    assert first["ok"] is True
+    assert conflict["ok"] is False
+    assert conflict["error"] == "campaign_ref_conflict"
+    assert registered == 1
+
+
+def test_wpp_campaign_caixa_status_reconciles_from_ledger_only(tmp_path):
+    from tools.whatsapp_ops_store import init_db, transition_campaign, transition_campaign_item, acquire_campaign_item_lease
+    from tools.whatsapp_ops_tool import wpp_campaign_caixa_prepare, wpp_campaign_caixa_status
+    import tools.whatsapp_ops_store as store_mod
+
+    token = set_hermes_home_override(tmp_path)
+    try:
+        init_db()
+        manifest = _make_caixa_fixture(store_mod, tmp_path)
+        prepare = _parse(wpp_campaign_caixa_prepare(manifest))
+        campaign_id = prepare["campaign_id"]
+
+        # Transition to approved
+        store_mod.transition_campaign(campaign_id, "pending_approval")
+        store_mod.transition_campaign(campaign_id, "approved")
+        store_mod.transition_campaign(campaign_id, "executing")
+        for ordinal in range(1, 4):
+            store_mod.transition_campaign_item(campaign_id, ordinal, "approved")
+
+        status = _parse(wpp_campaign_caixa_status(campaign_id))
+        # Status must derive from ledger, not infer from parent
+        assert status["ok"] is True
+        assert status["campaign_id"] == campaign_id
+        assert status["state"] == "executing"
+        assert len(status["items"]) == 3
+        for item in status["items"]:
+            assert item["state"] == "approved"
+            assert "ordinal" in item
+            assert "classification" in item
+            assert "segment" in item
+            assert "suppression_reason" in item
+            assert "followup_count" in item
+
+        # Now lease one item
+        lease = store_mod.acquire_campaign_item_lease(campaign_id, 1, fence="fence_01", lease_seconds=60)
+        status_after_lease = _parse(wpp_campaign_caixa_status(campaign_id))
+        assert status_after_lease["items"][0]["state"] == "leased"
+        assert status_after_lease["items"][1]["state"] == "approved"
+        assert status_after_lease["items"][2]["state"] == "approved"
+    finally:
+        reset_hermes_home_override(token)
+
+
+def test_wpp_campaign_caixa_pause_blocks_future_reservations(tmp_path):
+    from tools.whatsapp_ops_store import init_db, transition_campaign, transition_campaign_item, acquire_campaign_item_lease
+    from tools.whatsapp_ops_tool import (
+        wpp_campaign_caixa_pause,
+        wpp_campaign_caixa_prepare,
+        wpp_campaign_caixa_status,
+    )
+    import tools.whatsapp_ops_store as store_mod
+
+    token = set_hermes_home_override(tmp_path)
+    try:
+        init_db()
+        manifest = _make_caixa_fixture(store_mod, tmp_path)
+        prepare = _parse(wpp_campaign_caixa_prepare(manifest))
+        campaign_id = prepare["campaign_id"]
+
+        store_mod.transition_campaign(campaign_id, "pending_approval")
+        store_mod.transition_campaign(campaign_id, "approved")
+        for ordinal in range(1, 4):
+            store_mod.transition_campaign_item(campaign_id, ordinal, "approved")
+
+        # Pause
+        pause_result = _parse(wpp_campaign_caixa_pause(campaign_id))
+        assert pause_result["ok"] is True
+        assert pause_result["paused"] is True
+
+        # Lease should be blocked
+        lease_blocked = store_mod.acquire_campaign_item_lease(campaign_id, 1, fence="fence_01", lease_seconds=60)
+        assert lease_blocked["ok"] is False
+        assert lease_blocked["error"] == "campaign_paused"
+
+        # Status should show paused
+        status = _parse(wpp_campaign_caixa_status(campaign_id))
+        assert status["paused"] is True
+        assert status["state"] == "blocked"
+    finally:
+        reset_hermes_home_override(token)

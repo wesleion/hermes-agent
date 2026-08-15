@@ -44,7 +44,7 @@ _AUTONOMY_MIN_LEASE_SECONDS = 30
 _AUTONOMY_MAX_LEASE_SECONDS = 3600
 _CAMPAIGN_SCHEMA = "wpp-campaign-manifest/v1"
 _CAMPAIGN_DIGEST_RE = re.compile(r"^[0-9a-f]{64}$")
-_CAMPAIGN_CLASSIFICATIONS = frozenset({"cold", "warm", "reactivation"})
+_CAMPAIGN_CLASSIFICATIONS = frozenset({"cold", "known", "warm", "reactivation"})
 _CAMPAIGN_SUPPRESSION_REASONS = frozenset(
     {"opt_out", "inbound_after_approval", "manual_required", "channel_revoked"}
 )
@@ -308,7 +308,7 @@ def _migrate_campaign_ledger(conn: sqlite3.Connection) -> None:
             approval_id TEXT NOT NULL UNIQUE REFERENCES approvals(id),
             contact_id TEXT NOT NULL REFERENCES contacts(id),
             channel_id TEXT NOT NULL REFERENCES contact_channels(id),
-            classification TEXT NOT NULL CHECK(classification IN ('cold', 'warm', 'reactivation')),
+            classification TEXT NOT NULL CHECK(classification IN ('cold', 'known', 'warm', 'reactivation')),
             segment TEXT NOT NULL,
             draft_hash TEXT NOT NULL,
             message_hash TEXT NOT NULL,
@@ -5913,6 +5913,126 @@ def campaign_manifest_digest(manifest: dict[str, Any]) -> dict[str, Any]:
     }
 
 
+def preview_campaign_manifest(manifest: dict[str, Any]) -> dict[str, Any]:
+    """Validate a cash-ready three-lead manifest without writing local state."""
+
+    normalized, error = _normalize_campaign_manifest(
+        manifest, require_open_window=True
+    )
+    if error is not None or normalized is None:
+        return _campaign_error(error or "campaign_manifest_invalid")
+    if any(
+        item["classification"] not in {"known", "warm", "reactivation"}
+        for item in normalized["items"]
+    ):
+        return _campaign_error("campaign_item_classification_invalid")
+
+    try:
+        with _connect_read_only() as conn:
+            now_dt = _mission_now()
+            for item in normalized["items"]:
+                draft_row = conn.execute(
+                    "SELECT * FROM drafts WHERE id=?", (item["draft_id"],)
+                ).fetchone()
+                if draft_row is None:
+                    return _campaign_error("campaign_draft_not_found")
+                draft = dict(draft_row)
+                if draft["status"] != "pending_approval":
+                    return _campaign_error("campaign_item_not_eligible")
+                if (
+                    draft["message_hash"] != item["message_hash"]
+                    or draft["idempotency_key"] != item["draft_hash"]
+                    or not draft_signature_matches(draft)
+                ):
+                    return _campaign_error("campaign_draft_changed")
+                try:
+                    targets = json.loads(str(draft["targets_json"]))
+                except (TypeError, json.JSONDecodeError):
+                    targets = None
+                if (
+                    type(targets) is not list
+                    or len(targets) != 1
+                    or type(targets[0]) is not dict
+                    or set(targets[0]) != {"type", "contact_id"}
+                    or targets[0].get("type") != "contact"
+                    or targets[0].get("contact_id") != item["contact_id"]
+                ):
+                    return _campaign_error("campaign_draft_not_one_to_one")
+
+                approval_row = conn.execute(
+                    "SELECT * FROM approvals WHERE id=?", (item["approval_id"],)
+                ).fetchone()
+                if approval_row is None:
+                    return _campaign_error("campaign_approval_not_found")
+                approval = dict(approval_row)
+                expiry = _strict_utc_timestamp(approval["expires_at"])
+                if (
+                    approval["draft_id"] != item["draft_id"]
+                    or approval["status"] != "pending"
+                    or approval["message_hash"] != draft["message_hash"]
+                    or approval["draft_idempotency_key"] != draft["idempotency_key"]
+                    or expiry is None
+                    or expiry[1] <= now_dt
+                ):
+                    return _campaign_error("campaign_approval_changed")
+
+                contact = conn.execute(
+                    "SELECT whitelisted FROM contacts WHERE id=?",
+                    (item["contact_id"],),
+                ).fetchone()
+                channel = conn.execute(
+                    "SELECT * FROM contact_channels WHERE id=?",
+                    (item["channel_id"],),
+                ).fetchone()
+                if (
+                    contact is None
+                    or not bool(contact["whitelisted"])
+                    or channel is None
+                    or channel["contact_id"] != item["contact_id"]
+                    or channel["channel_type"] != "whatsapp"
+                    or not bool(channel["is_active"])
+                    or channel["validation_status"] != "validated"
+                    or not bool(channel["allow_send"])
+                    or channel["revoked_at"] is not None
+                ):
+                    return _campaign_error("campaign_channel_ineligible")
+    except (FileNotFoundError, sqlite3.Error):
+        return _campaign_error("campaign_store_unavailable")
+
+    window = {
+        "start_at": normalized["start_at"],
+        "end_at": normalized["end_at"],
+        "timezone": normalized["timezone"],
+    }
+    return {
+        "ok": True,
+        "schema": _CAMPAIGN_SCHEMA,
+        "manifest_digest": hash_text(_canonical_campaign_json(normalized)),
+        "campaign_ref": normalized["campaign_ref"],
+        "project_ref": normalized["project_ref"],
+        "eligible_count": 3,
+        "items": [
+            {
+                "ordinal": item["ordinal"],
+                "classification": item["classification"],
+                "segment": item["segment"],
+                "draft_id": item["draft_id"],
+                "approval_id": item["approval_id"],
+                "contact_id": item["contact_id"],
+                "channel_id": item["channel_id"],
+                "draft_hash": item["draft_hash"],
+                "message_hash": item["message_hash"],
+                "window": dict(window),
+                "crm_context": {
+                    "contact_id": item["contact_id"],
+                    "channel_id": item["channel_id"],
+                },
+            }
+            for item in normalized["items"]
+        ],
+    }
+
+
 def _append_campaign_event(
     conn: sqlite3.Connection,
     *,
@@ -6076,9 +6196,10 @@ def register_campaign_manifest(manifest: dict[str, Any]) -> dict[str, Any]:
                 if draft_row is None:
                     return _campaign_error("campaign_draft_not_found")
                 draft = dict(draft_row)
+                if draft["status"] != "pending_approval":
+                    return _campaign_error("campaign_item_not_eligible")
                 if (
-                    draft["status"] != "pending_approval"
-                    or draft["message_hash"] != item["message_hash"]
+                    draft["message_hash"] != item["message_hash"]
                     or draft["idempotency_key"] != item["draft_hash"]
                     or not draft_signature_matches(draft)
                 ):

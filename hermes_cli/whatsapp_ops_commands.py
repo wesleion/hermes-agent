@@ -182,9 +182,209 @@ def _mission_usage_lines() -> list[str]:
         "- /missao revisar item N — usa o item exatamente como aparece em /fila.",
         "- /missao atacar base fria — prepara plano gateado; não executa outreach.",
         "- /missao radar comercial hoje — ainda bloqueado até gate de cron/radar.",
+        "- /missao caixa ajuda — campanha supervisionada de exatamente 3 leads.",
         "",
         "Este corte não envia WhatsApp, não escreve CRM, não puxa provider-history, não ativa cron e não persiste resumo.",
     ]
+
+
+def _mission_caixa_usage_lines() -> list[str]:
+    return [
+        "💰 Caixa — campanha supervisionada (3 leads)",
+        "- /missao caixa preview — valida o manifesto runtime-only sem mutação.",
+        "- /missao caixa preparar — registra exatamente 3 drafts/approvals pendentes.",
+        "- /missao caixa status <campaign_id> — lê somente o ledger canônico.",
+        "- /missao caixa pausar <campaign_id> — bloqueia novas reservas.",
+        "Preparar não envia WhatsApp e não escreve CRM; cada lead continua com approval próprio.",
+    ]
+
+
+def _render_mission_caixa(
+    rest: str,
+    *,
+    caixa_preview: Callable[[dict[str, Any]], str] | None,
+    caixa_prepare: Callable[[dict[str, Any]], str] | None,
+    caixa_status: Callable[[str], str] | None,
+    caixa_pause: Callable[[str], str] | None,
+    caixa_manifest_loader: Callable[[], dict[str, Any]] | None,
+) -> str:
+    tokens = [part.strip() for part in str(rest or "").split() if part.strip()]
+    subaction = tokens[0].lower() if tokens else "ajuda"
+    if subaction in {"help", "ajuda", "?", "uso"}:
+        return "\n".join(
+            _safe_text(line, max_len=700) for line in _mission_caixa_usage_lines()
+        )
+
+    def decode(raw: Any) -> dict[str, Any]:
+        data = json.loads(raw) if isinstance(raw, str) else raw
+        if isinstance(data, dict):
+            return data
+        return {"ok": False, "error": "campaign_response_invalid"}
+
+    guarantees = (
+        "Garantias: send_performed=false · crm_write=false · "
+        "provider_history_used=false · external_send=false · external_crm=false."
+    )
+    preview_actions = {"preview", "prever", "preflight"}
+    prepare_actions = {"preparar", "prepare"}
+    if subaction in preview_actions | prepare_actions:
+        callback_injected = (
+            caixa_preview is not None
+            if subaction in preview_actions
+            else caixa_prepare is not None
+        )
+        if caixa_manifest_loader is not None:
+            try:
+                manifest = caixa_manifest_loader()
+            except Exception as exc:
+                return "\n".join(
+                    [
+                        "💰 Caixa — campanha bloqueada",
+                        "Manifesto runtime-only indisponível: "
+                        + _safe_text(exc, max_len=160),
+                        guarantees,
+                    ]
+                )
+        elif callback_injected:
+            # Embedded callers can own the manifest source through their callback.
+            manifest = {}
+        else:
+            return "\n".join(
+                [
+                    "💰 Caixa — campanha bloqueada",
+                    "Manifesto runtime-only não foi carregado; valores complexos não são aceitos pelo texto do comando.",
+                    "Materialize o manifesto privado e repita pelo bridge profile-local.",
+                    guarantees,
+                ]
+            )
+        try:
+            if subaction in preview_actions:
+                if caixa_preview is None:
+                    from tools.whatsapp_ops_tool import (
+                        wpp_campaign_caixa_preview as callback,
+                    )
+                else:
+                    callback = caixa_preview
+            else:
+                if caixa_prepare is None:
+                    from tools.whatsapp_ops_tool import (
+                        wpp_campaign_caixa_prepare as callback,
+                    )
+                else:
+                    callback = caixa_prepare
+            data = decode(callback(manifest))
+        except Exception as exc:
+            data = {"ok": False, "error": _safe_text(exc, max_len=160)}
+        if data.get("ok") is not True:
+            return "\n".join(
+                [
+                    "💰 Caixa — campanha bloqueada",
+                    "Motivo: "
+                    + _safe_text(
+                        data.get("error") or "campaign_preflight_failed",
+                        max_len=160,
+                    ),
+                    guarantees,
+                ]
+            )
+        if subaction in preview_actions:
+            lines = [
+                "💰 Caixa — preview de campanha (3 leads)",
+                "Elegíveis: "
+                + _safe_text(data.get("eligible_count") or 0, max_len=8),
+            ]
+            items = data.get("items") if isinstance(data.get("items"), list) else []
+            for item in items[:3]:
+                if not isinstance(item, dict):
+                    continue
+                lines.extend(
+                    [
+                        f"{_safe_text(item.get('ordinal') or 0, max_len=8)}. "
+                        f"classification: {_safe_text(item.get('classification'), max_len=24)} · "
+                        f"segment: {_safe_text(item.get('segment'), max_len=64)}",
+                        f"draft: {_safe_text(item.get('draft_id'), max_len=80)} · "
+                        f"approval: {_safe_text(item.get('approval_id'), max_len=80)}",
+                        f"contact: {_safe_text(item.get('contact_id'), max_len=80)} · "
+                        f"channel: {_safe_text(item.get('channel_id'), max_len=80)}",
+                    ]
+                )
+            lines.append(guarantees)
+            return "\n".join(_safe_text(line, max_len=700) for line in lines)
+        return "\n".join(
+            [
+                "💰 Caixa — campanha preparada",
+                "campaign: " + _safe_text(data.get("campaign_id"), max_len=100),
+                "state: " + _safe_text(data.get("state"), max_len=40),
+                "items: " + _safe_text(data.get("item_count") or 0, max_len=8),
+                guarantees,
+            ]
+        )
+
+    if subaction in {"status", "pausar", "pause"}:
+        campaign_id = tokens[1] if len(tokens) > 1 else ""
+        if not campaign_id:
+            return "\n".join(_mission_caixa_usage_lines())
+        try:
+            if subaction == "status":
+                if caixa_status is None:
+                    from tools.whatsapp_ops_tool import (
+                        wpp_campaign_caixa_status as status_callback,
+                    )
+                else:
+                    status_callback = caixa_status
+                data = decode(status_callback(campaign_id))
+            else:
+                if caixa_pause is None:
+                    from tools.whatsapp_ops_tool import (
+                        wpp_campaign_caixa_pause as pause_callback,
+                    )
+                else:
+                    pause_callback = caixa_pause
+                data = decode(pause_callback(campaign_id))
+        except Exception as exc:
+            data = {"ok": False, "error": _safe_text(exc, max_len=160)}
+        if data.get("ok") is not True:
+            return "\n".join(
+                [
+                    "💰 Caixa — campanha bloqueada",
+                    "Motivo: "
+                    + _safe_text(
+                        data.get("error") or "campaign_lookup_failed", max_len=160
+                    ),
+                    guarantees,
+                ]
+            )
+        if subaction == "status":
+            lines = [
+                "💰 Caixa — status da campanha",
+                "campaign: " + _safe_text(data.get("campaign_id"), max_len=100),
+                "state: " + _safe_text(data.get("state"), max_len=40),
+                "paused: " + str(bool(data.get("paused"))).lower(),
+            ]
+            items = data.get("items") if isinstance(data.get("items"), list) else []
+            for item in items[:3]:
+                if isinstance(item, dict):
+                    lines.append(
+                        f"{_safe_text(item.get('ordinal') or 0, max_len=8)}. "
+                        f"{_safe_text(item.get('classification'), max_len=24)} · "
+                        f"{_safe_text(item.get('segment'), max_len=64)} · "
+                        f"{_safe_text(item.get('state'), max_len=32)}"
+                    )
+            lines.append(guarantees)
+            return "\n".join(_safe_text(line, max_len=700) for line in lines)
+        return "\n".join(
+            [
+                "💰 Caixa — campanha pausada",
+                "campaign: " + _safe_text(data.get("campaign_id"), max_len=100),
+                "paused: " + str(bool(data.get("paused"))).lower(),
+                "state: " + _safe_text(data.get("state"), max_len=40),
+                guarantees,
+            ]
+        )
+
+    return "\n".join(
+        _safe_text(line, max_len=700) for line in _mission_caixa_usage_lines()
+    )
 
 
 def _format_counts(counts: dict[str, Any]) -> str:
@@ -285,6 +485,11 @@ def render_mission_command(
     summary_loader: Callable[..., str] | None = None,
     target_resolver: Callable[..., dict[str, Any]] | None = None,
     radar_loader: Callable[..., str] | None = None,
+    caixa_preview: Callable[[dict[str, Any]], str] | None = None,
+    caixa_prepare: Callable[[dict[str, Any]], str] | None = None,
+    caixa_status: Callable[[str], str] | None = None,
+    caixa_pause: Callable[[str], str] | None = None,
+    caixa_manifest_loader: Callable[[], dict[str, Any]] | None = None,
 ) -> str:
     """Render the read-only Hunter commercial mission cockpit."""
     tokens = [part.strip() for part in str(arg or "").split() if part.strip()]
@@ -293,6 +498,15 @@ def render_mission_command(
 
     action = tokens[0].lower()
     rest = " ".join(tokens[1:]).strip()
+    if action == "caixa":
+        return _render_mission_caixa(
+            rest,
+            caixa_preview=caixa_preview,
+            caixa_prepare=caixa_prepare,
+            caixa_status=caixa_status,
+            caixa_pause=caixa_pause,
+            caixa_manifest_loader=caixa_manifest_loader,
+        )
     if action in {"review", "revisar", "contexto", "analise", "analisar"}:
         parsed = _parse_targeted_args(rest, default_limit=30, max_limit=50)
         if parsed.get("help") or parsed.get("error") or not (parsed.get("target") or parsed.get("item") or parsed.get("thread") or parsed.get("contact")):
@@ -461,6 +675,11 @@ def render_mission_command(
         summary_loader=summary_loader,
         target_resolver=target_resolver,
         radar_loader=radar_loader,
+        caixa_preview=caixa_preview,
+        caixa_prepare=caixa_prepare,
+        caixa_status=caixa_status,
+        caixa_pause=caixa_pause,
+        caixa_manifest_loader=caixa_manifest_loader,
     )
 
 

@@ -468,3 +468,200 @@ def test_render_thread_context_command_reports_safe_failure():
     assert "https://" not in rendered
     assert "@lid" not in rendered
     assert "Nenhum envio foi disparado" in rendered
+
+
+def test_render_mission_command_caixa_preview_validates_three_no_mutation():
+    import tools.whatsapp_ops_store as store
+
+    def fake_preview(manifest):
+        return json.dumps(
+            {
+                "ok": True,
+                "eligible_count": 3,
+                "campaign_ref": "caixa_demo_01",
+                "items": [
+                    {
+                        "ordinal": 1,
+                        "classification": "known",
+                        "segment": "segment_caixa_1",
+                        "draft_id": "draft_aaa",
+                        "approval_id": "approval_aaa",
+                        "contact_id": "contact_aaa",
+                        "channel_id": "channel_aaa",
+                        "draft_hash": "hash_aaa",
+                        "message_hash": "hash_aaa",
+                        "window": {"start_at": "2026-08-15T10:00:00+00:00", "end_at": "2026-08-15T11:00:00+00:00"},
+                        "crm_context": {"lead_id": "L-001", "contact_id": "C-001"},
+                    },
+                    {
+                        "ordinal": 2,
+                        "classification": "warm",
+                        "segment": "segment_caixa_2",
+                        "draft_id": "draft_bbb",
+                        "approval_id": "approval_bbb",
+                        "contact_id": "contact_bbb",
+                        "channel_id": "channel_bbb",
+                        "draft_hash": "hash_bbb",
+                        "message_hash": "hash_bbb",
+                        "window": {"start_at": "2026-08-15T10:00:00+00:00", "end_at": "2026-08-15T11:00:00+00:00"},
+                        "crm_context": {"lead_id": "L-002", "contact_id": "C-002"},
+                    },
+                    {
+                        "ordinal": 3,
+                        "classification": "reactivation",
+                        "segment": "segment_caixa_3",
+                        "draft_id": "draft_ccc",
+                        "approval_id": "approval_ccc",
+                        "contact_id": "contact_ccc",
+                        "channel_id": "channel_ccc",
+                        "draft_hash": "hash_ccc",
+                        "message_hash": "hash_ccc",
+                        "window": {"start_at": "2026-08-15T10:00:00+00:00", "end_at": "2026-08-15T11:00:00+00:00"},
+                        "crm_context": {"lead_id": "L-003", "contact_id": "C-003"},
+                    },
+                ],
+                "external_send": False,
+                "external_crm": False,
+            },
+            ensure_ascii=False,
+        )
+
+    def fake_prepare(manifest):
+        return json.dumps(
+            {
+                "ok": True,
+                "campaign_id": "campaign_xxx",
+                "state": "queued",
+                "item_count": 3,
+                "items": [],
+                "external_send": False,
+                "external_crm": False,
+            },
+            ensure_ascii=False,
+        )
+
+    rendered = render_mission_command(
+        "caixa preview",
+        caixa_preview=fake_preview,
+        caixa_prepare=fake_prepare,
+    )
+
+    assert "Caixa — preview de campanha (3 leads)" in rendered
+    assert "Elegíveis: 3" in rendered
+    assert "classification: known" in rendered
+    assert "classification: warm" in rendered
+    assert "classification: reactivation" in rendered
+    assert "draft_aaa" in rendered
+    assert "approval_aaa" in rendered
+    assert "contact_aaa" in rendered
+    assert "channel_aaa" in rendered
+    assert "send_performed=false" in rendered
+    assert "crm_write=false" in rendered
+    assert "provider_history_used=false" in rendered
+    assert "external_send=false" in rendered
+    assert "external_crm=false" in rendered
+
+
+def test_render_mission_command_caixa_prepare_idempotent():
+    import tools.whatsapp_ops_store as store
+
+    def fake_prepare(manifest):
+        return json.dumps(
+            {
+                "ok": True,
+                "campaign_id": "campaign_xxx",
+                "state": "queued",
+                "item_count": 3,
+                "items": [],
+                "deduped": False,
+                "external_send": False,
+                "external_crm": False,
+            },
+            ensure_ascii=False,
+        )
+
+    rendered = render_mission_command(
+        "caixa preparar",
+        caixa_prepare=fake_prepare,
+    )
+
+    assert "Caixa — campanha preparada" in rendered
+    assert "campaign_xxx" in rendered
+    assert "state: queued" in rendered
+    assert "items: 3" in rendered
+    assert "send_performed=false" in rendered
+    assert "crm_write=false" in rendered
+
+
+def test_render_mission_command_caixa_status_reconciles_from_ledger():
+    def fake_status(campaign_id):
+        return json.dumps(
+            {
+                "ok": True,
+                "campaign_id": "campaign_xxx",
+                "state": "executing",
+                "paused": False,
+                "killed": False,
+                "items": [
+                    {"ordinal": 1, "state": "leased", "classification": "known", "segment": "segment_caixa_1"},
+                    {"ordinal": 2, "state": "approved", "classification": "warm", "segment": "segment_caixa_2"},
+                    {"ordinal": 3, "state": "approved", "classification": "reactivation", "segment": "segment_caixa_3"},
+                ],
+                "external_send": False,
+                "external_crm": False,
+            },
+            ensure_ascii=False,
+        )
+
+    rendered = render_mission_command(
+        "caixa status campaign_xxx",
+        caixa_status=fake_status,
+    )
+
+    assert "Caixa — status da campanha" in rendered
+    assert "campaign_xxx" in rendered
+    assert "state: executing" in rendered
+    assert "paused: false" in rendered
+    assert "leased" in rendered
+    assert "approved" in rendered
+    assert "send_performed=false" in rendered
+    assert "crm_write=false" in rendered
+
+
+def test_render_mission_command_caixa_pause_blocks_reservations():
+    def fake_pause(campaign_id):
+        return json.dumps(
+            {
+                "ok": True,
+                "campaign_id": "campaign_xxx",
+                "paused": True,
+                "state": "blocked",
+                "external_send": False,
+                "external_crm": False,
+            },
+            ensure_ascii=False,
+        )
+
+    rendered = render_mission_command(
+        "caixa pausar campaign_xxx",
+        caixa_pause=fake_pause,
+    )
+
+    assert "Caixa — campanha pausada" in rendered
+    assert "campaign_xxx" in rendered
+    assert "paused: true" in rendered
+    assert "state: blocked" in rendered
+    assert "send_performed=false" in rendered
+    assert "crm_write=false" in rendered
+
+
+def test_render_mission_command_caixa_help_shows_usage():
+    rendered = render_mission_command("caixa ajuda")
+
+    assert "Caixa — campanha supervisionada (3 leads)" in rendered
+    assert "/missao caixa preview" in rendered
+    assert "/missao caixa preparar" in rendered
+    assert "/missao caixa status <campaign_id>" in rendered
+    assert "/missao caixa pausar <campaign_id>" in rendered
+    assert "não envia WhatsApp" in rendered
+    assert "não escreve CRM" in rendered
