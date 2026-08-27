@@ -1,0 +1,94 @@
+name: Agent work
+description: Create a canonical, validator-gated work item for an approved agent.
+title: "[agent] "
+labels:
+  - "agent:managed"
+assignees: []
+body:
+  - type: input
+    id: template_version
+    attributes:
+      label: Template Version
+      description: Validator contract version. Do not change this value.
+      value: agent-work/v1
+    validations:
+      required: true
+  - type: input
+    id: canonical_ref
+    attributes:
+      label: Canonical Ref
+      description: Stable authority reference for deduplication and callbacks.
+      placeholder: gh:wesleion/repository#123
+    validations:
+      required: true
+  - type: input
+    id: owner_profile
+    attributes:
+      label: Owner Profile
+      description: Exact profile name from the live Hermes roster.
+      placeholder: software-implementation-worker
+    validations:
+      required: true
+  - type: textarea
+    id: write_scope
+    attributes:
+      label: Write Scope
+      description: One approved repository-relative path per line. No absolute paths or traversal.
+      placeholder: |-
+        src/component
+        tests/component
+    validations:
+      required: true
+  - type: textarea
+    id: gate
+    attributes:
+      label: Gate
+      description: Approval or risk gate that authorizes this work.
+      placeholder: Gate B approved by <actor> on YYYY-MM-DD.
+    validations:
+      required: true
+  - type: textarea
+    id: acceptance
+    attributes:
+      label: Acceptance
+      description: Observable acceptance criteria; the Issue remains canonical.
+      placeholder: |-
+        - Expected result is observable.
+        - Protected state remains unchanged.
+    validations:
+      required: true
+  - type: textarea
+    id: verifier
+    attributes:
+      label: Verifier
+      description: Deterministic command or procedure that returns pass/fail.
+      placeholder: pytest tests/component -q
+    validations:
+      required: true
+  - type: input
+    id: target
+    attributes:
+      label: Target
+      description: Source/package/runtime target. State explicitly when no runtime promotion is included.
+      placeholder: source-only; no runtime promotion
+    validations:
+      required: true
+  - type: dropdown
+    id: risk
+    attributes:
+      label: Risk
+      options:
+        - R0
+        - R1
+        - R2
+        - R3
+    validations:
+      required: true
+  - type: input
+    id: contract_revision
+    attributes:
+      label: Contract Revision
+      description: Monotonic revision used to reject stale delivery events.
+      value: "1"
+    validations:
+      required: true
