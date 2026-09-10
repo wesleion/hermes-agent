@@ -26,7 +26,7 @@ def test_authenticated_telegram_callback_is_the_only_activation_boundary(tmp_pat
         contacts=[{"contact_id":r["contact_id"],"channel_id":list_contact_channels(r["contact_id"])[0]["channel_id"]} for r in rows]
         now=datetime.now(timezone.utc)
         preview=prepare_friends_envelope(campaign_id="friends",contacts=contacts,offer={},playbook={},issuer="telegram:7",starts_at=now.isoformat(),expires_at=(now+timedelta(minutes=10)).isoformat())
-        pending=persist_friends_pending(preview,profile_id="telegram",chat_id="42",thread_id="9",operator_id="7")
+        pending=persist_friends_pending(preview,profile_id=str(tmp_path),chat_id="42",thread_id="9",operator_id="7")
         adapter=type("FakeTelegram", (), {"name":"telegram", "_is_callback_user_authorized":lambda self,*_args,**_kwargs: True})()
         query=_Query(f"wppf:a:{pending['pending_id']}")
         asyncio.run(TelegramAdapter._handle_callback_query(adapter,type("Update",(),{"callback_query":query})(),None))

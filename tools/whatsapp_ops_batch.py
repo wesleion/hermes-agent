@@ -79,7 +79,9 @@ def _envelope_valid(envelope: Any) -> tuple[dict[str, Any] | None, str | None]:
 
 def prepare_friends_envelope(*, campaign_id: Any, contacts: Any, offer: Any, playbook: Any, issuer: Any, starts_at: Any, expires_at: Any, actions: Any=("offer",)) -> dict[str, Any]:
     if not isinstance(contacts, list): return {"ok":False,"error":"grant_contacts_exactly_three_required"}
-    normalized = [{"contact_id": row.get("contact_id", "").strip(), "channel_id": row.get("channel_id", "").strip()} if isinstance(row, dict) else row for row in contacts]
+    if any(not isinstance(row, dict) or not _valid_string(row.get("contact_id")) or not _valid_string(row.get("channel_id")) for row in contacts):
+        return {"ok": False, "error": "grant_contact_invalid"}
+    normalized = [{"contact_id": row["contact_id"].strip(), "channel_id": row["channel_id"].strip()} for row in contacts]
     starts, expires = _iso(starts_at), _iso(expires_at)
     envelope = {"schema":"friends_autonomous_v1","campaign_id":campaign_id.strip() if isinstance(campaign_id,str) else campaign_id,"contacts":normalized,"offer":offer,"playbook":playbook,"issuer":issuer.strip() if isinstance(issuer,str) else issuer,"actions":list(actions) if isinstance(actions,(list,tuple)) else actions,"starts_at":starts.isoformat() if starts else starts_at,"expires_at":expires.isoformat() if expires else expires_at,"caps":{"max_turns":_MAX_TURNS,"max_messages":_MAX_MESSAGES,"max_blocks":_MAX_BLOCKS,"global_cap":_GLOBAL_CAP},"revocation_version":0}
     _, error = _envelope_valid(envelope)
@@ -182,7 +184,7 @@ def freeze_friends_message_plan(grant_id: str, *, contact_id: Any, channel_id: A
         if action not in json.loads(grant["actions_json"]):return {"ok":False,"error":"action_not_granted"}
         if not _bound_contact_current(conn,grant,contact_id,channel_id):return {"ok":False,"error":"contact_binding_invalid"}
         if conn.execute("SELECT 1 FROM friends_suppressions WHERE contact_id=? AND channel_id=?",(contact_id,channel_id)).fetchone():return {"ok":False,"error":"contact_suppressed"}
-        replay=_digest({"action":action,"context_highwatermark":context_highwatermark,"grant_revision":grant["revocation_version"],"blocks_digest":digest})
+        replay=_digest({"contact_id":contact_id,"channel_id":channel_id,"action":action,"context_highwatermark":context_highwatermark,"grant_revision":grant["revocation_version"]})
         plan_id="friends_plan_"+uuid.uuid4().hex[:16]
         try:
             conn.execute("INSERT INTO friends_plans (plan_id,grant_id,contact_id,channel_id,action,offer_digest,context_highwatermark,blocks_digest,blocks_json,replay_key,status,created_at,updated_at) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)",(plan_id,grant_id,contact_id,channel_id,action,offer_digest,context_highwatermark,digest,_canonical(blocks),replay,"ready",now,now))
@@ -243,9 +245,10 @@ def reserve_friends_block(plan_id:str,fence:str)->dict[str,Any]:
                 elif conn.execute("SELECT 1 FROM friends_suppressions WHERE contact_id=? AND channel_id=?",(plan["contact_id"],plan["channel_id"])).fetchone():result={"ok":False,"error":"contact_suppressed"}
                 elif conn.execute("SELECT 1 FROM friends_blocks b JOIN friends_plans p ON p.plan_id=b.plan_id WHERE p.grant_id=? AND b.status='reserved' LIMIT 1",(plan["grant_id"],)).fetchone():result={"ok":False,"error":"grant_block_in_flight"}
                 else:
-                    usage=conn.execute("SELECT COUNT(*) AS messages,COALESCE(SUM(CASE WHEN turns_reserved=1 THEN 1 ELSE 0 END),0) AS turns FROM friends_plans WHERE grant_id=? AND contact_id=? AND channel_id=?",(plan["grant_id"],plan["contact_id"],plan["channel_id"])).fetchone()
+                    usage=conn.execute("SELECT COALESCE(SUM(messages_reserved),0) AS messages,COALESCE(SUM(turns_reserved),0) AS turns FROM friends_plans WHERE grant_id=? AND contact_id=? AND channel_id=?",(plan["grant_id"],plan["contact_id"],plan["channel_id"])).fetchone()
                     block=conn.execute("SELECT * FROM friends_blocks WHERE plan_id=? AND status='pending' ORDER BY block_index LIMIT 1",(plan_id,)).fetchone()
                     if block is None:result={"ok":False,"error":"plan_completed"}
+                    elif (plan["offer_digest"] != grant["offer_digest"] or _digest(json.loads(plan["blocks_json"])) != plan["blocks_digest"] or block["block_digest"] != _digest(block["text"]) or json.loads(plan["blocks_json"])[block["block_index"]-1] != block["text"]):result={"ok":False,"error":"plan_integrity_invalid"}
                     elif grant["messages_reserved"] >= grant["global_cap"] or usage["messages"] >= grant["max_messages"]:result={"ok":False,"error":"message_cap_reached"}
                     elif plan["turns_reserved"] == 0 and usage["turns"] >= grant["max_turns"]:result={"ok":False,"error":"turn_cap_reached"}
                     else:
@@ -272,6 +275,8 @@ def finish_friends_block(plan_id:str,reservation_id:str,*,outcome:str,receipt:An
                 elif status=="failed": conn.execute("UPDATE friends_plans SET status='paused',updated_at=? WHERE plan_id=? AND status NOT IN ('cancelled','completed')",(now,plan_id));plan_state="failed"
                 else:
                     pending=conn.execute("SELECT 1 FROM friends_blocks WHERE plan_id=? AND status='pending'",(plan_id,)).fetchone();desired="sending" if pending else "completed";conn.execute("UPDATE friends_plans SET status=?,updated_at=? WHERE plan_id=? AND status='sending'",(desired,now,plan_id));plan_state="sent"
+                if status != "sent" or not pending:
+                    conn.execute("DELETE FROM friends_conversation_leases WHERE plan_id=?", (plan_id,))
                 result={"ok":True,"status":status,"plan_id":plan_id,"plan_state":plan_state}
             conn.commit();return result
         except BaseException:conn.rollback();raise

@@ -7495,12 +7495,14 @@ class TelegramAdapter(BasePlatformAdapter):
             try:
                 from gateway.whatsapp_ops_batch_approval import issue_authenticated_friends_authority
                 from tools.whatsapp_ops_batch import activate_friends_pending, friends_pending_binding
+                from hermes_constants import get_hermes_home
+                profile_id = str(get_hermes_home().resolve())
                 pending = friends_pending_binding(parts[2])
-                if not pending or pending.get("profile_id") != self.name:
+                if not pending or pending.get("profile_id") != profile_id:
                     await query.answer(text="Friends grant is no longer available.")
                     return
                 authority = issue_authenticated_friends_authority(
-                    profile_id=self.name, chat_id=str(query_chat_id or ""),
+                    profile_id=profile_id, chat_id=str(query_chat_id or ""),
                     thread_id=str(query_thread_id or ""), operator_id=caller_id,
                     pending_id=parts[2], envelope_digest=str(pending["envelope_digest"]),
                 )
