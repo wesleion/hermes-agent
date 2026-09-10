@@ -362,6 +362,90 @@ def test_inbound_transaction_rolls_back_if_queue_insert_fails(pilot, monkeypatch
         ).fetchone()
 
 
+def test_status_reports_whatsapp_receipts_and_exception_delivery_is_once(pilot):
+    from hermes_cli.whatsapp_ops_batch_commands import (
+        friends_pilot_status,
+        select_current_grant,
+    )
+    from gateway.whatsapp_ops_friends_notifications import drain_friends_exceptions
+
+    p = pilot
+    p["dispatcher"]().run_once()
+    status = friends_pilot_status()
+    assert status["counts"]["sent"] == 3 and len(status["conversations"]) == 3
+    assert select_current_grant() == p["grant"]["grant_id"]
+    p["inbound"](0, "pare", "stop-notify")
+    posted = []
+
+    class Response:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *args):
+            pass
+
+        def read(self):
+            return b'{"ok":true,"result":{"message_id":123}}'
+
+    def send(request, timeout):
+        posted.append(json.loads(request.data))
+        return Response()
+
+    assert drain_friends_exceptions(p["profile"], client=send, token="fixture") == 1
+    assert drain_friends_exceptions(p["profile"], client=send, token="fixture") == 0
+    assert len(posted) == 1 and "551188" not in json.dumps(posted)
+    assert posted[0]["chat_id"] == "42" and "actor-0" in posted[0]["text"]
+
+
+def test_temp_process_restart_uses_persisted_queue_without_reopening(pilot):
+    import os
+    import subprocess
+    import sys
+    from hermes_constants import get_hermes_home
+
+    p = pilot
+    p["dispatcher"]().run_once()
+    p["inbound"](0, "Preciso de briefing", "restart-queue")
+    p["now"][0] += timedelta(seconds=5)
+    script = """
+import json, os
+from datetime import datetime
+from tools import whatsapp_ops_batch as b
+from gateway.whatsapp_ops_batch_dispatch import FriendsBatchDispatcher
+now=datetime.fromisoformat(os.environ['FIXTURE_NOW'])
+b._now=lambda:now
+class Generator:
+ def generate(self,**kw):
+  assert any('briefing' in x['text'] for x in kw['messages'])
+  return dict(stage='discovery',qualification={},action='brief',blocks=['Vamos organizar seu briefing.'],next_step='operador',escalation=False)
+calls=[]
+d=FriendsBatchDispatcher(generator=Generator(),enabled=lambda:True,clock=lambda:now,send_client=lambda p,c:calls.append(p) or {'ok':True,'message_id_hash':'restart-receipt'},send_config={'send_enabled':True,'kill_switch':False,'friends_pilot':{'enabled':True},'quepasa':{'send_enabled':True}})
+print(json.dumps({'processed':d.run_once(),'calls':len(calls)}))
+"""
+    env = dict(
+        os.environ,
+        HERMES_HOME=str(get_hermes_home()),
+        FIXTURE_NOW=p["now"][0].isoformat(),
+    )
+    result = subprocess.run(
+        [sys.executable, "-c", script],
+        env=env,
+        text=True,
+        capture_output=True,
+        timeout=20,
+    )
+    assert result.returncode == 0, result.stderr
+    assert json.loads(result.stdout.splitlines()[-1]) == {"processed": 1, "calls": 1}
+    with batch._conn() as conn:
+        assert (
+            conn.execute(
+                "SELECT count(*) FROM friends_blocks WHERE status='sent'"
+            ).fetchone()[0]
+            == 4
+        )
+    assert p["dispatcher"]().run_once() == 0
+
+
 @pytest.mark.asyncio
 async def test_real_webhook_ack_and_lifecycle_use_current_profile_without_generic_dispatch(
     pilot, monkeypatch

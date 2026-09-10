@@ -341,6 +341,12 @@ class FriendsBatchDispatcher:
     async def serve(self) -> None:
         while not self._stop.is_set():
             await asyncio.to_thread(self.run_once)
+            if self.enabled() and not self._stop.is_set():
+                from gateway.whatsapp_ops_friends_notifications import (
+                    drain_friends_operator_events,
+                )
+
+                await asyncio.to_thread(drain_friends_operator_events, self.profile_id)
             await asyncio.to_thread(self._stop.wait, 0.5)
 
     def stop(self) -> None:
