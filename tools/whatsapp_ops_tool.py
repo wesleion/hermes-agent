@@ -1069,7 +1069,9 @@ def _provider_receipt(result: dict[str, Any]) -> str:
     """Accept only a provider-correlatable confirmation, never ``ok`` alone."""
     if not isinstance(result, dict):
         return ""
-    for key in ("message_id", "receipt_id", "id"):
+    # QuePasa deliberately redacts provider identifiers in its real client
+    # response.  The stable message_id_hash is the correlatable receipt.
+    for key in ("message_id_hash", "receipt_hash", "message_id", "receipt_id", "id"):
         value = result.get(key)
         if isinstance(value, str) and value.strip():
             return value.strip()[:500]
@@ -1104,8 +1106,10 @@ def _send_friends_batch_block(plan_id: str, fence: str, cfg: dict[str, Any],
     if bool(provider.get("ok")) and receipt:
         completed = finish_friends_block(plan_id, reserved["reservation_id"], outcome="sent", receipt=receipt)
         return {"ok": bool(completed.get("ok")), "plan_id": plan_id, "block_index": block["index"], "status": completed.get("status")}
-    finish_friends_block(plan_id, reserved["reservation_id"], outcome="failed" if not bool(provider.get("ok")) else "uncertain")
-    return {"ok": False, "plan_id": plan_id, "block_index": block["index"], "reasons": ["provider_failed" if not bool(provider.get("ok")) else "provider_receipt_missing"]}
+    # A non-confirmation cannot prove that QuePasa did not accept the send;
+    # preserve the block as uncertain and pause the grant rather than retrying.
+    finish_friends_block(plan_id, reserved["reservation_id"], outcome="uncertain")
+    return {"ok": False, "plan_id": plan_id, "block_index": block["index"], "reasons": ["provider_uncertain" if not bool(provider.get("ok")) else "provider_receipt_missing"]}
 
 
 def wpp_send_approved(

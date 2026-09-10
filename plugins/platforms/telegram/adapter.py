@@ -7475,6 +7475,49 @@ class TelegramAdapter(BasePlatformAdapter):
             )
             return
 
+        # --- Friends pilot grant callbacks (wppf:a|d:pending_id) ---
+        # This is intentionally a separate, authenticated boundary from draft
+        # approvals: the model never receives an authority token or this path.
+        if data.startswith("wppf:"):
+            parts = data.split(":", 2)
+            if len(parts) != 3 or parts[1] not in {"a", "d"} or not parts[2]:
+                await query.answer(text="Invalid friends grant approval data.")
+                return
+            caller_id = str(getattr(query.from_user, "id", ""))
+            if not self._is_callback_user_authorized(
+                caller_id, chat_id=query_chat_id,
+                chat_type=str(query_chat_type) if query_chat_type is not None else None,
+                thread_id=str(query_thread_id) if query_thread_id is not None else None,
+                user_name=query_user_name,
+            ):
+                await query.answer(text="⛔ You are not authorized to approve this grant.")
+                return
+            try:
+                from gateway.whatsapp_ops_batch_approval import issue_authenticated_friends_authority
+                from tools.whatsapp_ops_batch import activate_friends_pending, friends_pending_binding
+                pending = friends_pending_binding(parts[2])
+                if not pending or pending.get("profile_id") != self.name:
+                    await query.answer(text="Friends grant is no longer available.")
+                    return
+                authority = issue_authenticated_friends_authority(
+                    profile_id=self.name, chat_id=str(query_chat_id or ""),
+                    thread_id=str(query_thread_id or ""), operator_id=caller_id,
+                    pending_id=parts[2], envelope_digest=str(pending["envelope_digest"]),
+                )
+                resolved = activate_friends_pending(
+                    parts[2], decision="approved" if parts[1] == "a" else "denied", authority=authority,
+                )
+            except Exception:
+                logger.error("[%s] friends grant callback failed", self.name, exc_info=True)
+                await query.answer(text="Friends grant approval failed.")
+                return
+            await query.answer(text="Friends grant approved." if resolved.get("ok") and parts[1] == "a" else "Friends grant denied.")
+            try:
+                await query.edit_message_reply_markup(reply_markup=None)
+            except Exception:
+                logger.debug("Failed to clear friends grant controls", exc_info=True)
+            return
+
         # --- WhatsApp Ops approval callbacks (wpp:a|d|e:approval_id) ---
         if data.startswith("wpp:"):
             parts = data.split(":", 2)

@@ -150,8 +150,10 @@ def evaluate_friends_batch_guardrails(*, config: dict[str, Any], contact_authori
     quepasa = cfg.get("quepasa") if isinstance(cfg.get("quepasa"), dict) else {}
     friends = cfg.get("friends_pilot") if isinstance(cfg.get("friends_pilot"), dict) else {}
     reasons: list[str] = []
+    # Exact booleans are a safety boundary: strings, ints, null and omissions
+    # must never become a send permit (including kill_switch='true').
     if cfg.get("send_enabled") is not True: reasons.append("send_disabled")
-    if cfg.get("kill_switch") is True: reasons.append("kill_switch_active")
+    if cfg.get("kill_switch") is not False: reasons.append("kill_switch_active")
     if quepasa.get("send_enabled") is not True: reasons.append("quepasa_send_disabled")
     if friends.get("enabled") is not True: reasons.append("friends_pilot_disabled")
     if not contact_authorized: reasons.append("target_not_whitelisted")
