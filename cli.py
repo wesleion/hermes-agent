@@ -12874,6 +12874,12 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
             self._show_billing(cmd_original)
         elif canonical == "insights":
             self._show_insights(cmd_original)
+        elif canonical == "ctxwpp":
+            parts = cmd_original.split(None, 1)
+            arg = parts[1].strip() if len(parts) > 1 else ""
+            from hermes_cli.whatsapp_ops_commands import render_thread_context_command
+
+            self._console_print(render_thread_context_command(arg))
         elif canonical == "copy":
             self._handle_copy_command(cmd_original)
         elif canonical == "debug":
@@ -13097,6 +13103,11 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
                     exec_cmd = qcmd.get("command", "")
                     if exec_cmd:
                         try:
+                            if qcmd.get("pass_args"):
+                                import shlex
+                                user_args = cmd_original[len(base_cmd):].strip()
+                                if user_args:
+                                    exec_cmd = f"{exec_cmd} {shlex.quote(user_args)}"
                             # shell=True is intentional: quick_commands are user-defined
                             # shell snippets from config.yaml — not agent/LLM controlled.
                             # Sanitize env to prevent credential leakage —

@@ -398,6 +398,52 @@ COMMAND_REGISTRY: list[CommandDef] = [
                cli_only=True, aliases=("gateway",), desktop="terminal"),
     CommandDef("platform", "Pause, resume, or list a failing gateway platform", "Info",
                gateway_only=True, args_hint="<pause|resume|list> [name]"),
+    CommandDef("wpp", "Hunter WPP: cockpit e ajuda tática",
+               "WhatsApp Ops", cli_only=True,
+               gateway_config_gate="whatsapp_ops.slash_commands_enabled"),
+    CommandDef("fila", "Hunter WPP: fila acionável",
+               "WhatsApp Ops", cli_only=True,
+               aliases=("wpp_register_staging_status",),
+               gateway_config_gate="whatsapp_ops.slash_commands_enabled"),
+    CommandDef("modo", "Hunter WPP: modo operacional/autonomia",
+               "WhatsApp Ops", cli_only=True,
+               args_hint="[status|manual|copiloto|comercial|autonomo]",
+               subcommands=("status", "manual", "copiloto", "comercial", "autonomo"),
+               gateway_config_gate="whatsapp_ops.slash_commands_enabled"),
+    CommandDef("crm", "Hunter CRM: workbook Google Sheets",
+               "WhatsApp Ops", cli_only=True,
+               args_hint="[status|check|map|pipeline|next|projeto]",
+               subcommands=("status", "check", "map", "schema", "pipeline", "next", "projeto", "help"),
+               gateway_config_gate="whatsapp_ops.slash_commands_enabled"),
+    CommandDef("ctxwpp", "Hunter WPP: contexto local seguro",
+               "WhatsApp Ops", cli_only=True, args_hint="[alvo|item N|limite]",
+               aliases=("wpp_thread_context",),
+               gateway_config_gate="whatsapp_ops.slash_commands_enabled"),
+    CommandDef("sumwpp", "Hunter WPP: resumo local determinístico",
+               "WhatsApp Ops", cli_only=True, args_hint="[alvo|item N|limite]",
+               aliases=("wpp_conversation_summary",),
+               gateway_config_gate="whatsapp_ops.slash_commands_enabled"),
+    CommandDef("missao", "Hunter WPP: cockpit de missão comercial",
+               "WhatsApp Ops", cli_only=True, args_hint="[ajuda|revisar <alvo>|atacar base fria]",
+               aliases=("mission",),
+               subcommands=("ajuda", "revisar", "atacar", "radar"),
+               gateway_config_gate="whatsapp_ops.slash_commands_enabled"),
+    CommandDef("addct", "Hunter WPP: cadastrar contato",
+               "WhatsApp Ops", cli_only=True, args_hint="<nome> --item N | <nome> | ref",
+               aliases=("wpp_register_contact",),
+               gateway_config_gate="whatsapp_ops.slash_commands_enabled"),
+    CommandDef("addgp", "Hunter WPP: cadastrar grupo existente",
+               "WhatsApp Ops", cli_only=True, args_hint="<nome> --item N | <nome> | ref",
+               aliases=("wpp_register_group",),
+               gateway_config_gate="whatsapp_ops.slash_commands_enabled"),
+    CommandDef("ignorar", "Hunter WPP: ignorar item da fila",
+               "WhatsApp Ops", cli_only=True, args_hint="<item>",
+               aliases=("ignore", "wpp_ignore_staging_item"),
+               gateway_config_gate="whatsapp_ops.slash_commands_enabled"),
+    CommandDef("crgp", "Hunter WPP: preparar grupo com aprovação",
+               "WhatsApp Ops", cli_only=True, args_hint="<nome> [| membros]",
+               busy_policy="dispatch",
+               gateway_config_gate="whatsapp_ops.slash_commands_enabled"),
     CommandDef("copy", "Copy the last assistant response to clipboard", "Info",
                cli_only=True, args_hint="[number]", desktop="terminal"),
     CommandDef("paste", "Attach clipboard image from your clipboard", "Info",
@@ -615,23 +661,17 @@ def should_bypass_active_session(command_name: str | None) -> bool:
     return resolve_command(command_name) is not None if command_name else False
 
 
-def _resolve_config_gates() -> set[str]:
-    """Return canonical names of commands whose ``gateway_config_gate`` is truthy.
+def _resolve_config_gates_from_config(cfg: dict[str, Any] | None) -> set[str]:
+    """Resolve config-gated command names from an already loaded config.
 
-    Reads ``config.yaml`` and walks the dot-separated key path for each
-    config-gated command.  Returns an empty set on any error so callers
-    degrade gracefully.
+    Keeping this traversal pure lets gateway/TUI surfaces share the registry
+    semantics without re-reading global config, and makes injected configs
+    deterministic in tests.
     """
-    gated = [c for c in COMMAND_REGISTRY if c.gateway_config_gate]
-    if not gated:
-        return set()
-    try:
-        from hermes_cli.config import read_raw_config
-        cfg = read_raw_config()
-    except Exception:
-        return set()
     result: set[str] = set()
-    for cmd in gated:
+    for cmd in COMMAND_REGISTRY:
+        if not cmd.gateway_config_gate:
+            continue
         val: Any = cfg
         for key in cmd.gateway_config_gate.split("."):
             if isinstance(val, dict):
@@ -642,6 +682,42 @@ def _resolve_config_gates() -> set[str]:
         if is_truthy_value(val, default=False):
             result.add(cmd.name)
     return result
+
+
+def _resolve_config_gates() -> set[str]:
+    """Return canonical names of commands whose config gate is truthy.
+
+    Reads ``config.yaml`` once and delegates traversal to the pure resolver.
+    Returns an empty set on read errors so callers degrade gracefully.
+    """
+    if not any(c.gateway_config_gate for c in COMMAND_REGISTRY):
+        return set()
+    try:
+        from hermes_cli.config import read_raw_config
+        cfg = read_raw_config()
+    except Exception:
+        return set()
+    return _resolve_config_gates_from_config(cfg)
+
+
+def is_config_gated_command_enabled(
+    name: str,
+    cfg: dict[str, Any] | None = None,
+) -> bool:
+    """Return whether *name* may execute under its gateway config gate.
+
+    Unknown and ungated commands remain executable. Config-gated commands
+    fail closed when their key is absent, false, or unreadable.
+    """
+    cmd = resolve_command(name)
+    if cmd is None or not getattr(cmd, "gateway_config_gate", None):
+        return True
+    enabled = (
+        _resolve_config_gates_from_config(cfg)
+        if cfg is not None
+        else _resolve_config_gates()
+    )
+    return cmd.name in enabled
 
 
 def _is_gateway_available(cmd: CommandDef, config_overrides: set[str] | None = None) -> bool:
@@ -768,6 +844,17 @@ _TELEGRAM_MENU_PRIORITY = (
     "stop",
     "status",
     "egress",
+    # Profile-gated WhatsApp Ops cockpit commands — only surface when enabled.
+    "wpp",
+    "fila",
+    "modo",
+    "crm",
+    "ctxwpp",
+    "sumwpp",
+    "missao",
+    "addct",
+    "addgp",
+    "crgp",
     "resume",
     "sessions",
     "model",

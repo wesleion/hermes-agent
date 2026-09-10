@@ -39,6 +39,37 @@ def _redact_telegram_error_text(error: object) -> str:
         return "<telegram error redacted>"
 
 
+def _whatsapp_approval_effect_summary(execution: dict[str, Any]) -> str:
+    """Render enumerated WhatsApp/CRM outcomes without echoing payload data."""
+    if execution.get("ok") is not True:
+        reasons = execution.get("reasons") or []
+        if not reasons and isinstance(execution.get("send_result"), dict):
+            reasons = [execution["send_result"].get("error") or "execution_failed"]
+        allowed = {
+            "approval_required",
+            "idempotency_duplicate",
+            "kill_switch_active",
+            "quepasa_send_disabled",
+            "send_disabled",
+            "target_not_whitelisted",
+            "target_ref_unresolved",
+        }
+        safe = [str(reason) for reason in reasons if str(reason) in allowed]
+        return "WhatsApp: NÃO enviado. Bloqueio: " + (", ".join(safe) or "execution_blocked") + ". CRM: não executado."
+
+    crm = execution.get("crm") if isinstance(execution.get("crm"), dict) else {}
+    crm_result = str(crm.get("result") or "not_attempted")
+    if execution.get("crm_write_performed") is True and crm_result == "appended":
+        crm_text = "CRM: interação registrada em Interacoes e read-back confirmado."
+    elif crm_result == "failed_unknown":
+        crm_text = "CRM: registro não confirmado; sem retry automático."
+    elif crm_result == "idempotent_replay":
+        crm_text = "CRM: interação já registrada; nenhuma duplicação."
+    else:
+        crm_text = "CRM: não registrado."
+    return "WhatsApp: enviado via QuePasa/direct. " + crm_text
+
+
 def _scoped_gate_env(name: str, default: str = "") -> str:
     """Read a TELEGRAM_*/GATEWAY_* authorization gate env var per-profile.
 
@@ -867,6 +898,12 @@ class TelegramAdapter(BasePlatformAdapter):
         self._choice_picker_state: Dict[str, dict] = {}
         # Approval button state: message_id → session_key
         self._approval_state: Dict[int, str] = {}
+        # WhatsApp Ops approval-card Edit state: message_id → pending edit context
+        # (draft_id, approval_id, chat_id, thread_id). Populated when the
+        # operator taps "✏️ Editar"; consumed when they reply to that same
+        # card message with the revised text. Never persisted — memory only,
+        # cleared on resolution or gateway restart (operator can re-tap Edit).
+        self._wpp_pending_edit: Dict[int, dict] = {}
         # Slash-confirm button state: confirm_id → session_key (for /reload-mcp
         # and any other slash-confirm prompts; see GatewayRunner._request_slash_confirm).
         self._slash_confirm_state: Dict[str, str] = {}
@@ -7438,6 +7475,148 @@ class TelegramAdapter(BasePlatformAdapter):
             )
             return
 
+        # --- WhatsApp Ops approval callbacks (wpp:a|d|e:approval_id) ---
+        if data.startswith("wpp:"):
+            parts = data.split(":", 2)
+            if len(parts) != 3 or parts[1] not in {"a", "d", "e"} or not parts[2]:
+                await query.answer(text="Invalid WhatsApp approval data.")
+                return
+
+            caller_id = str(getattr(query.from_user, "id", ""))
+            if not self._is_callback_user_authorized(
+                caller_id,
+                chat_id=query_chat_id,
+                chat_type=str(query_chat_type) if query_chat_type is not None else None,
+                thread_id=str(query_thread_id) if query_thread_id is not None else None,
+                user_name=query_user_name,
+            ):
+                await query.answer(text="⛔ You are not authorized to approve WhatsApp drafts.")
+                return
+
+            approval_id = parts[2]
+
+            # --- Edit branch: request revision without approving/sending ---
+            if parts[1] == "e":
+                try:
+                    from tools.whatsapp_ops_store import resolve_approval as _resolve_wpp_approval
+
+                    resolved = _resolve_wpp_approval(
+                        approval_id,
+                        decision="edit_requested",
+                        approver_ref=f"telegram:{caller_id}",
+                    )
+                except Exception as exc:
+                    logger.error("[%s] WhatsApp edit-request callback failed: %s", self.name, exc, exc_info=True)
+                    await query.answer(text="Failed to request WhatsApp draft edit.")
+                    return
+                if not resolved.get("ok"):
+                    error = str(resolved.get("error") or "Edit request not resolved")
+                    await query.answer(text=error[:80])
+                    if error in {"approval_not_pending", "approval_not_found"}:
+                        try:
+                            await query.edit_message_reply_markup(reply_markup=None)
+                        except Exception:
+                            logger.warning("Failed to remove stale WhatsApp approval controls", exc_info=True)
+                    return
+                await query.answer(text="✏️ Edição solicitada")
+                draft_id = str(resolved.get("draft_id", ""))
+                card_message = getattr(query, "message", None)
+                card_message_id = getattr(card_message, "message_id", None)
+                if card_message_id is not None:
+                    self._wpp_pending_edit[int(card_message_id)] = {
+                        "draft_id": draft_id,
+                        "approval_id": approval_id,
+                        "chat_id": query_chat_id,
+                        "thread_id": query_thread_id,
+                        "user_id": caller_id,
+                    }
+                try:
+                    await query.edit_message_text(
+                        text=(
+                            "✏️ <b>Edição solicitada</b>\n\n"
+                            f"Draft: <code>{_html.escape(draft_id)}</code>\n\n"
+                            "Responda esta mensagem (reply) com o novo texto. "
+                            "Nada será enviado até você aprovar o novo card."
+                        ),
+                        parse_mode=ParseMode.HTML,
+                        reply_markup=None,
+                    )
+                except Exception:
+                    logger.warning("WhatsApp edit-request card edit failed", exc_info=True)
+                return
+
+            if parts[1] not in {"a", "d"}:
+                await query.answer(text="Invalid WhatsApp approval data.")
+                return
+
+            decision = "approved" if parts[1] == "a" else "denied"
+            user_display = getattr(query.from_user, "first_name", "User")
+            try:
+                from tools.whatsapp_ops_store import resolve_approval as _resolve_wpp_approval
+
+                resolved = _resolve_wpp_approval(
+                    approval_id,
+                    decision=decision,
+                    approver_ref=f"telegram:{caller_id}",
+                )
+            except Exception as exc:
+                logger.error("[%s] WhatsApp approval callback failed: %s", self.name, exc, exc_info=True)
+                await query.answer(text="Failed to resolve WhatsApp approval.")
+                return
+
+            if not resolved.get("ok"):
+                error = str(resolved.get("error") or "Approval not resolved")
+                await query.answer(text=error[:80])
+                if error in {"approval_not_pending", "approval_not_found"}:
+                    try:
+                        await query.edit_message_reply_markup(reply_markup=None)
+                    except Exception:
+                        logger.warning(
+                            "Failed to remove stale WhatsApp approval controls",
+                            exc_info=True,
+                        )
+                return
+
+            label = "✅ WhatsApp draft approved" if decision == "approved" else "❌ WhatsApp draft denied"
+            await query.answer(text=label)
+            try:
+                draft_id = str(resolved.get("draft_id", ""))
+                followup = "Envio não foi solicitado."
+                if decision == "approved" and draft_id:
+                    try:
+                        from tools.whatsapp_ops_tool import wpp_send_approved as _wpp_send_approved
+
+                        execution = json.loads(_wpp_send_approved(draft_id))
+                        followup = _whatsapp_approval_effect_summary(execution)
+                    except Exception as exc:
+                        logger.error("[%s] WhatsApp approved send callback failed: %s", self.name, exc, exc_info=True)
+                        followup = "Aprovação registrada, mas o envio NÃO executou por erro interno."
+                elif decision != "approved":
+                    followup = "Envio negado; nada foi disparado."
+                await query.edit_message_text(
+                    text=(
+                        f"{label} by {_html.escape(str(user_display))}\n"
+                        f"Draft: <code>{_html.escape(draft_id)}</code>\n"
+                        f"{_html.escape(followup)}"
+                    ),
+                    parse_mode=ParseMode.HTML,
+                    reply_markup=None,
+                )
+            except Exception:
+                logger.warning(
+                    "WhatsApp approval completed but status-card edit failed; "
+                    "attempting to remove stale controls",
+                    exc_info=True,
+                )
+                try:
+                    await query.edit_message_reply_markup(reply_markup=None)
+                except Exception:
+                    logger.warning(
+                        "Failed to remove stale WhatsApp approval controls",
+                        exc_info=True,
+                    )
+            return
+
         # --- Exec approval callbacks (ea:choice:id) ---
         if data.startswith("ea:"):
             parts = data.split(":", 2)
@@ -9913,6 +10092,71 @@ class TelegramAdapter(BasePlatformAdapter):
         """
         return getattr(update, "effective_message", None) or getattr(update, "message", None)
 
+    async def _resolve_wpp_edit_reply(self, msg: Any, pending: dict, new_text: str) -> bool:
+        """Apply an operator's edit reply to a WhatsApp Ops draft.
+
+        Updates the draft message text (creating a fresh idempotent draft
+        row, since drafts are immutable-by-hash once approved/edited), then
+        issues a brand new approval card. Never sends, never auto-approves.
+
+        Returns True only when the new draft + approval card were both
+        created successfully — the caller keeps the pending-edit context
+        (so the operator can retry) whenever this returns False.
+        """
+        draft_id = str(pending.get("draft_id") or "")
+        try:
+            from tools.whatsapp_ops_store import get_draft as _get_wpp_draft
+            from tools.whatsapp_ops_tool import wpp_create_draft as _wpp_create_draft
+            from tools.whatsapp_ops_tool import wpp_request_approval as _wpp_request_approval
+
+            old_draft = _get_wpp_draft(draft_id)
+            if old_draft is None:
+                await self._send_message_with_thread_fallback(
+                    chat_id=pending.get("chat_id"),
+                    text="Draft original não encontrado — a edição não pôde ser aplicada.",
+                    message_thread_id=pending.get("thread_id"),
+                )
+                return False
+            targets = json.loads(str(old_draft.get("targets_json") or "[]"))
+            media = None
+            media_json = old_draft.get("media_json")
+            if media_json:
+                try:
+                    media = json.loads(str(media_json))
+                except Exception:
+                    media = None
+            create_result = json.loads(
+                _wpp_create_draft(targets=targets, message=new_text, media=media)
+            )
+            if not create_result.get("ok"):
+                await self._send_message_with_thread_fallback(
+                    chat_id=pending.get("chat_id"),
+                    text=f"Falha ao criar novo draft revisado: {create_result.get('error', 'erro desconhecido')}",
+                    message_thread_id=pending.get("thread_id"),
+                )
+                return False
+            new_draft_id = str(create_result.get("draft_id", ""))
+            approval_result = json.loads(_wpp_request_approval(new_draft_id))
+            if not approval_result.get("ok"):
+                await self._send_message_with_thread_fallback(
+                    chat_id=pending.get("chat_id"),
+                    text=(
+                        f"Draft revisado criado (<code>{_html.escape(new_draft_id)}</code>), "
+                        "mas o novo card de aprovação falhou ao ser enviado."
+                    ),
+                    message_thread_id=pending.get("thread_id"),
+                )
+                return False
+            return True
+        except Exception as exc:
+            logger.error("[%s] WhatsApp edit-reply resolution failed: %s", self.name, exc, exc_info=True)
+            await self._send_message_with_thread_fallback(
+                chat_id=pending.get("chat_id"),
+                text="Erro interno ao aplicar a edição do draft.",
+                message_thread_id=pending.get("thread_id"),
+            )
+            return False
+
     async def _handle_text_message(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         """Handle incoming text messages.
 
@@ -9938,6 +10182,33 @@ class TelegramAdapter(BasePlatformAdapter):
             if self._should_observe_unmentioned_group_message(msg):
                 self._observe_unmentioned_group_message(msg, MessageType.TEXT, update_id=update.update_id)
             return
+
+        # WhatsApp Ops edit-context reply: if the operator replies directly to
+        # a card we put into "edit requested" state, consume it here instead
+        # of routing through the normal agent turn. This never approves or
+        # sends — it only updates the draft message and re-issues a fresh
+        # approval card. See self._wpp_pending_edit population in the
+        # wpp:e callback handler above.
+        reply_target = getattr(msg, "reply_to_message", None)
+        reply_target_id = getattr(reply_target, "message_id", None)
+        if reply_target_id is not None and int(reply_target_id) in self._wpp_pending_edit:
+            pending = self._wpp_pending_edit[int(reply_target_id)]
+            caller_id = str(getattr(getattr(msg, "from_user", None), "id", ""))
+            reply_chat_id = str(getattr(getattr(msg, "chat", None), "id", ""))
+            if (
+                str(pending.get("user_id") or "") == caller_id
+                and str(pending.get("chat_id") or "") == reply_chat_id
+            ):
+                new_text = str(msg.text or "").strip()
+                if new_text:
+                    resolved_ok = await self._resolve_wpp_edit_reply(msg, pending, new_text)
+                    if resolved_ok:
+                        self._wpp_pending_edit.pop(int(reply_target_id), None)
+                    return
+                # Empty text (e.g. sticker/photo reply) — keep the context so
+                # the operator can retry with a real reply, and fall through
+                # to normal handling instead of silently dropping.
+
         await self._ensure_forum_commands(update.message)
 
         event = self._build_message_event(msg, MessageType.TEXT, update_id=update.update_id)

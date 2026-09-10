@@ -234,6 +234,28 @@ async def test_admin_runs_quick_command_when_gating_enabled():
     assert result == "quick-command-admin"
 
 
+@pytest.mark.asyncio
+async def test_registry_known_hunter_quick_command_still_executes():
+    """Profile-gated Hunter commands are in COMMAND_REGISTRY for menu UX, but
+    the gateway must still route them to quick_commands exec when configured.
+    """
+    runner = _make_runner(
+        platform_extra={
+            "allow_admin_from": ["111"],
+            "user_allowed_commands": [],
+        }
+    )
+    runner.config.quick_commands = {
+        "fila": {"type": "exec", "command": "printf hunter-fila-ok"}
+    }
+
+    result = await runner._handle_message(
+        _make_event("/fila", _make_source(user_id="111"))
+    )
+
+    assert result == "hunter-fila-ok"
+
+
 # ---------------------------------------------------------------------------
 # Running-agent fast-path gating — admin/user split must hold even when an
 # agent is already running. The fast-path block in _handle_message dispatches

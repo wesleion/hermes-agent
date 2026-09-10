@@ -200,6 +200,15 @@ class TestToolsetConsistency:
             assert "includes" in ts, f"{name} missing includes"
 
 
+    def test_whatsapp_ops_does_not_expose_direct_crm_sink(self):
+        """CRM append remains an internal post-send hook, never model-callable."""
+        exposed = [
+            tool
+            for tool in TOOLSETS["whatsapp_ops"]["tools"]
+            if "crm" in tool.lower()
+        ]
+        assert exposed == []
+
     def test_hermes_platforms_share_core_tools(self):
         """All hermes-* platform toolsets share the same core tools.
 

@@ -1,0 +1,6913 @@
+"""SQLite persistence for the WhatsApp Ops toolset.
+
+All paths are profile-safe via ``get_hermes_home()``.  This module stores only
+operational state; callers are responsible for avoiding raw PII in logs.
+"""
+
+from __future__ import annotations
+
+import hashlib
+import json
+import os
+import re
+import secrets
+import sqlite3
+import uuid
+from datetime import datetime, timedelta, timezone
+from pathlib import Path
+from typing import Any
+from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
+
+from hermes_constants import get_hermes_home
+from tools.whatsapp_ops_sales import is_opaque_ref
+
+try:
+    import yaml
+except Exception:  # pragma: no cover - PyYAML is normally available in Hermes
+    yaml = None  # type: ignore[assignment]
+
+DB_FILENAME = "wpp_ops.sqlite"
+
+# Raw refs staged for registration are purged after this age.
+_STAGING_TTL = timedelta(minutes=5)
+_STAGING_TTL_MIN_SECONDS = 60
+_STAGING_TTL_MAX_SECONDS = 7 * 24 * 60 * 60
+_CRM_BINDING_ID_RE = re.compile(r"^[A-Za-z][A-Za-z0-9_.:-]{0,39}$")
+_MISSION_DIGEST_RE = re.compile(r"^[0-9a-f]{64}$")
+_MISSION_MODES = frozenset({"assist", "safe_auto"})
+_AUTONOMY_RESULT_CLASSES = frozenset(
+    {"success", "no_op", "policy_blocked", "safe_failure"}
+)
+_MISSION_MAX_ITEMS = 50
+_MISSION_MAX_LOCAL_WRITES = 5
+_AUTONOMY_MIN_LEASE_SECONDS = 30
+_AUTONOMY_MAX_LEASE_SECONDS = 3600
+_CAMPAIGN_SCHEMA = "wpp-campaign-manifest/v1"
+_CAMPAIGN_DIGEST_RE = re.compile(r"^[0-9a-f]{64}$")
+# The D1 ledger remains reusable for generic campaigns and therefore accepts
+# ``cold``. The Cash-Ready bridge is intentionally narrower and rejects cold
+# before registration, allowing only known/warm/reactivation.
+_CAMPAIGN_CLASSIFICATIONS = frozenset({"cold", "known", "warm", "reactivation"})
+_CAMPAIGN_KNOWN_CLASSIFICATION_MIGRATION = "campaign_items_known_classification_v1"
+_CAMPAIGN_SUPPRESSION_REASONS = frozenset(
+    {"opt_out", "inbound_after_approval", "manual_required", "channel_revoked"}
+)
+_CAMPAIGN_MIN_LEASE_SECONDS = 30
+_CAMPAIGN_MAX_LEASE_SECONDS = 3600
+_CAMPAIGN_TRANSITIONS = {
+    "queued": frozenset({"pending_approval", "blocked", "failed", "killed"}),
+    "pending_approval": frozenset({"approved", "blocked", "failed", "killed"}),
+    "approved": frozenset({"executing", "blocked", "failed", "killed"}),
+    "executing": frozenset(
+        {"sent", "partial", "blocked", "failed", "failed_unknown", "killed"}
+    ),
+    "partial": frozenset({"executing", "blocked", "failed", "failed_unknown", "killed"}),
+    "blocked": frozenset({"killed"}),
+    "failed_unknown": frozenset({"killed"}),
+    "sent": frozenset(),
+    "failed": frozenset(),
+    "killed": frozenset(),
+}
+_CAMPAIGN_ITEM_TRANSITIONS = {
+    "staged": frozenset({"approved", "suppressed", "failed"}),
+    "approved": frozenset({"leased", "suppressed", "failed"}),
+    "leased": frozenset({"sent", "suppressed", "failed", "failed_unknown"}),
+    "sent": frozenset(),
+    "suppressed": frozenset(),
+    "failed": frozenset(),
+    "failed_unknown": frozenset(),
+}
+
+
+def utc_now() -> str:
+    return datetime.now(timezone.utc).isoformat()
+
+
+def _parse_iso_datetime(value: Any) -> datetime | None:
+    text = str(value or "").strip()
+    if not text:
+        return None
+    try:
+        parsed = datetime.fromisoformat(text.replace("Z", "+00:00"))
+    except ValueError:
+        return None
+    if parsed.tzinfo is None:
+        parsed = parsed.replace(tzinfo=timezone.utc)
+    return parsed.astimezone(timezone.utc)
+
+
+def _is_recent_iso(value: Any, *, max_age: timedelta) -> bool:
+    parsed = _parse_iso_datetime(value)
+    if parsed is None:
+        return False
+    return datetime.now(timezone.utc) - parsed <= max_age
+
+
+def _truthy_provider_bool(value: Any) -> bool:
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, (int, float)):
+        return bool(value)
+    if isinstance(value, str):
+        return value.strip().lower() in {"1", "true", "yes", "y", "on"}
+    return False
+
+
+def _payload_from_self(payload: dict[str, Any] | Any) -> bool:
+    """Return True when a provider payload is an outbound echo from our own number.
+
+    QuePasa/Baileys-style webhooks can echo messages sent by the connected
+    account with fields such as ``fromme`` or ``key.fromMe``. Those are useful
+    as conversation context, but they must not become actionable contact
+    registration items: the participant is the operator's own connected number.
+    """
+    if not isinstance(payload, dict):
+        return False
+    body = payload.get("body") if isinstance(payload.get("body"), dict) else {}
+    data = body.get("data") if isinstance(body.get("data"), dict) else payload.get("data")
+    if not isinstance(data, dict):
+        data = {}
+    key = data.get("key") if isinstance(data.get("key"), dict) else {}
+    candidates = (
+        payload.get("fromme"),
+        payload.get("fromMe"),
+        payload.get("from_me"),
+        payload.get("isFromMe"),
+        data.get("fromme"),
+        data.get("fromMe"),
+        data.get("from_me"),
+        key.get("fromme"),
+        key.get("fromMe"),
+        key.get("from_me"),
+    )
+    return any(_truthy_provider_bool(value) for value in candidates)
+
+
+def _registration_staging_ttl() -> timedelta:
+    """Return the profile-configured registration staging TTL.
+
+    The framework default stays conservative (5 minutes), but operator-facing
+    gateway profiles can opt into a longer window with:
+
+      whatsapp_ops.registration_staging_ttl_seconds: <seconds>
+
+    This is behavioral config, not a secret. Values are clamped to avoid raw
+    refs being kept indefinitely by accident.
+    """
+    if yaml is None:
+        return _STAGING_TTL
+    try:
+        config_path = get_hermes_home() / "config.yaml"
+        data = yaml.safe_load(config_path.read_text()) or {}
+        wpp = data.get("whatsapp_ops") if isinstance(data, dict) else {}
+        if not isinstance(wpp, dict):
+            return _STAGING_TTL
+        raw = wpp.get("registration_staging_ttl_seconds")
+        if raw is None:
+            raw = wpp.get("registration_staging_ttl")
+        seconds = int(raw)
+        seconds = max(_STAGING_TTL_MIN_SECONDS, min(seconds, _STAGING_TTL_MAX_SECONDS))
+        return timedelta(seconds=seconds)
+    except Exception:
+        return _STAGING_TTL
+
+
+def registration_staging_ttl_seconds() -> int:
+    """Public, sanitized TTL value for status/UX output."""
+    return int(_registration_staging_ttl().total_seconds())
+
+
+def get_db_path(hermes_home: str | Path | None = None) -> Path:
+    home = Path(hermes_home) if hermes_home is not None else get_hermes_home()
+    return home / DB_FILENAME
+
+
+def hash_text(value: str) -> str:
+    return hashlib.sha256(value.encode("utf-8")).hexdigest()
+
+
+def _connect() -> sqlite3.Connection:
+    db_path = get_db_path()
+    db_path.parent.mkdir(parents=True, exist_ok=True)
+    conn = sqlite3.connect(db_path)
+    conn.row_factory = sqlite3.Row
+    return conn
+
+
+def _connect_read_only() -> sqlite3.Connection:
+    """Open the existing store without creating files or allowing writes."""
+
+    db_uri = get_db_path().absolute().as_uri() + "?mode=ro"
+    conn = sqlite3.connect(db_uri, uri=True)
+    try:
+        conn.execute("PRAGMA query_only = ON")
+    except sqlite3.Error:
+        conn.close()
+        raise
+    conn.row_factory = sqlite3.Row
+    return conn
+
+
+def _migrate_mission_ledger(conn: sqlite3.Connection) -> None:
+    """Atomically add the bounded mission ledger without owning the connection.
+
+    The savepoint keeps caller-owned transactions open and makes a partially
+    applied DDL sequence retryable on the same SQLite database.
+    """
+
+    savepoint = "whatsapp_ops_mission_ledger_v1"
+    conn.execute(f"SAVEPOINT {savepoint}")
+    try:
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS mission_envelopes (
+                envelope_digest TEXT PRIMARY KEY,
+                project_ref TEXT NOT NULL,
+                sales_pack_digest TEXT NOT NULL,
+                mode TEXT NOT NULL CHECK(mode IN ('assist', 'safe_auto')),
+                max_items INTEGER NOT NULL CHECK(max_items BETWEEN 1 AND 50),
+                max_local_writes INTEGER NOT NULL
+                    CHECK(max_local_writes BETWEEN 0 AND 5),
+                window_ref TEXT NOT NULL,
+                expires_at TEXT NOT NULL,
+                active INTEGER NOT NULL CHECK(active IN (0, 1)),
+                killed INTEGER NOT NULL CHECK(killed IN (0, 1)),
+                payload_json TEXT NOT NULL,
+                created_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL
+            )
+            """
+        )
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS autonomy_runs (
+                run_id TEXT PRIMARY KEY,
+                envelope_digest TEXT NOT NULL REFERENCES mission_envelopes(envelope_digest),
+                run_key TEXT NOT NULL UNIQUE,
+                status TEXT NOT NULL CHECK(status IN ('started', 'completed')),
+                fence_hash TEXT NOT NULL,
+                lease_expires_at TEXT NOT NULL,
+                started_at TEXT NOT NULL,
+                completed_at TEXT,
+                items_count INTEGER NOT NULL DEFAULT 0 CHECK(items_count >= 0),
+                local_write_count INTEGER NOT NULL DEFAULT 0 CHECK(local_write_count >= 0),
+                result_class TEXT,
+                updated_at TEXT NOT NULL
+            )
+            """
+        )
+        conn.execute(
+            """
+            CREATE INDEX IF NOT EXISTS ix_autonomy_runs_envelope_status
+            ON autonomy_runs(envelope_digest, status)
+            """
+        )
+    except BaseException:
+        try:
+            conn.execute(f"ROLLBACK TO {savepoint}")
+        except BaseException:
+            pass
+        try:
+            conn.execute(f"RELEASE {savepoint}")
+        except BaseException:
+            pass
+        raise
+    else:
+        conn.execute(f"RELEASE {savepoint}")
+
+
+def _migrate_campaign_ledger(conn: sqlite3.Connection) -> None:
+    """Add the campaign ledger atomically without owning the caller transaction."""
+
+    savepoint = f"whatsapp_ops_campaign_ledger_{secrets.token_hex(8)}"
+    statements = (
+        """
+        CREATE TABLE IF NOT EXISTS campaigns (
+            campaign_id TEXT PRIMARY KEY,
+            manifest_digest TEXT NOT NULL UNIQUE,
+            campaign_ref TEXT NOT NULL UNIQUE,
+            project_ref TEXT NOT NULL,
+            start_at TEXT NOT NULL,
+            end_at TEXT NOT NULL,
+            timezone TEXT NOT NULL,
+            sales_pack_digest TEXT NOT NULL,
+            max_followups INTEGER NOT NULL CHECK(max_followups BETWEEN 0 AND 3),
+            state TEXT NOT NULL CHECK(state IN (
+                'queued', 'pending_approval', 'approved', 'executing', 'sent',
+                'partial', 'blocked', 'failed', 'failed_unknown', 'killed'
+            )),
+            paused INTEGER NOT NULL DEFAULT 0 CHECK(paused IN (0, 1)),
+            killed INTEGER NOT NULL DEFAULT 0 CHECK(killed IN (0, 1)),
+            manifest_json TEXT NOT NULL,
+            created_at TEXT NOT NULL,
+            updated_at TEXT NOT NULL
+        )
+        """,
+        """
+        CREATE TABLE IF NOT EXISTS campaign_items (
+            campaign_item_id TEXT PRIMARY KEY,
+            campaign_id TEXT NOT NULL REFERENCES campaigns(campaign_id),
+            ordinal INTEGER NOT NULL CHECK(ordinal BETWEEN 1 AND 3),
+            draft_id TEXT NOT NULL UNIQUE REFERENCES drafts(id),
+            approval_id TEXT NOT NULL UNIQUE REFERENCES approvals(id),
+            contact_id TEXT NOT NULL REFERENCES contacts(id),
+            channel_id TEXT NOT NULL REFERENCES contact_channels(id),
+            classification TEXT NOT NULL CHECK(classification IN ('cold', 'known', 'warm', 'reactivation')),
+            segment TEXT NOT NULL,
+            draft_hash TEXT NOT NULL,
+            message_hash TEXT NOT NULL,
+            state TEXT NOT NULL CHECK(state IN (
+                'staged', 'approved', 'leased', 'sent', 'suppressed',
+                'failed', 'failed_unknown'
+            )),
+            suppression_reason TEXT,
+            followup_count INTEGER NOT NULL DEFAULT 0 CHECK(followup_count BETWEEN 0 AND 3),
+            lease_fence_hash TEXT,
+            lease_expires_at TEXT,
+            leased_at TEXT,
+            created_at TEXT NOT NULL,
+            updated_at TEXT NOT NULL,
+            UNIQUE(campaign_id, ordinal),
+            UNIQUE(campaign_id, contact_id),
+            UNIQUE(campaign_id, channel_id)
+        )
+        """,
+        """
+        CREATE TABLE IF NOT EXISTS campaign_events (
+            event_id TEXT PRIMARY KEY,
+            campaign_id TEXT NOT NULL REFERENCES campaigns(campaign_id),
+            campaign_item_id TEXT REFERENCES campaign_items(campaign_item_id),
+            event_type TEXT NOT NULL,
+            ordinal INTEGER,
+            state TEXT,
+            reason TEXT,
+            created_at TEXT NOT NULL
+        )
+        """,
+        """
+        CREATE INDEX IF NOT EXISTS ix_campaign_events_campaign_created
+        ON campaign_events(campaign_id, created_at, event_id)
+        """,
+        """
+        CREATE TRIGGER IF NOT EXISTS campaign_events_no_update
+        BEFORE UPDATE ON campaign_events
+        BEGIN
+            SELECT RAISE(ABORT, 'campaign_events append-only');
+        END
+        """,
+        """
+        CREATE TRIGGER IF NOT EXISTS campaign_events_no_delete
+        BEFORE DELETE ON campaign_events
+        BEGIN
+            SELECT RAISE(ABORT, 'campaign_events append-only');
+        END
+        """,
+    )
+
+    existing_items_sql = conn.execute(
+        "SELECT sql FROM sqlite_master WHERE type='table' AND name='campaign_items'"
+    ).fetchone()
+    needs_known_classification = bool(
+        existing_items_sql
+        and "'known'" not in str(existing_items_sql[0] or "")
+    )
+    migration_ledger_exists = bool(
+        conn.execute(
+            "SELECT 1 FROM sqlite_master "
+            "WHERE type='table' AND name='whatsapp_ops_schema_migrations'"
+        ).fetchone()
+    )
+
+    conn.execute(f"SAVEPOINT {savepoint}")
+    try:
+        for statement in statements[:3]:
+            conn.execute(statement)
+        if needs_known_classification:
+            conn.execute(
+                "ALTER TABLE campaign_events "
+                "RENAME TO campaign_events_legacy_classification"
+            )
+            conn.execute(
+                "ALTER TABLE campaign_items "
+                "RENAME TO campaign_items_legacy_classification"
+            )
+            conn.execute(
+                statements[1].replace(
+                    "CREATE TABLE IF NOT EXISTS campaign_items",
+                    "CREATE TABLE campaign_items",
+                    1,
+                )
+            )
+            item_columns = (
+                "campaign_item_id, campaign_id, ordinal, draft_id, approval_id, "
+                "contact_id, channel_id, classification, segment, draft_hash, "
+                "message_hash, state, suppression_reason, followup_count, "
+                "lease_fence_hash, lease_expires_at, leased_at, created_at, updated_at"
+            )
+            conn.execute(
+                f"INSERT INTO campaign_items ({item_columns}) "
+                f"SELECT {item_columns} FROM campaign_items_legacy_classification"
+            )
+            conn.execute(
+                statements[2].replace(
+                    "CREATE TABLE IF NOT EXISTS campaign_events",
+                    "CREATE TABLE campaign_events",
+                    1,
+                )
+            )
+            event_columns = (
+                "event_id, campaign_id, campaign_item_id, event_type, ordinal, "
+                "state, reason, created_at"
+            )
+            conn.execute(
+                f"INSERT INTO campaign_events ({event_columns}) "
+                f"SELECT {event_columns} FROM campaign_events_legacy_classification"
+            )
+            conn.execute("DROP TABLE campaign_events_legacy_classification")
+            conn.execute("DROP TABLE campaign_items_legacy_classification")
+        for statement in statements[3:]:
+            conn.execute(statement)
+        if migration_ledger_exists:
+            conn.execute(
+                "INSERT OR IGNORE INTO whatsapp_ops_schema_migrations(id, applied_at) "
+                "VALUES (?, ?)",
+                (_CAMPAIGN_KNOWN_CLASSIFICATION_MIGRATION, utc_now()),
+            )
+    except BaseException:
+        try:
+            conn.execute(f"ROLLBACK TO {savepoint}")
+        except BaseException:
+            pass
+        try:
+            conn.execute(f"RELEASE {savepoint}")
+        except BaseException:
+            pass
+        raise
+    else:
+        conn.execute(f"RELEASE {savepoint}")
+
+
+def init_db() -> Path:
+    db_path = get_db_path()
+    db_path.parent.mkdir(parents=True, exist_ok=True)
+    with _connect() as conn:
+        conn.executescript(
+            """
+            CREATE TABLE IF NOT EXISTS contacts (
+                id TEXT PRIMARY KEY,
+                display_name TEXT NOT NULL,
+                phone_e164_hash TEXT,
+                phone_e164_enc TEXT,
+                whitelisted INTEGER NOT NULL DEFAULT 0,
+                policy_group TEXT,
+                metadata_json TEXT,
+                created_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL
+            );
+            CREATE TABLE IF NOT EXISTS contact_aliases (
+                id TEXT PRIMARY KEY,
+                contact_id TEXT NOT NULL REFERENCES contacts(id),
+                alias_norm TEXT NOT NULL,
+                created_at TEXT NOT NULL,
+                UNIQUE(alias_norm, contact_id)
+            );
+            CREATE TABLE IF NOT EXISTS contact_channels (
+                id TEXT PRIMARY KEY,
+                contact_id TEXT NOT NULL REFERENCES contacts(id),
+                channel_type TEXT NOT NULL CHECK(channel_type = 'whatsapp'),
+                address_hash TEXT NOT NULL,
+                address_ref_enc TEXT NOT NULL,
+                is_active INTEGER NOT NULL DEFAULT 1 CHECK(is_active IN (0, 1)),
+                is_primary INTEGER NOT NULL DEFAULT 0 CHECK(is_primary IN (0, 1)),
+                validation_status TEXT NOT NULL
+                    CHECK(validation_status IN ('unvalidated', 'validated', 'invalid')),
+                allow_send INTEGER NOT NULL DEFAULT 0 CHECK(allow_send IN (0, 1)),
+                authorized_at TEXT,
+                revoked_at TEXT,
+                context_key_hash TEXT,
+                source TEXT NOT NULL,
+                created_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL,
+                UNIQUE(channel_type, address_hash)
+            );
+            CREATE UNIQUE INDEX IF NOT EXISTS uq_contact_channels_active_primary_whatsapp
+            ON contact_channels(contact_id)
+            WHERE channel_type='whatsapp' AND is_active=1 AND is_primary=1;
+            CREATE TABLE IF NOT EXISTS whatsapp_ops_schema_migrations (
+                id TEXT PRIMARY KEY,
+                applied_at TEXT NOT NULL
+            );
+            CREATE TABLE IF NOT EXISTS lists (
+                id TEXT PRIMARY KEY,
+                name TEXT NOT NULL,
+                name_norm TEXT NOT NULL UNIQUE,
+                allowed INTEGER NOT NULL DEFAULT 0,
+                target_ref_enc TEXT,
+                metadata_json TEXT,
+                created_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL
+            );
+            CREATE TABLE IF NOT EXISTS list_members (
+                list_id TEXT NOT NULL REFERENCES lists(id),
+                contact_id TEXT NOT NULL REFERENCES contacts(id),
+                created_at TEXT NOT NULL,
+                PRIMARY KEY(list_id, contact_id)
+            );
+            CREATE TABLE IF NOT EXISTS drafts (
+                id TEXT PRIMARY KEY,
+                targets_json TEXT NOT NULL,
+                message TEXT NOT NULL,
+                message_hash TEXT NOT NULL,
+                media_json TEXT,
+                send_at TEXT,
+                status TEXT NOT NULL,
+                idempotency_key TEXT NOT NULL UNIQUE,
+                created_by TEXT,
+                created_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL
+            );
+            CREATE TABLE IF NOT EXISTS approvals (
+                id TEXT PRIMARY KEY,
+                draft_id TEXT NOT NULL REFERENCES drafts(id),
+                approval_token_hash TEXT NOT NULL UNIQUE,
+                approver_ref_hash TEXT,
+                message_hash TEXT NOT NULL,
+                draft_idempotency_key TEXT NOT NULL,
+                status TEXT NOT NULL,
+                expires_at TEXT NOT NULL,
+                created_at TEXT NOT NULL,
+                resolved_at TEXT
+            );
+            CREATE TABLE IF NOT EXISTS outbox (
+                id TEXT PRIMARY KEY,
+                draft_id TEXT NOT NULL REFERENCES drafts(id),
+                idempotency_key TEXT NOT NULL UNIQUE,
+                status TEXT NOT NULL,
+                attempt_count INTEGER NOT NULL DEFAULT 0,
+                last_error TEXT,
+                scheduled_for TEXT,
+                sent_at TEXT,
+                created_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL
+            );
+            CREATE TABLE IF NOT EXISTS crm_append_log (
+                id TEXT PRIMARY KEY,
+                idempotency_key TEXT NOT NULL UNIQUE,
+                event_id TEXT NOT NULL,
+                status TEXT NOT NULL CHECK(status IN ('reserved', 'appended', 'failed_unknown')),
+                last_reason TEXT,
+                created_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL,
+                appended_at TEXT
+            );
+            CREATE TABLE IF NOT EXISTS inbound_events (
+                id TEXT PRIMARY KEY,
+                source_event_id_hash TEXT NOT NULL UNIQUE,
+                contact_ref_hash TEXT,
+                thread_ref_hash TEXT,
+                payload_redacted_json TEXT,
+                resolved_contact_id TEXT,
+                status TEXT NOT NULL,
+                created_at TEXT NOT NULL
+            );
+            CREATE TABLE IF NOT EXISTS media_transcriptions (
+                id TEXT PRIMARY KEY,
+                event_id TEXT NOT NULL UNIQUE REFERENCES inbound_events(id),
+                status TEXT NOT NULL,
+                reason TEXT NOT NULL,
+                mode TEXT NOT NULL,
+                language TEXT,
+                provider TEXT NOT NULL,
+                media_type TEXT NOT NULL,
+                media_metadata_json TEXT,
+                safety_flags_json TEXT NOT NULL,
+                transcript_text TEXT,
+                transcript_sha256 TEXT,
+                transcript_truncated INTEGER NOT NULL DEFAULT 0,
+                detected_language TEXT,
+                duration_seconds REAL,
+                model TEXT,
+                created_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL
+            );
+            CREATE TABLE IF NOT EXISTS registration_staging (
+                id TEXT PRIMARY KEY,
+                contact_ref_raw TEXT,
+                thread_ref_raw TEXT,
+                display_name TEXT,
+                kind TEXT NOT NULL DEFAULT 'inbound',
+                expires_at TEXT NOT NULL,
+                created_at TEXT NOT NULL
+            );
+            CREATE TABLE IF NOT EXISTS registration_ignored (
+                id TEXT PRIMARY KEY,
+                kind TEXT NOT NULL,
+                ref_hash TEXT NOT NULL,
+                safe_hint_json TEXT,
+                created_at TEXT NOT NULL,
+                source_staging_id TEXT,
+                UNIQUE(kind, ref_hash)
+            );
+            CREATE TABLE IF NOT EXISTS audit_log (
+                id TEXT PRIMARY KEY,
+                event_type TEXT NOT NULL,
+                entity_type TEXT,
+                entity_id TEXT,
+                actor_ref_hash TEXT,
+                safe_summary TEXT NOT NULL,
+                metadata_redacted_json TEXT,
+                created_at TEXT NOT NULL
+            );
+            """
+        )
+        _ensure_draft_columns(conn)
+        _ensure_approval_columns(conn)
+        _ensure_list_columns(conn)
+        _ensure_contact_channel_columns(conn)
+        _ensure_media_transcription_columns(conn)
+        _ensure_inbound_event_columns(conn)
+        _migrate_legacy_contact_channels(conn)
+        _ensure_registration_staging_columns(conn)
+        _backfill_registration_staging_metadata(conn)
+        _migrate_mission_ledger(conn)
+        _migrate_campaign_ledger(conn)
+    return db_path
+
+
+
+def _ensure_registration_staging_columns(conn: sqlite3.Connection) -> None:
+    columns = {row["name"] for row in conn.execute("PRAGMA table_info(registration_staging)")}
+    additions = {
+        "ref_hash": "ref_hash TEXT",
+        "last_seen_at": "last_seen_at TEXT",
+        "message_count": "message_count INTEGER NOT NULL DEFAULT 1",
+        "safe_hint_json": "safe_hint_json TEXT",
+    }
+    for name, ddl in additions.items():
+        if name not in columns:
+            conn.execute(f"ALTER TABLE registration_staging ADD COLUMN {ddl}")
+
+
+def _ensure_draft_columns(conn: sqlite3.Connection) -> None:
+    columns = {row["name"] for row in conn.execute("PRAGMA table_info(drafts)")}
+    if "media_json" not in columns:
+        conn.execute("ALTER TABLE drafts ADD COLUMN media_json TEXT")
+
+
+def _ensure_approval_columns(conn: sqlite3.Connection) -> None:
+    """Bind new approvals to the complete immutable draft signature.
+
+    Legacy rows remain NULL and therefore fail closed in send/CRM policy.
+    """
+    columns = {row["name"] for row in conn.execute("PRAGMA table_info(approvals)")}
+    if "draft_idempotency_key" not in columns:
+        conn.execute("ALTER TABLE approvals ADD COLUMN draft_idempotency_key TEXT")
+
+
+def _ensure_list_columns(conn: sqlite3.Connection) -> None:
+    columns = {row["name"] for row in conn.execute("PRAGMA table_info(lists)")}
+    if "target_ref_enc" not in columns:
+        conn.execute("ALTER TABLE lists ADD COLUMN target_ref_enc TEXT")
+
+
+def _ensure_contact_channel_columns(conn: sqlite3.Connection) -> None:
+    """Upgrade pre-Gate-B channel candidates without destructive DDL."""
+    columns = {row["name"] for row in conn.execute("PRAGMA table_info(contact_channels)")}
+    for name, ddl in {
+        "authorized_at": "authorized_at TEXT",
+        "revoked_at": "revoked_at TEXT",
+    }.items():
+        if name not in columns:
+            conn.execute(f"ALTER TABLE contact_channels ADD COLUMN {ddl}")
+
+
+def _ensure_media_transcription_columns(conn: sqlite3.Connection) -> None:
+    """Add private transcript fields without rebuilding or exposing old rows."""
+    columns = {row["name"] for row in conn.execute("PRAGMA table_info(media_transcriptions)")}
+    additions = {
+        "transcript_text": "transcript_text TEXT",
+        "transcript_sha256": "transcript_sha256 TEXT",
+        "transcript_truncated": "transcript_truncated INTEGER NOT NULL DEFAULT 0",
+        "detected_language": "detected_language TEXT",
+        "duration_seconds": "duration_seconds REAL",
+        "model": "model TEXT",
+    }
+    for name, ddl in additions.items():
+        if name not in columns:
+            conn.execute(f"ALTER TABLE media_transcriptions ADD COLUMN {ddl}")
+
+
+def _ensure_inbound_event_columns(conn: sqlite3.Connection) -> None:
+    """Add the optional known-contact identity to legacy inbound rows."""
+    columns = {row["name"] for row in conn.execute("PRAGMA table_info(inbound_events)")}
+    if "resolved_contact_id" in columns:
+        return
+    try:
+        conn.execute("ALTER TABLE inbound_events ADD COLUMN resolved_contact_id TEXT")
+    except sqlite3.OperationalError as exc:
+        # Concurrent init may have added it after the PRAGMA read.
+        if "duplicate column name" not in str(exc).casefold():
+            raise
+
+
+def _migrate_legacy_contact_channels(conn: sqlite3.Connection) -> None:
+    """Project legacy single-number contacts once, preserving old authority.
+
+    This is the only path allowed to copy legacy ``whitelisted`` authority into
+    a channel. The migration marker prevents future contact updates from
+    silently creating or reauthorizing channels.
+    """
+    migration_id = "2026-08-13-contact-channels-v1"
+    applied = conn.execute(
+        "SELECT 1 FROM whatsapp_ops_schema_migrations WHERE id=?", (migration_id,)
+    ).fetchone()
+    if applied is not None:
+        return
+    rows = conn.execute(
+        "SELECT * FROM contacts WHERE COALESCE(phone_e164_enc, '') <> '' ORDER BY id"
+    ).fetchall()
+    for row in rows:
+        raw_ref = str(row["phone_e164_enc"] or "").strip()
+        try:
+            canonical = _normalize_whatsapp_address(raw_ref)
+        except ValueError:
+            continue
+        address_hash = hash_text(canonical)
+        existing = conn.execute(
+            "SELECT contact_id FROM contact_channels "
+            "WHERE channel_type='whatsapp' AND address_hash=?",
+            (address_hash,),
+        ).fetchone()
+        if existing is not None:
+            if str(existing["contact_id"]) != str(row["id"]):
+                raise ValueError("contact channel ownership conflict")
+            continue
+        created_at = str(row["created_at"])
+        legacy_authorized = bool(row["whitelisted"])
+        conn.execute(
+            """
+            INSERT INTO contact_channels (
+                id, contact_id, channel_type, address_hash, address_ref_enc,
+                is_active, is_primary, validation_status, allow_send,
+                authorized_at, revoked_at, context_key_hash, source,
+                created_at, updated_at
+            ) VALUES (?, ?, 'whatsapp', ?, ?, 1, 1, 'validated', ?, ?, NULL, NULL,
+                      'legacy_contacts', ?, ?)
+            """,
+            (
+                "channel_" + hash_text("whatsapp:" + canonical)[:20],
+                str(row["id"]),
+                address_hash,
+                raw_ref,
+                1 if legacy_authorized else 0,
+                created_at if legacy_authorized else None,
+                created_at,
+                str(row["updated_at"]),
+            ),
+        )
+    conn.execute(
+        "INSERT INTO whatsapp_ops_schema_migrations (id, applied_at) VALUES (?, ?)",
+        (migration_id, utc_now()),
+    )
+
+
+
+def _row_to_dict(row: sqlite3.Row | None) -> dict[str, Any] | None:
+    return dict(row) if row is not None else None
+
+def _normalize(value: str) -> str:
+    return re.sub(r"\s+", " ", str(value or "").strip().casefold())
+
+
+def _phone_digits(value: str) -> str:
+    return re.sub(r"\D+", "", str(value or ""))
+
+
+def mask_phone(value: str | None) -> str:
+    digits = _phone_digits(value or "")
+    if not digits:
+        return ""
+    if len(digits) <= 4:
+        return "****" + digits[-2:]
+    if digits.startswith("55"):
+        prefix = "+55"
+    else:
+        prefix = "+" + digits[:2] if len(digits) >= 12 else "+" + digits[:1]
+    return f"{prefix}***{digits[-4:]}"
+
+
+_PHONE_REF_DOMAINS = ("@s.whatsapp.net", "@c.us", "@whatsapp.net")
+_NON_PHONE_REF_DOMAINS = ("@lid", "@g.us")
+
+
+def _trusted_phone_digits(value: Any) -> str:
+    """Return digits only when *value* is a real phone-bearing value.
+
+    WhatsApp provider identifiers such as ``@lid`` and group JIDs contain long
+    digit strings that are not phone numbers. They must never become
+    ``phone_masked``/``last4`` hints in the operator cockpit.
+    """
+    text = str(value or "").strip()
+    if not text:
+        return ""
+    lowered = text.casefold()
+    if any(domain in lowered for domain in _NON_PHONE_REF_DOMAINS):
+        return ""
+    if re.search(r"\b\d{4}-\d{2}-\d{2}\b", text):
+        return ""
+    digits = _phone_digits(text)
+    if not (8 <= len(digits) <= 15):
+        return ""
+    if any(domain in lowered for domain in _PHONE_REF_DOMAINS):
+        return digits
+    if "@" in lowered:
+        return ""
+    return digits
+
+
+def _mask_trusted_phone(value: Any) -> str:
+    digits = _trusted_phone_digits(value)
+    return mask_phone(digits) if digits else ""
+
+
+def _safe_existing_phone_mask(value: Any) -> str:
+    text = str(value or "").strip()
+    if not text:
+        return ""
+    lowered = text.casefold()
+    if any(domain in lowered for domain in _NON_PHONE_REF_DOMAINS):
+        return ""
+    if "*" in text and re.fullmatch(r"\+?\d{1,3}\*+\d{2,4}", text):
+        return text
+    return _mask_trusted_phone(text)
+
+
+def _safe_person_name(value: Any, limit: int = 60) -> str:
+    return _clean_registration_text(value, limit=limit)
+
+
+def _mask_phone_fragment(value: str) -> str:
+    text = str(value or "")
+    # Do not treat ISO/date fragments as phones (e.g. 2026-06-06 timestamps).
+    if re.search(r"\b\d{4}-\d{2}-\d{2}\b", text):
+        return text
+    return mask_phone(text) or "<redacted-phone>"
+
+
+def _replace_phone_mentions_with_names(text: str) -> str:
+    """Prefer a provider/contact name over an opaque phone placeholder.
+
+    Examples:
+    - @5511999987655 (Maria) -> @Maria
+    - @<redacted-phone> (Maria) -> @Maria
+    If there is no adjacent name, the caller still masks the phone digits.
+    """
+    def repl(match: re.Match[str]) -> str:
+        name = _safe_person_name(match.group(1), limit=50)
+        if not name:
+            return match.group(0)
+        return f"@{name}"
+
+    text = re.sub(r"@?\+?\d[\d\s().-]{6,}\d\s*\(([^)]+)\)", repl, text)
+    text = re.sub(r"@?<redacted-phone>\s*\(([^)]+)\)", repl, text, flags=re.IGNORECASE)
+    return text
+
+
+def _safe_contact_id(contact_id: str) -> str:
+    raw = str(contact_id or "")
+    if raw.startswith(("contact_", "synthetic_")):
+        return raw
+    if "@" in raw or _phone_digits(raw):
+        return "contact_" + hash_text(raw)[:16]
+    return raw
+
+
+def _safe_contact(row: dict[str, Any]) -> dict[str, Any]:
+    return {
+        "contact_id": _safe_contact_id(row["id"]),
+        "display_name": row["display_name"],
+        "phone_masked": _safe_existing_phone_mask(row.get("phone_e164_enc")),
+        "whitelisted": bool(row.get("whitelisted")),
+        "policy_group": row.get("policy_group"),
+    }
+
+
+def _normalize_whatsapp_address(value: Any) -> str:
+    """Return one canonical E.164-like WhatsApp address for identity hashing."""
+    if type(value) is not str:
+        raise ValueError("valid WhatsApp address is required")
+    raw = value.strip()
+    jid = re.fullmatch(
+        r"([0-9]{8,15})@(s\.whatsapp\.net|c\.us|whatsapp\.net)",
+        raw.casefold(),
+    )
+    if jid is not None:
+        digits = jid.group(1)
+    else:
+        if "@" in raw or re.fullmatch(r"\+?[0-9\s().-]+", raw) is None:
+            raise ValueError("valid WhatsApp address is required")
+        digits = _phone_digits(raw)
+    if not (8 <= len(digits) <= 15) or digits.startswith("0"):
+        raise ValueError("valid WhatsApp address is required")
+    return "+" + digits
+
+
+def resolve_inbound_contact_by_lid(lid_ref: str) -> str:
+    """Resolve an inbound WhatsApp LID to an existing active contact channel.
+
+    This path performs at most one read-only QuePasa GET and one read-only
+    SQLite SELECT. Any missing configuration, provider error, invalid phone,
+    absent channel, or database error returns an empty string.
+    """
+    try:
+        value = str(lid_ref or "").strip()
+        if not value.casefold().endswith("@lid"):
+            return ""
+        from tools.whatsapp_ops_quepasa import resolve_lid_via_quepasa
+
+        phone = resolve_lid_via_quepasa(value)
+        if not phone:
+            return ""
+        canonical = _normalize_whatsapp_address(phone)
+        with _connect_read_only() as conn:
+            row = conn.execute(
+                """
+                SELECT contact_id
+                FROM contact_channels
+                WHERE channel_type='whatsapp' AND address_hash=? AND is_active=1
+                LIMIT 1
+                """,
+                (hash_text(canonical),),
+            ).fetchone()
+        return str(row["contact_id"] or "") if row is not None else ""
+    except Exception:
+        return ""
+
+
+def _safe_contact_channel(row: dict[str, Any]) -> dict[str, Any]:
+    canonical = _normalize_whatsapp_address(str(row.get("address_ref_enc") or ""))
+    return {
+        "channel_id": str(row["id"]),
+        "contact_id": _safe_contact_id(str(row["contact_id"])),
+        "channel_type": str(row["channel_type"]),
+        "address_masked": "***" + canonical[-4:],
+        "is_active": bool(row["is_active"]),
+        "is_primary": bool(row["is_primary"]),
+        "validation_status": str(row["validation_status"]),
+        "allow_send": bool(row["allow_send"]),
+        "authorized_at": row.get("authorized_at"),
+        "revoked_at": row.get("revoked_at"),
+    }
+
+
+
+def _safe_registration_id(kind: str, raw_ref: str) -> str:
+    prefix = "grp" if kind == "group" else "ctt"
+    return f"{prefix}_{hash_text(raw_ref)[:8]}"
+
+
+
+def _clean_registration_text(value: Any, limit: int = 80) -> str:
+    text = re.sub(r"\s+", " ", str(value or "").strip())
+    if not text:
+        return ""
+    if re.search(r"(?i)https?://", text) or "@" in text:
+        return ""
+    text = re.sub(r"\+?\d[\d\s().-]{6,}\d", "", text).strip()
+    return text[:limit]
+
+
+
+def _safe_message_type(value: Any) -> str:
+    text = re.sub(r"[^a-z0-9_.-]+", "", str(value or "").strip().lower())
+    return text[:40]
+
+
+
+def _coerce_safe_hint(value: dict[str, Any] | None) -> dict[str, Any]:
+    if not isinstance(value, dict):
+        return {}
+    hint: dict[str, Any] = {}
+    for key in ("display_name", "group_name", "participant_name", "source_group_name"):
+        cleaned = _clean_registration_text(value.get(key))
+        if cleaned:
+            hint[key] = cleaned
+    for key in ("safe_id", "source_group_safe_id"):
+        cleaned = _safe_message_type(value.get(key))
+        if cleaned:
+            hint[key] = cleaned
+    msg_type = _safe_message_type(value.get("last_message_type"))
+    if msg_type:
+        hint["last_message_type"] = msg_type
+    if "has_media" in value:
+        hint["has_media"] = bool(value.get("has_media"))
+
+    explicit_phone = ""
+    for key in (
+        "phone",
+        "phone_e164",
+        "phone_number",
+        "phoneNumber",
+        "senderPhone",
+        "participantPhone",
+    ):
+        explicit_phone = _safe_existing_phone_mask(value.get(key))
+        if explicit_phone:
+            hint["phone_masked"] = explicit_phone
+            digits = _trusted_phone_digits(value.get(key))
+            if digits:
+                hint["last4"] = digits[-4:]
+            hint["phone_source"] = "explicit"
+            break
+    if not explicit_phone and str(value.get("phone_source") or "").strip() in {"explicit", "raw_ref", "resolved"}:
+        existing_mask = _safe_existing_phone_mask(value.get("phone_masked"))
+        if existing_mask:
+            hint["phone_masked"] = existing_mask
+            last4 = re.sub(r"\D+", "", str(value.get("last4") or ""))[-4:]
+            if last4:
+                hint["last4"] = last4
+            hint["phone_source"] = str(value.get("phone_source"))
+    return hint
+
+
+
+def _raw_ref_for_kind(kind: str, contact_ref: str, thread_ref: str) -> str:
+    if kind == "group":
+        return str(thread_ref or contact_ref or "")
+    return str(contact_ref or thread_ref or "")
+
+
+
+def _build_staging_hint(
+    *,
+    kind: str,
+    raw_ref: str,
+    contact_ref: str = "",
+    thread_ref: str = "",
+    display_name: str = "",
+    safe_hint: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    hint = _coerce_safe_hint(safe_hint)
+    hint["safe_id"] = _safe_registration_id(kind, raw_ref)
+    digits = _trusted_phone_digits(raw_ref)
+    if kind == "contact" and digits:
+        masked = mask_phone(raw_ref)
+        if masked:
+            hint["phone_masked"] = masked
+            hint["phone_source"] = "raw_ref"
+        hint["last4"] = digits[-4:]
+    if kind == "contact" and thread_ref and thread_ref != contact_ref:
+        hint["source_group_safe_id"] = _safe_registration_id("group", thread_ref)
+        source_name = _clean_registration_text(hint.get("source_group_name") or "")
+        if source_name:
+            hint["source_group_name"] = source_name
+    display = _clean_registration_text(display_name)
+    if kind == "group":
+        display = hint.get("group_name") or display
+    else:
+        display = hint.get("participant_name") or display
+    if display:
+        hint["display_name"] = display
+    return hint
+
+
+
+def _load_staging_hint(raw: Any) -> dict[str, Any]:
+    if not raw:
+        return {}
+    try:
+        data = json.loads(str(raw))
+    except json.JSONDecodeError:
+        return {}
+    return data if isinstance(data, dict) else {}
+
+
+
+def _merge_staging_hints(old: dict[str, Any], new: dict[str, Any]) -> dict[str, Any]:
+    merged = dict(old)
+    if "phone_masked" not in new:
+        merged.pop("phone_masked", None)
+        merged.pop("last4", None)
+        merged.pop("phone_source", None)
+    for key, value in new.items():
+        if value not in (None, "", [], {}):
+            merged[key] = value
+    return merged
+
+
+
+def _backfill_registration_staging_metadata(conn: sqlite3.Connection) -> None:
+    try:
+        rows = conn.execute(
+            """
+            SELECT id, contact_ref_raw, thread_ref_raw, display_name, kind,
+                   created_at, ref_hash, last_seen_at, safe_hint_json
+            FROM registration_staging
+            WHERE ref_hash IS NULL OR last_seen_at IS NULL OR safe_hint_json IS NULL
+            """
+        ).fetchall()
+    except sqlite3.OperationalError:
+        return
+    for row in rows:
+        kind = str(row["kind"] or "contact").strip().lower()
+        if kind not in {"contact", "group"}:
+            kind = "group" if row["thread_ref_raw"] and row["thread_ref_raw"] != row["contact_ref_raw"] else "contact"
+        contact_ref = str(row["contact_ref_raw"] or "")
+        thread_ref = str(row["thread_ref_raw"] or "")
+        raw_ref = _raw_ref_for_kind(kind, contact_ref, thread_ref)
+        if not raw_ref:
+            continue
+        existing_hint = _load_staging_hint(row["safe_hint_json"])
+        hint = _merge_staging_hints(existing_hint, _build_staging_hint(
+            kind=kind,
+            raw_ref=raw_ref,
+            contact_ref=contact_ref,
+            thread_ref=thread_ref,
+            display_name=row["display_name"] or "",
+            safe_hint=existing_hint,
+        ))
+        conn.execute(
+            """
+            UPDATE registration_staging
+            SET ref_hash=?, last_seen_at=COALESCE(last_seen_at, created_at),
+                message_count=COALESCE(message_count, 1), safe_hint_json=?
+            WHERE id=?
+            """,
+            (hash_text(raw_ref), json.dumps(hint, ensure_ascii=False, sort_keys=True), row["id"]),
+        )
+
+
+
+# ---------------------------------------------------------------------------
+# Staging raw inbound refs for registration
+# ---------------------------------------------------------------------------
+
+
+def _staging_cleanup() -> None:
+    """Remove expired staging rows."""
+    now = utc_now()
+    with _connect() as conn:
+        conn.execute("DELETE FROM registration_staging WHERE expires_at <= ?", (now,))
+
+
+def _registration_ref_is_ignored(conn: sqlite3.Connection, kind: str, ref_hash: str) -> bool:
+    if not ref_hash:
+        return False
+    row = conn.execute(
+        "SELECT 1 FROM registration_ignored WHERE kind=? AND ref_hash=? LIMIT 1",
+        (kind, ref_hash),
+    ).fetchone()
+    return row is not None
+
+
+def stage_raw_ref(
+    *,
+    contact_ref: str = "",
+    thread_ref: str = "",
+    display_name: str = "",
+    kind: str | None = None,
+    safe_hint: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    """Store raw inbound refs temporarily for registration use.
+
+    Auto-purges old staging first.  Expires after the profile TTL.
+    The caller is responsible for calling this only from trusted ingest
+    code paths, never from model-driven tool calls.
+    """
+    init_db()
+    _staging_cleanup()
+    contact_ref = str(contact_ref or "")
+    thread_ref = str(thread_ref or "")
+    kind_norm = str(kind or "").strip().lower()
+    if kind_norm not in {"contact", "group"}:
+        kind_norm = "group" if thread_ref and thread_ref != contact_ref else "contact"
+    raw_ref = _raw_ref_for_kind(kind_norm, contact_ref, thread_ref)
+    if not raw_ref:
+        return {"ok": False, "error": "no_ref"}
+
+    now_dt = datetime.now(timezone.utc)
+    now = now_dt.isoformat()
+    expires_at = (now_dt + _registration_staging_ttl()).isoformat()
+    ref_hash = hash_text(raw_ref)
+    hint = _build_staging_hint(
+        kind=kind_norm,
+        raw_ref=raw_ref,
+        contact_ref=contact_ref,
+        thread_ref=thread_ref,
+        display_name=display_name,
+        safe_hint=safe_hint,
+    )
+    display = hint.get("display_name", "")[:80]
+
+    with _connect() as conn:
+        if _registration_ref_is_ignored(conn, kind_norm, ref_hash):
+            return {
+                "ok": True,
+                "ignored": True,
+                "kind": kind_norm,
+                "safe_id": hint.get("safe_id", ""),
+            }
+        existing = conn.execute(
+            """
+            SELECT * FROM registration_staging
+            WHERE kind=? AND ref_hash=? AND expires_at > ?
+            ORDER BY COALESCE(last_seen_at, created_at) DESC, created_at DESC
+            LIMIT 1
+            """,
+            (kind_norm, ref_hash, utc_now()),
+        ).fetchone()
+        if existing:
+            row_id = existing["id"]
+            merged_hint = _merge_staging_hints(_load_staging_hint(existing["safe_hint_json"]), hint)
+            message_count = int(existing["message_count"] or 1) + 1
+            conn.execute(
+                """
+                UPDATE registration_staging
+                SET contact_ref_raw=?, thread_ref_raw=?, display_name=?, expires_at=?,
+                    last_seen_at=?, message_count=?, safe_hint_json=?
+                WHERE id=?
+                """,
+                (
+                    contact_ref or None,
+                    thread_ref or None,
+                    display,
+                    expires_at,
+                    now,
+                    message_count,
+                    json.dumps(merged_hint, ensure_ascii=False, sort_keys=True),
+                    row_id,
+                ),
+            )
+        else:
+            row_id = "staging_" + uuid.uuid4().hex[:12]
+            conn.execute(
+                """
+                INSERT INTO registration_staging (
+                    id, contact_ref_raw, thread_ref_raw, display_name,
+                    kind, expires_at, created_at, ref_hash, last_seen_at,
+                    message_count, safe_hint_json
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    row_id,
+                    contact_ref or None,
+                    thread_ref or None,
+                    display,
+                    kind_norm,
+                    expires_at,
+                    now,
+                    ref_hash,
+                    now,
+                    1,
+                    json.dumps(hint, ensure_ascii=False, sort_keys=True),
+                ),
+            )
+            message_count = 1
+    return {
+        "ok": True,
+        "staging_id": row_id,
+        "kind": kind_norm,
+        "expires_at": expires_at,
+        "safe_id": hint.get("safe_id", ""),
+        "message_count": message_count,
+    }
+
+
+
+def _delete_staging_row(conn: sqlite3.Connection, row: dict[str, Any]) -> None:
+    ref_hash = row.get("ref_hash")
+    if ref_hash:
+        conn.execute(
+            "DELETE FROM registration_staging WHERE kind=? AND ref_hash=?",
+            (row.get("kind"), ref_hash),
+        )
+    else:
+        conn.execute("DELETE FROM registration_staging WHERE id=?", (row["id"],))
+
+
+
+def _latest_staging(kind: str = "contact", staging_id: str = "") -> dict[str, Any] | None:
+    """Return and consume a non-expired staging row for *kind*."""
+    init_db()
+    _staging_cleanup()
+    kind_norm = str(kind or "contact").strip().lower()
+    if kind_norm not in {"contact", "group"}:
+        kind_norm = "contact"
+    if staging_id:
+        where = "id=? AND kind=? AND expires_at > ?"
+        params: tuple[Any, ...] = (staging_id, kind_norm, utc_now())
+    else:
+        where = "kind=? AND expires_at > ?"
+        params = (kind_norm, utc_now())
+    with _connect() as conn:
+        row = conn.execute(
+            f"""
+            SELECT * FROM registration_staging
+            WHERE {where}
+            ORDER BY COALESCE(last_seen_at, created_at) DESC, created_at DESC
+            LIMIT 1
+            """,
+            params,
+        ).fetchone()
+        if row is None:
+            return None
+        result = dict(row)
+        _delete_staging_row(conn, result)
+    return result
+
+
+
+def consume_latest_raw_ref(kind: str = "contact", staging_id: str = "") -> str | None:
+    """Return the raw ref from staging, optionally selecting a staging id.
+
+    ``kind="contact"`` returns ``contact_ref_raw``.
+    ``kind="group"`` returns ``thread_ref_raw``.
+    Matching staging rows are consumed after read.
+    """
+    row = _latest_staging(kind, staging_id=staging_id)
+    if row is None:
+        return None
+    kind_norm = str(kind or "contact").strip().lower()
+    key = "thread_ref_raw" if kind_norm == "group" else "contact_ref_raw"
+    return str(row.get(key) or "") or None
+
+
+
+def _recent_messages_for_staging_row(row: dict[str, Any], *, limit: int = 5, max_text_chars: int = 140) -> list[dict[str, Any]]:
+    """Return bounded safe local context for a staging row.
+
+    This is intentionally local-store only. It can include self-echo messages as
+    context ("Eu"), but it never uses those messages as contact-registration
+    targets and it never fetches provider history.
+    """
+    thread_ref = str(row.get("thread_ref_raw") or "").strip()
+    contact_ref = str(row.get("contact_ref_raw") or "").strip()
+    lookup_ref = thread_ref or contact_ref
+    if not lookup_ref:
+        return []
+    events = lookup_inbound_events(thread=lookup_ref, limit=max(limit * 4, limit))
+    recent: list[dict[str, Any]] = []
+    for event in events:
+        payload = event.get("payload") if isinstance(event.get("payload"), dict) else {}
+        if _message_type_from_payload(payload) == "system":
+            continue
+        summary = _summary_event(event, max_text_chars)
+        from_self = _payload_from_self(payload)
+        summary["from_self"] = from_self
+        summary["direction"] = "eu" if from_self else "contato"
+        if from_self:
+            summary["sender_label"] = "Eu"
+            summary.pop("sender_display_name", None)
+            summary.pop("sender_phone_masked", None)
+        else:
+            summary["sender_label"] = str(summary.get("sender_label") or "Contato")
+        recent.append(summary)
+        if len(recent) >= max(1, min(limit, 5)):
+            break
+    return list(reversed(recent))
+
+
+def _registration_context_summary(messages: list[dict[str, Any]]) -> str:
+    if not messages:
+        return ""
+    parts: list[str] = []
+    for msg in messages[-3:]:
+        who = str(msg.get("sender_label") or ("Eu" if msg.get("from_self") else "Contato"))
+        preview = str(msg.get("text_preview") or "").strip()
+        if not preview:
+            preview = "mídia" if msg.get("has_media") else str(msg.get("message_type") or "mensagem")
+        parts.append(f"{who}: {preview}")
+    return _truncate_text(" | ".join(parts), 260)
+
+
+def _recent_contact_phone_mask(messages: list[dict[str, Any]], display_name: str) -> str:
+    """Return a sanitized sender phone mask from local context for this contact.
+
+    This is a display-only fallback for pre-patch staging rows. It only accepts
+    already-masked sender phones from sanitized local inbound payloads and only
+    when the sender display name matches the staging contact name.
+    """
+    display_norm = _normalize(display_name)
+    if not display_norm:
+        return ""
+    for msg in reversed(messages):
+        if msg.get("from_self"):
+            continue
+        sender_name = _normalize(str(msg.get("sender_display_name") or ""))
+        if sender_name != display_norm:
+            continue
+        masked = _safe_existing_phone_mask(msg.get("sender_phone_masked"))
+        if masked:
+            return masked
+    return ""
+
+
+def _is_system_staging_row(row: dict[str, Any]) -> bool:
+    hint = _load_staging_hint(row.get("safe_hint_json"))
+    return str(hint.get("last_message_type") or "").strip().lower() == "system"
+
+
+def is_synthetic_contact_sync_payload(payload: dict[str, Any]) -> bool:
+    """Detect a native WhatsApp contact/profile sync event surfaced by the
+    provider (whatsmeow ``events.Contact``, forwarded by QuePasa as a
+    synthetic vCard "message"), as opposed to a real inbound message or a
+    contact card a human actually shared in a chat.
+
+    Signature observed in production: ``type=="contact"``, ``edited==True``,
+    no ``participant`` key, the chat/contact/thread ref all collapse to the
+    same id (no real sender distinct from the chat), and a vCard-shaped
+    attachment. These must never be staged as actionable leads or shown as
+    recent commercial context — they are WhatsApp/linked-device plumbing,
+    not a lead or a shared contact.
+    """
+    if not isinstance(payload, dict):
+        return False
+    msg_type = str(payload.get("type") or payload.get("messageType") or "").strip().lower()
+    if msg_type != "contact":
+        return False
+    if payload.get("edited") is not True:
+        return False
+    if payload.get("participant"):
+        return False
+    chat = payload.get("chat") if isinstance(payload.get("chat"), dict) else {}
+    chat_id = str(chat.get("id") or "")
+    contact_ref = str(chat_id or payload.get("contact") or "")
+    thread_ref = str(chat_id or payload.get("chatId") or payload.get("thread") or "")
+    if not contact_ref or contact_ref != thread_ref:
+        return False
+    attachment = payload.get("attachment") if isinstance(payload.get("attachment"), dict) else {}
+    filename = str(attachment.get("filename") or "").lower()
+    mime = str(attachment.get("mime") or "").lower()
+    return filename.endswith(".vcf") or "vcard" in mime
+
+
+def _metadata_target_ref_hash(value: Any) -> str:
+    try:
+        data = json.loads(value or "{}")
+    except (TypeError, json.JSONDecodeError):
+        return ""
+    if not isinstance(data, dict):
+        return ""
+    return str(data.get("target_ref_hash") or "").strip()
+
+
+def _staging_ref_is_registered(conn: sqlite3.Connection, row: dict[str, Any]) -> bool:
+    """Return True when a staging row already has a local contact/group record.
+
+    Registration staging is a short-lived operator queue. If the same raw-ref
+    hash is already present in the local allowlist cache, showing it again as
+    "Cadastrar" is redundant and can make the operator think the register step
+    failed. Name-only collisions are intentionally not enough: same display
+    name can point to a different provider ref.
+    """
+    kind = str(row.get("kind") or "contact").strip().lower()
+    ref_hash = str(row.get("ref_hash") or "").strip()
+    if not ref_hash:
+        return False
+    if kind == "group":
+        expected_id = "list_" + ref_hash[:16]
+        direct = conn.execute("SELECT 1 FROM lists WHERE id=? LIMIT 1", (expected_id,)).fetchone()
+        if direct is not None:
+            return True
+        rows = conn.execute("SELECT metadata_json FROM lists WHERE metadata_json LIKE ?", (f"%{ref_hash[:16]}%",)).fetchall()
+    else:
+        expected_id = "contact_" + ref_hash[:16]
+        direct = conn.execute("SELECT 1 FROM contacts WHERE id=? LIMIT 1", (expected_id,)).fetchone()
+        if direct is not None:
+            return True
+        rows = conn.execute("SELECT metadata_json FROM contacts WHERE metadata_json LIKE ?", (f"%{ref_hash[:16]}%",)).fetchall()
+    return any(_metadata_target_ref_hash(row_meta["metadata_json"]) == ref_hash for row_meta in rows)
+
+
+def _payload_message_type(payload: dict[str, Any]) -> str:
+    return str(_message_type_from_payload(payload) or "").strip().lower()
+
+
+def _public_staging_item(row: dict[str, Any]) -> dict[str, Any]:
+    kind = str(row.get("kind") or "contact")
+    hint = _load_staging_hint(row.get("safe_hint_json"))
+    raw_ref = _raw_ref_for_kind(kind, str(row.get("contact_ref_raw") or ""), str(row.get("thread_ref_raw") or ""))
+    if raw_ref and not hint.get("safe_id"):
+        hint["safe_id"] = _safe_registration_id(kind, raw_ref)
+    if kind == "contact" and hint.get("phone_masked") and not hint.get("phone_source") and not _trusted_phone_digits(raw_ref):
+        hint.pop("phone_masked", None)
+        hint.pop("last4", None)
+    display_name = row.get("display_name") or hint.get("display_name") or ""
+    if not display_name:
+        display_name = hint.get("group_name") or hint.get("participant_name") or ""
+    recent_messages = _recent_messages_for_staging_row(row, limit=5, max_text_chars=140)
+    item = {
+        "staging_id": row["id"],
+        "display_name": display_name,
+        "kind": kind,
+        "created_at": row.get("created_at"),
+        "last_seen_at": row.get("last_seen_at") or row.get("created_at"),
+        "available_until": row.get("expires_at"),
+        "message_count": int(row.get("message_count") or 1),
+        "safe_id": hint.get("safe_id") or "",
+    }
+    if recent_messages:
+        item["recent_messages"] = recent_messages
+        item["context_summary"] = _registration_context_summary(recent_messages)
+        latest_text = next((str(msg.get("text_preview") or "").strip() for msg in reversed(recent_messages) if msg.get("text_preview")), "")
+        if latest_text:
+            item["last_text_preview"] = latest_text
+        if kind == "contact" and not hint.get("phone_masked"):
+            context_mask = _recent_contact_phone_mask(recent_messages, str(display_name or ""))
+            if context_mask:
+                hint["phone_masked"] = context_mask
+                digits = _phone_digits(context_mask)
+                if digits:
+                    hint["last4"] = digits[-4:]
+                hint["phone_source"] = "local_context"
+    for key in (
+        "phone_masked",
+        "last4",
+        "source_group_safe_id",
+        "source_group_name",
+        "last_message_type",
+        "has_media",
+    ):
+        if key in hint and hint[key] not in (None, ""):
+            item[key] = hint[key]
+    if kind == "contact" and not item.get("phone_masked"):
+        item["phone_status"] = "unresolved"
+        item["identity_note"] = "número não resolvido"
+    return item
+
+
+
+def peek_staging() -> list[dict[str, Any]]:
+    """Return sanitized info about what's staged for registration (no raw refs).
+
+    This is an operator-facing read path used by /fila and diagnostics. It must
+    hide expired rows without deleting them so read-only cockpit/smoke commands
+    do not mutate the live Hunter database.
+    """
+    init_db()
+    with _connect() as conn:
+        rows = []
+        for row in conn.execute(
+            """
+            SELECT *
+            FROM registration_staging
+            WHERE expires_at > ?
+            ORDER BY COALESCE(last_seen_at, created_at) DESC, created_at DESC
+            """,
+            (utc_now(),),
+        ).fetchall():
+            row_dict = dict(row)
+            if _is_system_staging_row(row_dict):
+                continue
+            if _staging_ref_is_registered(conn, row_dict):
+                continue
+            rows.append(row_dict)
+    grouped: dict[tuple[str, str], dict[str, Any]] = {}
+    for row in rows:
+        key = (str(row.get("kind") or "contact"), str(row.get("ref_hash") or row.get("id")))
+        if key not in grouped:
+            grouped[key] = dict(row)
+            grouped[key]["message_count"] = int(row.get("message_count") or 1)
+            continue
+        grouped[key]["message_count"] = int(grouped[key].get("message_count") or 1) + int(row.get("message_count") or 1)
+    return [_public_staging_item(row) for row in grouped.values()]
+
+
+def ignore_staging_item(staging_id: str = "", item_index: Any = 0) -> dict[str, Any]:
+    """Ignore a current registration-staging target without exposing raw refs.
+
+    The ignore is keyed by kind + raw-ref hash, so the same group/contact will
+    not be re-staged by the next provider echo. This is still a local store
+    decision; no WhatsApp send, provider call, or secret-manager write occurs.
+    """
+    init_db()
+    _staging_cleanup()
+    selected_id = str(staging_id or "").strip()
+    if not selected_id and item_index not in (None, "", 0, "0"):
+        try:
+            idx = int(str(item_index).strip())
+        except Exception:
+            return {"ok": False, "error": "item_invalid", "hint": "Use /ignorar N com o número mostrado em /fila."}
+        staged = peek_staging()
+        if idx < 1 or idx > len(staged):
+            return {"ok": False, "error": "item_not_found", "hint": "Use /fila para ver os itens atuais."}
+        selected_id = str(staged[idx - 1].get("staging_id") or "")
+    if not selected_id:
+        return {"ok": False, "error": "staging_id_required", "hint": "Use /ignorar N com o número mostrado em /fila."}
+
+    with _connect() as conn:
+        row = conn.execute(
+            "SELECT * FROM registration_staging WHERE id=? AND expires_at > ? LIMIT 1",
+            (selected_id, utc_now()),
+        ).fetchone()
+        if row is None:
+            return {"ok": False, "error": "item_not_found_or_expired", "hint": "Use /fila para ver os itens atuais."}
+        row_dict = dict(row)
+        kind = str(row_dict.get("kind") or "contact").strip().lower()
+        raw_ref = _raw_ref_for_kind(kind, str(row_dict.get("contact_ref_raw") or ""), str(row_dict.get("thread_ref_raw") or ""))
+        ref_hash = str(row_dict.get("ref_hash") or (hash_text(raw_ref) if raw_ref else ""))
+        public_item = _public_staging_item(row_dict)
+        if not ref_hash:
+            return {"ok": False, "error": "ref_hash_missing"}
+        ignored_id = "ignored_" + uuid.uuid4().hex[:12]
+        now = utc_now()
+        conn.execute(
+            """
+            INSERT INTO registration_ignored (id, kind, ref_hash, safe_hint_json, created_at, source_staging_id)
+            VALUES (?, ?, ?, ?, ?, ?)
+            ON CONFLICT(kind, ref_hash) DO UPDATE SET
+                safe_hint_json=excluded.safe_hint_json,
+                created_at=excluded.created_at,
+                source_staging_id=excluded.source_staging_id
+            """,
+            (
+                ignored_id,
+                kind,
+                ref_hash,
+                json.dumps({
+                    "safe_id": public_item.get("safe_id", ""),
+                    "display_name": public_item.get("display_name", ""),
+                    "kind": kind,
+                    "source_group_name": public_item.get("source_group_name", ""),
+                }, ensure_ascii=False, sort_keys=True),
+                now,
+                selected_id,
+            ),
+        )
+        _delete_staging_row(conn, row_dict)
+    return {
+        "ok": True,
+        "ignored": True,
+        "kind": kind,
+        "staging_id": selected_id,
+        "safe_id": public_item.get("safe_id", ""),
+        "display_name": public_item.get("display_name", ""),
+        "message": "Item removido da fila e marcado para não reaparecer automaticamente.",
+        "send_performed": False,
+        "provider_history_used": False,
+    }
+
+
+
+def registration_staging_diagnostics() -> dict[str, Any]:
+    """Return sanitized registration-staging diagnostics for operator UX.
+
+    Diagnostic/status rendering is read-only: expired staging rows are hidden by
+    peek_staging() but not purged here.
+    """
+    init_db()
+    staging_count = len(peek_staging())
+    latest_created_at = None
+    with _connect() as conn:
+        inbound_count = conn.execute("SELECT COUNT(*) FROM inbound_events").fetchone()[0]
+        latest_rows = conn.execute(
+            "SELECT created_at, payload_redacted_json FROM inbound_events ORDER BY created_at DESC LIMIT 20"
+        ).fetchall()
+    for row in latest_rows:
+        try:
+            payload = json.loads(row["payload_redacted_json"] or "{}")
+        except json.JSONDecodeError:
+            payload = {}
+        if not isinstance(payload, dict) or _payload_message_type(payload) == "system":
+            continue
+        latest_created_at = row["created_at"]
+        break
+    empty_reason = "none"
+    if not staging_count:
+        empty_reason = "no_inbound_yet" if not inbound_count else "no_active_staging_or_expired"
+    return {
+        "staging_ttl_seconds": registration_staging_ttl_seconds(),
+        "staged_count": int(staging_count),
+        "inbound_count": int(inbound_count),
+        "latest_inbound_created_at": latest_created_at,
+        "empty_reason": empty_reason,
+    }
+
+
+# ---------------------------------------------------------------------------
+# Contacts & aliases
+# ---------------------------------------------------------------------------
+
+
+def upsert_contact(
+    *,
+    contact_id: str,
+    display_name: str,
+    phone_e164: str = "",
+    aliases: list[str] | None = None,
+    whitelisted: bool = False,
+    policy_group: str | None = None,
+    metadata: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    """Upsert descriptive person data without granting send authority.
+
+    ``whitelisted`` remains in the signature for legacy callers, but ordinary
+    contact updates never elevate it. Channel authorization is the only grant
+    path and maintains the legacy projection explicitly.
+    """
+    init_db()
+    if not contact_id or not display_name:
+        raise ValueError("contact_id and display_name are required")
+    if type(phone_e164) is not str:
+        raise ValueError("valid WhatsApp address is required")
+    now = utc_now()
+    phone_digits = _trusted_phone_digits(phone_e164)
+    phone_hash = hash_text(phone_digits) if phone_digits else None
+    masked_phone = _safe_existing_phone_mask(phone_e164)
+    phone_value = phone_e164.strip() if phone_digits or masked_phone else None
+    incoming_metadata = dict(metadata) if isinstance(metadata, dict) else {}
+    # CRM identity is an authorization boundary. Generic contact/allowlist
+    # sync may preserve an existing binding but may never create or replace it.
+    incoming_metadata.pop("crm_lead_id", None)
+    incoming_metadata.pop("crm_contact_id", None)
+    with _connect() as conn:
+        existing = conn.execute(
+            "SELECT metadata_json FROM contacts WHERE id=?", (contact_id,)
+        ).fetchone()
+        if existing is not None:
+            try:
+                existing_metadata = json.loads(str(existing["metadata_json"] or "{}"))
+            except (TypeError, json.JSONDecodeError):
+                existing_metadata = {}
+            if isinstance(existing_metadata, dict):
+                for key in ("crm_lead_id", "crm_contact_id"):
+                    if existing_metadata.get(key):
+                        incoming_metadata[key] = existing_metadata[key]
+        conn.execute(
+            """
+            INSERT INTO contacts (
+                id, display_name, phone_e164_hash, phone_e164_enc, whitelisted,
+                policy_group, metadata_json, created_at, updated_at
+            ) VALUES (?, ?, ?, ?, 0, ?, ?, ?, ?)
+            ON CONFLICT(id) DO UPDATE SET
+                display_name=excluded.display_name,
+                phone_e164_hash=COALESCE(excluded.phone_e164_hash, contacts.phone_e164_hash),
+                phone_e164_enc=COALESCE(excluded.phone_e164_enc, contacts.phone_e164_enc),
+                policy_group=excluded.policy_group,
+                metadata_json=excluded.metadata_json,
+                updated_at=excluded.updated_at
+            """,
+            (
+                contact_id,
+                display_name,
+                phone_hash,
+                phone_value,
+                policy_group,
+                json.dumps(incoming_metadata, ensure_ascii=False, sort_keys=True),
+                now,
+                now,
+            ),
+        )
+        alias_values = {
+            _normalize(display_name),
+            *(_normalize(alias) for alias in (aliases or [])),
+        }
+        if phone_digits:
+            alias_values.add(phone_digits)
+        for alias_norm in sorted(a for a in alias_values if a):
+            conn.execute(
+                """
+                INSERT OR IGNORE INTO contact_aliases (id, contact_id, alias_norm, created_at)
+                VALUES (?, ?, ?, ?)
+                """,
+                ("alias_" + uuid.uuid4().hex[:12], contact_id, alias_norm, now),
+            )
+        stored = conn.execute("SELECT * FROM contacts WHERE id=?", (contact_id,)).fetchone()
+    return _safe_contact(dict(stored))
+
+
+def bind_contact_crm_identity(
+    *, contact_id: str, lead_id: str, crm_contact_id: str
+) -> dict[str, str]:
+    """Explicitly bind one local contact to one immutable CRM identity pair."""
+    local_id = str(contact_id or "").strip()
+    lead = str(lead_id or "").strip()
+    crm_contact = str(crm_contact_id or "").strip()
+    if (
+        not local_id
+        or not _CRM_BINDING_ID_RE.fullmatch(lead)
+        or not _CRM_BINDING_ID_RE.fullmatch(crm_contact)
+    ):
+        raise ValueError("invalid CRM contact binding")
+    init_db()
+    with _connect() as conn:
+        row = conn.execute(
+            "SELECT metadata_json FROM contacts WHERE id=?", (local_id,)
+        ).fetchone()
+        if row is None:
+            raise ValueError("CRM contact binding owner not found")
+        try:
+            metadata = json.loads(str(row["metadata_json"] or "{}"))
+        except (TypeError, json.JSONDecodeError):
+            metadata = {}
+        if not isinstance(metadata, dict):
+            metadata = {}
+        existing = (
+            str(metadata.get("crm_lead_id") or "").strip(),
+            str(metadata.get("crm_contact_id") or "").strip(),
+        )
+        requested = (lead, crm_contact)
+        if any(existing) and existing != requested:
+            raise ValueError("CRM contact binding conflict")
+        metadata.update({"crm_lead_id": lead, "crm_contact_id": crm_contact})
+        conn.execute(
+            "UPDATE contacts SET metadata_json=?, updated_at=? WHERE id=?",
+            (json.dumps(metadata, ensure_ascii=False, sort_keys=True), utc_now(), local_id),
+        )
+    return {"lead_id": lead, "contact_id": crm_contact}
+
+
+def upsert_channel(
+    *,
+    contact_id: str,
+    address: str,
+    channel_type: str = "whatsapp",
+    is_active: bool = True,
+    is_primary: bool = False,
+    validation_status: str = "unvalidated",
+    context_key: str = "",
+    source: str = "manual",
+) -> dict[str, Any]:
+    """Upsert channel identity/lifecycle without granting or restoring send."""
+    init_db()
+    if type(contact_id) is not str or not contact_id.strip():
+        raise ValueError("contact channel owner is required")
+    if any(type(flag) is not bool for flag in (is_active, is_primary)):
+        raise ValueError("contact channel flags must be boolean")
+    if type(context_key) is not str or type(source) is not str:
+        raise ValueError("invalid contact channel metadata")
+    if channel_type != "whatsapp":
+        raise ValueError("unsupported contact channel type")
+    if validation_status not in {"unvalidated", "validated", "invalid"}:
+        raise ValueError("invalid contact channel validation status")
+    canonical = _normalize_whatsapp_address(address)
+    address_hash = hash_text(canonical)
+    raw_ref = address.strip() if "@" in address else canonical
+    now = utc_now()
+    with _connect() as conn:
+        owner = conn.execute(
+            "SELECT id FROM contacts WHERE id=?", (contact_id,)
+        ).fetchone()
+        if owner is None:
+            raise ValueError("contact channel owner does not exist")
+        existing = conn.execute(
+            "SELECT * FROM contact_channels WHERE channel_type=? AND address_hash=?",
+            (channel_type, address_hash),
+        ).fetchone()
+        if existing is not None and str(existing["contact_id"]) != contact_id:
+            raise ValueError("contact channel ownership conflict")
+        existing_id = str(existing["id"]) if existing is not None else ""
+        was_revoked = bool(existing is not None and existing["revoked_at"])
+        effective_active = False if was_revoked else bool(is_active)
+        effective_primary = bool(is_primary)
+        if effective_active and effective_primary:
+            conflict = conn.execute(
+                "SELECT id FROM contact_channels WHERE contact_id=? "
+                "AND channel_type='whatsapp' AND is_active=1 AND is_primary=1 AND id<>?",
+                (contact_id, existing_id),
+            ).fetchone()
+            if conflict is not None:
+                raise ValueError("active primary contact channel conflict")
+        if existing is None:
+            channel_id = "channel_" + hash_text("whatsapp:" + canonical)[:20]
+            revoked_at = now if not effective_active else None
+            conn.execute(
+                """
+                INSERT INTO contact_channels (
+                    id, contact_id, channel_type, address_hash, address_ref_enc,
+                    is_active, is_primary, validation_status, allow_send,
+                    authorized_at, revoked_at, context_key_hash, source,
+                    created_at, updated_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, 0, NULL, ?, ?, ?, ?, ?)
+                """,
+                (
+                    channel_id,
+                    contact_id,
+                    channel_type,
+                    address_hash,
+                    raw_ref,
+                    int(effective_active),
+                    int(effective_primary),
+                    validation_status,
+                    revoked_at,
+                    hash_text(context_key) if context_key else None,
+                    str(source or "manual")[:80],
+                    now,
+                    now,
+                ),
+            )
+        else:
+            channel_id = existing_id
+            revoked_at = existing["revoked_at"] or (now if not effective_active else None)
+            allow_send = bool(existing["allow_send"] and effective_active and not revoked_at)
+            conn.execute(
+                """
+                UPDATE contact_channels
+                SET address_ref_enc=?, is_active=?, is_primary=?, validation_status=?,
+                    allow_send=?, revoked_at=?, context_key_hash=?, source=?, updated_at=?
+                WHERE id=?
+                """,
+                (
+                    raw_ref,
+                    int(effective_active),
+                    int(effective_primary),
+                    validation_status,
+                    int(allow_send),
+                    revoked_at,
+                    hash_text(context_key) if context_key else existing["context_key_hash"],
+                    str(source or existing["source"])[:80],
+                    now,
+                    channel_id,
+                ),
+            )
+        row = conn.execute(
+            "SELECT * FROM contact_channels WHERE id=?", (channel_id,)
+        ).fetchone()
+    return _safe_contact_channel(dict(row))
+
+
+def authorize_channel(channel_id: str) -> dict[str, Any]:
+    """Explicitly authorize one exact active, validated, non-revoked channel."""
+    init_db()
+    now = utc_now()
+    with _connect() as conn:
+        row = conn.execute(
+            "SELECT * FROM contact_channels WHERE id=?", (str(channel_id),)
+        ).fetchone()
+        if row is None:
+            raise ValueError("contact channel does not exist")
+        if row["revoked_at"] or not bool(row["is_active"]):
+            raise ValueError("contact channel is inactive or revoked")
+        if str(row["validation_status"]) != "validated":
+            raise ValueError("contact channel must be validated")
+        conn.execute(
+            "UPDATE contact_channels SET allow_send=1, authorized_at=?, updated_at=? WHERE id=?",
+            (now, now, str(channel_id)),
+        )
+        conn.execute(
+            "UPDATE contacts SET whitelisted=1, updated_at=? WHERE id=?",
+            (now, str(row["contact_id"])),
+        )
+        updated = conn.execute(
+            "SELECT * FROM contact_channels WHERE id=?", (str(channel_id),)
+        ).fetchone()
+    return _safe_contact_channel(dict(updated))
+
+
+def revoke_channel(channel_id: str) -> dict[str, Any]:
+    """Logically revoke one channel; ordinary upsert cannot reactivate it."""
+    init_db()
+    now = utc_now()
+    with _connect() as conn:
+        row = conn.execute(
+            "SELECT * FROM contact_channels WHERE id=?", (str(channel_id),)
+        ).fetchone()
+        if row is None:
+            raise ValueError("contact channel does not exist")
+        revoked_at = row["revoked_at"] or now
+        conn.execute(
+            "UPDATE contact_channels SET is_active=0, allow_send=0, revoked_at=?, updated_at=? WHERE id=?",
+            (revoked_at, now, str(channel_id)),
+        )
+        remaining = conn.execute(
+            "SELECT 1 FROM contact_channels WHERE contact_id=? AND is_active=1 "
+            "AND validation_status='validated' AND allow_send=1 AND revoked_at IS NULL LIMIT 1",
+            (str(row["contact_id"]),),
+        ).fetchone()
+        if remaining is None:
+            conn.execute(
+                "UPDATE contacts SET whitelisted=0, updated_at=? WHERE id=?",
+                (now, str(row["contact_id"])),
+            )
+        updated = conn.execute(
+            "SELECT * FROM contact_channels WHERE id=?", (str(channel_id),)
+        ).fetchone()
+    return _safe_contact_channel(dict(updated))
+
+
+def prepare_revoked_channel_for_reauthorization(channel_id: str) -> dict[str, Any]:
+    """Explicitly reopen one validated revoked channel without granting send.
+
+    Ordinary upserts still cannot reactivate revoked channels. This operator-only
+    recovery step is one-shot, audited, and must be followed by authorize_channel.
+    """
+    init_db()
+    now = utc_now()
+    channel_key = str(channel_id or "").strip()
+    with _connect() as conn:
+        row = conn.execute(
+            "SELECT * FROM contact_channels WHERE id=?", (channel_key,)
+        ).fetchone()
+        if row is None:
+            raise ValueError("contact channel does not exist")
+        if not row["revoked_at"] or bool(row["is_active"]) or bool(row["allow_send"]):
+            raise ValueError("contact channel is not safely revoked")
+        if str(row["validation_status"]) != "validated":
+            raise ValueError("contact channel must be validated")
+        if bool(row["is_primary"]):
+            conflict = conn.execute(
+                "SELECT 1 FROM contact_channels WHERE contact_id=? "
+                "AND channel_type='whatsapp' AND is_active=1 AND is_primary=1 AND id<>? LIMIT 1",
+                (str(row["contact_id"]), channel_key),
+            ).fetchone()
+            if conflict is not None:
+                raise ValueError("active primary contact channel conflict")
+        conn.execute(
+            "UPDATE contact_channels SET is_active=1, allow_send=0, authorized_at=NULL, "
+            "revoked_at=NULL, updated_at=? WHERE id=?",
+            (now, channel_key),
+        )
+        conn.execute(
+            """
+            INSERT INTO audit_log (
+                id, event_type, entity_type, entity_id, actor_ref_hash,
+                safe_summary, metadata_redacted_json, created_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                "audit_" + uuid.uuid4().hex[:12],
+                "contact_channel_reactivation_prepared",
+                "contact_channel",
+                channel_key,
+                None,
+                "validated revoked channel prepared for explicit reauthorization",
+                json.dumps({"send_granted": False}, sort_keys=True),
+                now,
+            ),
+        )
+        updated = conn.execute(
+            "SELECT * FROM contact_channels WHERE id=?", (channel_key,)
+        ).fetchone()
+    return _safe_contact_channel(dict(updated))
+
+
+def get_contact_channel(channel_id: str) -> dict[str, Any] | None:
+    init_db()
+    with _connect() as conn:
+        row = conn.execute(
+            "SELECT * FROM contact_channels WHERE id=?", (str(channel_id),)
+        ).fetchone()
+    return _safe_contact_channel(dict(row)) if row is not None else None
+
+
+def list_contact_channels(
+    contact_id: str, *, include_inactive: bool = False
+) -> list[dict[str, Any]]:
+    init_db()
+    with _connect() as conn:
+        if include_inactive:
+            rows = conn.execute(
+                "SELECT * FROM contact_channels WHERE contact_id=? "
+                "ORDER BY is_active DESC, is_primary DESC, created_at ASC, id ASC",
+                (str(contact_id),),
+            ).fetchall()
+        else:
+            rows = conn.execute(
+                "SELECT * FROM contact_channels WHERE contact_id=? AND is_active=1 "
+                "ORDER BY is_primary DESC, created_at ASC, id ASC",
+                (str(contact_id),),
+            ).fetchall()
+    return [_safe_contact_channel(dict(row)) for row in rows]
+
+
+def get_transport_contact_ref(query: str, *, channel_id: str = "") -> str:
+    """Resolve only one exact active, validated, authorized, allowlisted channel."""
+    init_db()
+    needle = str(query or "").strip()
+    if not needle:
+        return ""
+    needle_norm = _normalize(needle)
+    needle_digits = _phone_digits(needle)
+    with _connect() as conn:
+        contacts = conn.execute(
+            """
+            SELECT DISTINCT c.id
+            FROM contacts c
+            LEFT JOIN contact_aliases a ON a.contact_id=c.id
+            WHERE c.whitelisted=1 AND (
+                c.id=? OR a.alias_norm=? OR lower(c.display_name)=?
+                OR (? != '' AND c.phone_e164_hash=?)
+            )
+            LIMIT 2
+            """,
+            (
+                needle,
+                needle_norm,
+                needle_norm,
+                needle_digits,
+                hash_text(needle_digits) if needle_digits else "",
+            ),
+        ).fetchall()
+        if len(contacts) != 1:
+            return ""
+        sql = (
+            "SELECT address_ref_enc FROM contact_channels "
+            "WHERE contact_id=? AND is_active=1 AND validation_status='validated' "
+            "AND allow_send=1 AND revoked_at IS NULL"
+        )
+        params: list[Any] = [str(contacts[0]["id"])]
+        if channel_id:
+            sql += " AND id=?"
+            params.append(str(channel_id))
+        sql += " LIMIT 2"
+        channels = conn.execute(sql, tuple(params)).fetchall()
+    if len(channels) != 1:
+        return ""
+    return str(channels[0]["address_ref_enc"] or "").strip()
+
+
+def preview_crm_identity_sync(
+    *,
+    contact_rows: list[dict[str, Any]],
+    channel_rows: list[dict[str, Any]] | None = None,
+    limit: int = 200,
+) -> dict[str, Any]:
+    """Build a bounded, sanitized identity preview without any local/CRM write."""
+    if not isinstance(contact_rows, list) or not isinstance(channel_rows or [], list):
+        return {"ok": False, "error": "crm_identity_rows_invalid"}
+    bounded_limit = max(1, min(int(limit or 200), 500))
+    contacts_in = contact_rows[:bounded_limit]
+    channels_in = (channel_rows or [])[:bounded_limit]
+    truncated = len(contact_rows) > bounded_limit or len(channel_rows or []) > bounded_limit
+    invalid_count = duplicate_count = ambiguous_count = 0
+    contact_proposals: list[dict[str, Any]] = []
+    channel_proposals: list[dict[str, Any]] = []
+    known_contacts: set[str] = set()
+    candidates: list[dict[str, Any]] = []
+    for row in contacts_in:
+        if not isinstance(row, dict):
+            invalid_count += 1
+            continue
+        contact_id = str(row.get("contact_id") or row.get("id") or "").strip()
+        display_name = _clean_registration_text(
+            row.get("display_name") or row.get("name"), limit=80
+        )
+        if not contact_id or not display_name:
+            invalid_count += 1
+            continue
+        safe_contact_id = _safe_contact_id(contact_id)
+        known_contacts.add(contact_id)
+        contact_proposals.append(
+            {"contact_id": safe_contact_id, "display_name": display_name}
+        )
+        legacy_address = str(
+            row.get("phone") or row.get("phone_e164") or row.get("address") or ""
+        ).strip()
+        if legacy_address:
+            candidates.append(
+                {
+                    "contact_id": contact_id,
+                    "address": legacy_address,
+                    "is_primary": True,
+                    "source": "crm_legacy_phone",
+                }
+            )
+    candidates.extend(row for row in channels_in if isinstance(row, dict))
+    invalid_count += sum(1 for row in channels_in if not isinstance(row, dict))
+    seen_addresses: set[str] = set()
+    primary_by_contact: dict[str, set[str]] = {}
+    for row in candidates:
+        contact_id = str(row.get("contact_id") or row.get("person_id") or "").strip()
+        address = str(row.get("address") or row.get("phone") or row.get("phone_e164") or "").strip()
+        if not contact_id or contact_id not in known_contacts or not address:
+            invalid_count += 1
+            continue
+        try:
+            canonical = _normalize_whatsapp_address(address)
+        except ValueError:
+            invalid_count += 1
+            continue
+        address_hash = hash_text(canonical)
+        if address_hash in seen_addresses:
+            duplicate_count += 1
+            continue
+        seen_addresses.add(address_hash)
+        is_primary = bool(row.get("is_primary", False))
+        if is_primary:
+            primary_by_contact.setdefault(contact_id, set()).add(address_hash)
+        channel_proposals.append(
+            {
+                "channel_id": "channel_" + hash_text("whatsapp:" + canonical)[:20],
+                "contact_id": _safe_contact_id(contact_id),
+                "channel_type": "whatsapp",
+                "address_masked": "***" + canonical[-4:],
+                "is_primary": is_primary,
+                "validation_status": "unvalidated",
+                "allow_send": False,
+                "source": str(row.get("source") or "crm_channel")[:40],
+            }
+        )
+    ambiguous_count = sum(1 for values in primary_by_contact.values() if len(values) > 1)
+    return {
+        "ok": True,
+        "source": "crm_rows",
+        "contact_proposals": contact_proposals,
+        "channel_proposals": channel_proposals,
+        "valid_count": len(channel_proposals),
+        "invalid_count": invalid_count,
+        "duplicate_count": duplicate_count,
+        "ambiguous_count": ambiguous_count,
+        "truncated": truncated,
+        "crm_write_performed": False,
+        "local_write_performed": False,
+        "allow_send_changes": 0,
+    }
+
+
+def resolve_contact(query: str) -> dict[str, Any]:
+    init_db()
+    query_norm = _normalize(query)
+    query_digits = _phone_digits(query)
+    if not query_norm and not query_digits:
+        return {"ok": True, "ambiguous": True, "matches": [], "query": ""}
+    with _connect() as conn:
+        rows = conn.execute(
+            """
+            SELECT DISTINCT c.*
+            FROM contacts c
+            LEFT JOIN contact_aliases a ON a.contact_id = c.id
+            WHERE c.id = ?
+               OR a.alias_norm = ?
+               OR (? != '' AND c.phone_e164_hash = ?)
+               OR lower(c.display_name) LIKE ?
+            ORDER BY c.display_name ASC
+            LIMIT 6
+            """,
+            (query, query_norm, query_digits, hash_text(query_digits) if query_digits else "", f"%{query_norm}%"),
+        ).fetchall()
+    matches = [_safe_contact(dict(row)) for row in rows]
+    if len(matches) == 1:
+        return {"ok": True, "ambiguous": False, "match": matches[0], "matches": matches}
+    return {"ok": True, "ambiguous": True, "matches": matches, "query": str(query)[:80]}
+
+
+def list_contacts(filter_text: str = "", limit: int = 50) -> list[dict[str, Any]]:
+    init_db()
+    filter_norm = _normalize(filter_text)
+    limit = max(1, min(int(limit or 50), 100))
+    with _connect() as conn:
+        if filter_norm:
+            rows = conn.execute(
+                """
+                SELECT DISTINCT c.*
+                FROM contacts c
+                LEFT JOIN contact_aliases a ON a.contact_id = c.id
+                WHERE a.alias_norm LIKE ?
+                   OR lower(c.display_name) LIKE ?
+                   OR lower(COALESCE(c.metadata_json, '')) LIKE ?
+                ORDER BY c.display_name ASC
+                LIMIT ?
+                """,
+                (f"%{filter_norm}%", f"%{filter_norm}%", f"%{filter_norm}%", limit),
+            ).fetchall()
+        else:
+            rows = conn.execute("SELECT * FROM contacts ORDER BY display_name ASC LIMIT ?", (limit,)).fetchall()
+    return [_safe_contact(dict(row)) for row in rows]
+
+
+def get_transport_group_ref(query: str) -> str:
+    """Return raw provider ref for an allowlisted group/list, for transport only."""
+    init_db()
+    needle = str(query or "").strip()
+    if not needle:
+        return ""
+    needle_norm = _normalize(needle)
+    with _connect() as conn:
+        rows = conn.execute(
+            """
+            SELECT *
+            FROM lists
+            WHERE allowed = 1
+              AND (id = ? OR name_norm = ? OR lower(name) = ?)
+            LIMIT 2
+            """,
+            (needle, needle_norm, needle_norm),
+        ).fetchall()
+    if len(rows) != 1:
+        return ""
+    return str(dict(rows[0]).get("target_ref_enc") or "").strip()
+
+
+def _segment_id_from_name(name: str) -> str:
+    return "segment_" + hash_text(_normalize(name))[:16]
+
+
+def _normalize_contact_ref_for_import(value: str) -> str:
+    raw = str(value or "").strip()
+    if not raw:
+        return ""
+    if "@" in raw:
+        return raw
+    digits = _phone_digits(raw)
+    if len(digits) >= 8:
+        return f"{digits}@s.whatsapp.net"
+    return raw
+
+
+def import_contact_list_local(
+    *,
+    list_name: str,
+    contacts: list[dict[str, Any]],
+    allow_send: bool = False,
+    policy_group: str = "lead",
+    source: str = "manual_import",
+) -> dict[str, Any]:
+    """Import a commercial contact segment into local SQLite.
+
+    Raw refs are retained only for operational transport; the returned summary is
+    sanitized. ``allow_send`` defaults false, so imported prospect lists cannot
+    be sent to until the operator explicitly opts into send allowlisting.
+    """
+    init_db()
+    name = str(list_name or "").strip()
+    if not name:
+        return {"ok": False, "error": "list_name_required"}
+    if not isinstance(contacts, list) or not contacts:
+        return {"ok": False, "error": "contacts_required"}
+    now = utc_now()
+    list_id = _segment_id_from_name(name)
+    imported: list[dict[str, Any]] = []
+    skipped = 0
+    with _connect() as conn:
+        conn.execute(
+            """
+            INSERT INTO lists (id, name, name_norm, allowed, target_ref_enc, metadata_json, created_at, updated_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+            ON CONFLICT(name_norm) DO UPDATE SET
+                name=excluded.name,
+                metadata_json=excluded.metadata_json,
+                updated_at=excluded.updated_at
+            """,
+            (
+                list_id,
+                name,
+                _normalize(name),
+                0,
+                None,
+                json.dumps({"source": source, "kind": "contact_segment"}, ensure_ascii=False, sort_keys=True),
+                now,
+                now,
+            ),
+        )
+    for item in contacts[:500]:
+        if not isinstance(item, dict):
+            skipped += 1
+            continue
+        alias = str(item.get("alias") or item.get("name") or item.get("display_name") or "").strip()
+        raw_ref = _normalize_contact_ref_for_import(str(item.get("target_ref") or item.get("phone") or item.get("phone_e164") or ""))
+        if not alias or not raw_ref:
+            skipped += 1
+            continue
+        contact_id = _contact_id_from_target(raw_ref)
+        display = str(item.get("display_name") or item.get("name") or alias).strip() or alias
+        metadata = {
+            "source": source,
+            "target_ref_hash": hash_text(raw_ref),
+            "segment_id": list_id,
+        }
+        upsert_contact(
+            contact_id=contact_id,
+            display_name=display,
+            phone_e164=raw_ref,
+            aliases=[alias],
+            policy_group=policy_group,
+            metadata=metadata,
+        )
+        channel = upsert_channel(
+            contact_id=contact_id,
+            address=raw_ref,
+            is_primary=True,
+            validation_status="validated",
+            source=source,
+        )
+        if allow_send:
+            authorize_channel(channel["channel_id"])
+        with _connect() as conn:
+            conn.execute(
+                "INSERT OR IGNORE INTO list_members (list_id, contact_id, created_at) VALUES (?, ?, ?)",
+                (list_id, contact_id, now),
+            )
+        imported.append({"contact_id": contact_id, "display_name": display, "whitelisted": bool(allow_send)})
+    return {
+        "ok": True,
+        "list_id": list_id,
+        "name": name,
+        "imported_count": len(imported),
+        "skipped_count": skipped,
+        "allow_send": bool(allow_send),
+        "contacts": [_safe_contact({"id": c["contact_id"], "display_name": c["display_name"], "phone_e164_enc": "", "whitelisted": c["whitelisted"], "policy_group": policy_group}) for c in imported[:50]],
+    }
+
+
+def list_contact_segments(limit: int = 50) -> list[dict[str, Any]]:
+    init_db()
+    limit = max(1, min(int(limit or 50), 100))
+    with _connect() as conn:
+        rows = conn.execute(
+            """
+            SELECT l.id, l.name, l.allowed, l.metadata_json,
+                   count(m.contact_id) AS member_count,
+                   sum(CASE WHEN c.whitelisted = 1 THEN 1 ELSE 0 END) AS whitelisted_count
+            FROM lists l
+            LEFT JOIN list_members m ON m.list_id = l.id
+            LEFT JOIN contacts c ON c.id = m.contact_id
+            WHERE l.id LIKE 'segment_%' OR json_extract(COALESCE(l.metadata_json, '{}'), '$.kind') = 'contact_segment'
+            GROUP BY l.id
+            ORDER BY l.updated_at DESC
+            LIMIT ?
+            """,
+            (limit,),
+        ).fetchall()
+    return [
+        {
+            "list_id": row["id"],
+            "name": row["name"],
+            "member_count": int(row["member_count"] or 0),
+            "whitelisted_count": int(row["whitelisted_count"] or 0),
+            "bulk_send_allowed": bool(row["allowed"]),
+        }
+        for row in rows
+    ]
+
+
+def list_contact_segment_members(list_ref: str, limit: int = 50) -> dict[str, Any]:
+    init_db()
+    ref = str(list_ref or "").strip()
+    if not ref:
+        return {"ok": False, "error": "list_ref_required"}
+    limit = max(1, min(int(limit or 50), 100))
+    ref_norm = _normalize(ref)
+    with _connect() as conn:
+        segment = conn.execute(
+            "SELECT * FROM lists WHERE id=? OR name_norm=? LIMIT 1",
+            (ref, ref_norm),
+        ).fetchone()
+        if segment is None:
+            return {"ok": False, "error": "list_not_found"}
+        rows = conn.execute(
+            """
+            SELECT c.*
+            FROM list_members m
+            JOIN contacts c ON c.id = m.contact_id
+            WHERE m.list_id=?
+            ORDER BY c.display_name ASC
+            LIMIT ?
+            """,
+            (segment["id"], limit),
+        ).fetchall()
+    return {"ok": True, "list_id": segment["id"], "name": segment["name"], "contacts": [_safe_contact(dict(row)) for row in rows]}
+
+
+# ---------------------------------------------------------------------------
+# Local registration (writes to SQLite directly, not via env/Infisical)
+# ---------------------------------------------------------------------------
+
+
+def register_contact_local(
+    *,
+    alias: str,
+    raw_ref: str,
+    display_name: str | None = None,
+    policy_group: str = "manual",
+    allow_send: bool = False,
+) -> dict[str, Any]:
+    """Register a contact in the local SQLite allowlist cache.
+
+    This writes directly to the operational DB, bypassing Infisical/env.
+    The registration survives runtime sync_allowlist_from_env() calls
+    because upsert only adds/updates — it never deletes existing rows.
+
+    Returns sanitized contact info (no raw ref in output).
+    """
+    init_db()
+    if not alias.strip():
+        return {"ok": False, "error": "alias_required"}
+    if not raw_ref.strip():
+        return {"ok": False, "error": "raw_ref_required"}
+    contact_id = _contact_id_from_target(raw_ref)
+    display = (display_name or alias).strip() or alias
+    metadata = {
+        "source": "local_registration",
+        "target_ref_hash": hash_text(raw_ref),
+    }
+    try:
+        result = upsert_contact(
+            contact_id=contact_id,
+            display_name=display,
+            phone_e164=raw_ref,
+            aliases=[alias],
+            policy_group=policy_group,
+            metadata=metadata,
+        )
+        channel = upsert_channel(
+            contact_id=contact_id,
+            address=raw_ref,
+            is_primary=True,
+            validation_status="validated",
+            source="local_registration",
+        )
+        if allow_send:
+            authorize_channel(channel["channel_id"])
+        result = resolve_contact(contact_id).get("match") or result
+    except ValueError as exc:
+        if "valid WhatsApp address" in str(exc) and not allow_send:
+            result = resolve_contact(contact_id).get("match") or result
+            return {"ok": True, **result}
+        return {"ok": False, "error": str(exc)[:200]}
+    return {"ok": True, **result}
+
+
+def register_group_local(
+    *,
+    alias: str,
+    raw_ref: str,
+    display_name: str | None = None,
+    policy_group: str = "manual",
+    allow_send: bool = False,
+) -> dict[str, Any]:
+    """Register a group in the local SQLite allowlist cache.
+
+    Same semantics as ``register_contact_local`` but for groups/lists.
+    """
+    init_db()
+    if not alias.strip():
+        return {"ok": False, "error": "alias_required"}
+    if not raw_ref.strip():
+        return {"ok": False, "error": "raw_ref_required"}
+    list_id = "list_" + hash_text(raw_ref)[:16]
+    name = (display_name or alias).strip() or alias
+    now = utc_now()
+    metadata = {
+        "source": "local_registration",
+        "target_ref_hash": hash_text(raw_ref),
+    }
+    with _connect() as conn:
+        conn.execute(
+            """
+            INSERT INTO lists (id, name, name_norm, allowed, target_ref_enc, metadata_json, created_at, updated_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+            ON CONFLICT(name_norm) DO UPDATE SET
+                name=excluded.name,
+                allowed=excluded.allowed,
+                target_ref_enc=excluded.target_ref_enc,
+                metadata_json=excluded.metadata_json,
+                updated_at=excluded.updated_at
+            """,
+            (
+                list_id,
+                name,
+                _normalize(name),
+                1 if allow_send else 0,
+                raw_ref,
+                json.dumps(metadata, ensure_ascii=False, sort_keys=True),
+                now,
+                now,
+            ),
+        )
+    return {
+        "ok": True,
+        "group_id": list_id,
+        "name": name,
+        "allow_send": bool(allow_send),
+        "policy_group": policy_group,
+    }
+
+
+# ---------------------------------------------------------------------------
+# Conversation target resolution (read-only, no raw refs in public output)
+# ---------------------------------------------------------------------------
+
+
+def _public_conversation_candidate(candidate: dict[str, Any]) -> dict[str, Any]:
+    result = {
+        "target_kind": str(candidate.get("target_kind") or ""),
+        "target_label": _clean_registration_text(candidate.get("target_label") or candidate.get("target_safe_id") or "alvo", limit=80) or "alvo",
+        "target_safe_id": str(candidate.get("target_safe_id") or "")[:80],
+        "source": str(candidate.get("source") or "local")[:80],
+        "thread_filter_set": bool(candidate.get("thread_ref")),
+        "contact_filter_set": bool(candidate.get("contact_ref")),
+    }
+    if candidate.get("staging_id"):
+        result["staging_id"] = str(candidate.get("staging_id"))[:80]
+    if candidate.get("message_count") not in (None, ""):
+        try:
+            result["message_count"] = int(candidate.get("message_count") or 0)
+        except Exception:
+            pass
+    if candidate.get("last_seen_at"):
+        result["last_seen_at"] = str(candidate.get("last_seen_at"))[:80]
+    return result
+
+
+def _conversation_target_response(candidate: dict[str, Any], *, include_transport: bool = False) -> dict[str, Any]:
+    public = _public_conversation_candidate(candidate)
+    public.update({"ok": True, "ambiguous": False})
+    if include_transport:
+        public["_thread_ref"] = str(candidate.get("thread_ref") or "")
+        public["_contact_ref"] = str(candidate.get("contact_ref") or "")
+    return public
+
+
+def _candidate_from_staging_row(row: dict[str, Any], *, source: str = "staging") -> dict[str, Any] | None:
+    kind = str(row.get("kind") or "contact").strip().lower()
+    contact_ref = str(row.get("contact_ref_raw") or "")
+    thread_ref = str(row.get("thread_ref_raw") or "")
+    raw_ref = _raw_ref_for_kind(kind, contact_ref, thread_ref)
+    if not raw_ref:
+        return None
+    public = _public_staging_item(row)
+    label = public.get("display_name") or public.get("phone_masked") or public.get("safe_id") or "alvo"
+    return {
+        "target_kind": "group" if kind == "group" else "contact",
+        "target_label": label,
+        "target_safe_id": public.get("safe_id") or _safe_registration_id(kind, raw_ref),
+        "source": source,
+        "thread_ref": raw_ref if kind == "group" else "",
+        "contact_ref": raw_ref if kind != "group" else "",
+        "staging_id": public.get("staging_id") or row.get("id") or "",
+        "message_count": public.get("message_count"),
+        "last_seen_at": public.get("last_seen_at") or public.get("created_at"),
+    }
+
+
+def _candidate_from_registered_group(row: dict[str, Any]) -> dict[str, Any] | None:
+    raw_ref = str(row.get("target_ref_enc") or "").strip()
+    if not raw_ref:
+        return None
+    return {
+        "target_kind": "group",
+        "target_label": row.get("name") or "grupo",
+        "target_safe_id": str(row.get("id") or ("list_" + hash_text(raw_ref)[:16])),
+        "source": "registered_group",
+        "thread_ref": raw_ref,
+        "contact_ref": "",
+    }
+
+
+def _candidate_from_registered_contact(row: dict[str, Any]) -> dict[str, Any] | None:
+    raw_ref = str(row.get("phone_e164_enc") or "").strip()
+    if not raw_ref:
+        return None
+    return {
+        "target_kind": "contact",
+        "target_label": row.get("display_name") or "contato",
+        "target_safe_id": _safe_contact_id(str(row.get("id") or "")),
+        "source": "registered_contact",
+        "thread_ref": "",
+        "contact_ref": raw_ref,
+    }
+
+
+def _conversation_target_for_queue_item(item_index: int) -> dict[str, Any] | None:
+    queue = get_actionable_queue(limit=max(10, min(int(item_index or 0), 50)))
+    items = queue.get("items") if isinstance(queue, dict) else []
+    if not isinstance(items, list) or item_index < 1 or item_index > len(items):
+        return {"ok": False, "error": "item_not_found", "hint": "Use /fila para ver os itens atuais."}
+    item = items[item_index - 1]
+    if not isinstance(item, dict):
+        return {"ok": False, "error": "item_invalid"}
+    if item.get("kind") == "context":
+        return {
+            "target_kind": "context",
+            "target_label": item.get("operator_title") or item.get("title") or "Contexto recente",
+            "target_safe_id": str(item.get("safe_event_id") or "context_recent")[:80],
+            "source": "queue_context",
+            "thread_ref": "",
+            "contact_ref": "",
+            "message_count": 1,
+            "last_seen_at": item.get("created_at") or "",
+        }
+    if item.get("kind") != "registration" or not item.get("staging_id"):
+        return {
+            "ok": False,
+            "error": "item_not_conversation_target",
+            "hint": "Use um item de cadastro mostrado em /fila ou informe o nome do grupo/contato.",
+        }
+    with _connect() as conn:
+        row = conn.execute(
+            "SELECT * FROM registration_staging WHERE id=? AND expires_at > ? LIMIT 1",
+            (str(item.get("staging_id") or ""), utc_now()),
+        ).fetchone()
+    if row is None:
+        return {"ok": False, "error": "item_not_found_or_expired", "hint": "Use /fila novamente."}
+    return _candidate_from_staging_row(dict(row), source="queue")
+
+
+def resolve_conversation_target(
+    query: str = "",
+    *,
+    item_index: Any = 0,
+    prefer: str = "",
+    include_transport: bool = False,
+) -> dict[str, Any]:
+    """Resolve an operator-safe WhatsApp conversation target.
+
+    Public output never includes raw WhatsApp refs, phones, URLs, or payloads.
+    ``include_transport=True`` is only for internal callers that need the raw
+    local ref to filter already-sanitized ``inbound_events``.
+    """
+    init_db()
+    try:
+        idx = int(str(item_index or 0).strip() or "0")
+    except Exception:
+        return {"ok": False, "error": "item_invalid", "hint": "Use /ctxwpp item N ou /ctxwpp <nome>."}
+    if idx > 0:
+        candidate = _conversation_target_for_queue_item(idx)
+        if not candidate or candidate.get("ok") is False:
+            return candidate or {"ok": False, "error": "item_not_found"}
+        return _conversation_target_response(candidate, include_transport=include_transport)
+
+    needle = str(query or "").strip()
+    if not needle:
+        return {"ok": False, "error": "target_required", "hint": "Use /ctxwpp <nome>, /ctxwpp item N ou /ctxwpp ajuda."}
+    needle_norm = _normalize(needle)
+    needle_digits = _phone_digits(needle)
+    prefer_norm = str(prefer or "").strip().lower()
+    candidates: list[dict[str, Any]] = []
+
+    with _connect() as conn:
+        list_rows = conn.execute(
+            """
+            SELECT *
+            FROM lists
+            WHERE id = ? OR name_norm = ? OR lower(name) LIKE ?
+            ORDER BY CASE WHEN name_norm = ? THEN 0 ELSE 1 END, name ASC
+            LIMIT 8
+            """,
+            (needle, needle_norm, f"%{needle_norm}%", needle_norm),
+        ).fetchall()
+        contact_rows = conn.execute(
+            """
+            SELECT DISTINCT c.*
+            FROM contacts c
+            LEFT JOIN contact_aliases a ON a.contact_id = c.id
+            WHERE c.id = ?
+               OR a.alias_norm = ?
+               OR (? != '' AND c.phone_e164_hash = ?)
+               OR lower(c.display_name) LIKE ?
+            ORDER BY CASE WHEN lower(c.display_name) = ? THEN 0 ELSE 1 END, c.display_name ASC
+            LIMIT 8
+            """,
+            (needle, needle_norm, needle_digits, hash_text(needle_digits) if needle_digits else "", f"%{needle_norm}%", needle_norm),
+        ).fetchall()
+        staging_rows = conn.execute(
+            """
+            SELECT *
+            FROM registration_staging
+            WHERE expires_at > ?
+            ORDER BY COALESCE(last_seen_at, created_at) DESC, created_at DESC
+            LIMIT 50
+            """,
+            (utc_now(),),
+        ).fetchall()
+
+    for row in list_rows:
+        candidate = _candidate_from_registered_group(dict(row))
+        if candidate:
+            candidates.append(candidate)
+    for row in contact_rows:
+        candidate = _candidate_from_registered_contact(dict(row))
+        if candidate:
+            candidates.append(candidate)
+    for row in staging_rows:
+        row_dict = dict(row)
+        if _is_system_staging_row(row_dict):
+            continue
+        public = _public_staging_item(row_dict)
+        safe_id = str(public.get("safe_id") or "")
+        label = str(public.get("display_name") or public.get("phone_masked") or "")
+        if needle in {str(public.get("staging_id") or ""), safe_id} or _normalize(label) == needle_norm or needle_norm in _normalize(label):
+            candidate = _candidate_from_staging_row(row_dict, source="staging")
+            if candidate:
+                candidates.append(candidate)
+
+    if prefer_norm in {"group", "grupo"}:
+        candidates = [c for c in candidates if c.get("target_kind") == "group"]
+    elif prefer_norm in {"contact", "contato", "dm"}:
+        candidates = [c for c in candidates if c.get("target_kind") == "contact"]
+
+    deduped: list[dict[str, Any]] = []
+    seen: set[tuple[str, str, str]] = set()
+    for candidate in candidates:
+        key = (
+            str(candidate.get("target_kind") or ""),
+            hash_text(str(candidate.get("thread_ref") or candidate.get("contact_ref") or candidate.get("target_safe_id") or "")),
+            str(candidate.get("source") or ""),
+        )
+        if key in seen:
+            continue
+        seen.add(key)
+        deduped.append(candidate)
+    candidates = deduped
+
+    if not candidates:
+        return {
+            "ok": False,
+            "error": "target_not_found",
+            "query": _clean_registration_text(needle, limit=80),
+            "hint": "Use /fila para ver itens recentes ou cadastre o grupo/contato primeiro.",
+        }
+    if len(candidates) == 1:
+        return _conversation_target_response(candidates[0], include_transport=include_transport)
+    return {
+        "ok": True,
+        "ambiguous": True,
+        "query": _clean_registration_text(needle, limit=80),
+        "matches": [_public_conversation_candidate(candidate) for candidate in candidates[:6]],
+        "hint": "Alvo ambíguo. Use /ctxwpp item N pela fila ou refine o nome.",
+    }
+
+
+# ---------------------------------------------------------------------------
+# Env-based allowlist sync
+# ---------------------------------------------------------------------------
+
+
+def _load_allowlist_json(env_name: str, default: Any, *fallback_env_names: str) -> Any:
+    raw = ""
+    for candidate in (env_name, *fallback_env_names):
+        raw = os.environ.get(candidate, "").strip()
+        if raw:
+            break
+    if not raw:
+        return default
+    try:
+        return json.loads(raw)
+    except json.JSONDecodeError as exc:
+        raise ValueError("allowlist_json_invalid") from exc
+
+
+def _iter_alias_map_entries(alias_map: Any) -> list[dict[str, Any]]:
+    if not isinstance(alias_map, dict):
+        return []
+    entries: list[dict[str, Any]] = []
+    for alias, value in alias_map.items():
+        if isinstance(value, dict):
+            item = dict(value)
+            item.setdefault("alias", alias)
+            entries.append(item)
+        elif isinstance(value, str):
+            entries.append({"alias": alias, "target_ref": value, "kind": "contact"})
+    return entries
+
+
+def _contact_id_from_target(target_ref: str) -> str:
+    return "contact_" + hash_text(target_ref)[:16]
+
+
+def _contact_id_for_unique_alias(alias: str) -> str:
+    alias_norm = _normalize(alias)
+    if not alias_norm:
+        return ""
+    with _connect() as conn:
+        rows = conn.execute(
+            "SELECT DISTINCT contact_id FROM contact_aliases WHERE alias_norm=? LIMIT 2",
+            (alias_norm,),
+        ).fetchall()
+    return str(rows[0]["contact_id"]) if len(rows) == 1 else ""
+
+
+def _sync_contact_item(item: dict[str, Any], *, source: str = "env") -> bool:
+    alias = str(item.get("alias") or "").strip()
+    target_ref = str(item.get("target_ref") or "").strip()
+    kind = str(item.get("kind") or "contact").strip().lower()
+    if kind not in {"contact", "dm"}:
+        return False
+    if not alias or not target_ref:
+        raise ValueError("allowlist_entry_invalid")
+    display_name = str(item.get("display_name") or alias).strip() or alias
+    metadata = {
+        "source": source,
+        "target_ref_hash": hash_text(target_ref),
+        "allow_receive": bool(item.get("allow_receive", True)),
+        "allow_send": bool(item.get("allow_send", False)),
+    }
+    contact_id = (
+        str(item.get("contact_id") or "").strip()
+        or _contact_id_for_unique_alias(alias)
+        or _contact_id_from_target(target_ref)
+    )
+    upsert_contact(
+        contact_id=contact_id,
+        display_name=display_name,
+        phone_e164=target_ref,
+        aliases=[alias],
+        policy_group=item.get("policy_group"),
+        metadata=metadata,
+    )
+    try:
+        channel = upsert_channel(
+            contact_id=contact_id,
+            address=target_ref,
+            is_primary=True,
+            validation_status="validated",
+            source=source,
+        )
+    except ValueError as exc:
+        # Provider-only identifiers such as @lid remain valid receive-only
+        # person aliases, but are never promoted into a sendable phone channel.
+        if "valid WhatsApp address" not in str(exc):
+            raise
+        if bool(item.get("allow_send", False)):
+            # Preserve the explicit legacy parent allowlist projection for
+            # diagnostics/policy, while channel resolution still blocks send.
+            now = utc_now()
+            with _connect() as conn:
+                conn.execute(
+                    "UPDATE contacts SET whitelisted=1, updated_at=? WHERE id=?",
+                    (now, contact_id),
+                )
+        return True
+    if bool(item.get("allow_send", False)):
+        authorize_channel(channel["channel_id"])
+    return True
+
+
+def sync_contact_allowlist_items(
+    items: list[dict[str, Any]], *, source: str = "runtime_config"
+) -> dict[str, Any]:
+    """Materialize explicit non-CRM allowlist entries into local channel authority."""
+    init_db()
+    if not isinstance(items, list):
+        return {"ok": False, "error": "allowlist_json_invalid"}
+    synced = 0
+    try:
+        for raw_item in items:
+            if not isinstance(raw_item, dict):
+                raise ValueError("allowlist_entry_invalid")
+            item = dict(raw_item)
+            target_ref = str(item.get("target_ref") or "").strip()
+            if not item.get("alias") and target_ref:
+                item["alias"] = (
+                    str(item.get("contact_id") or "").strip()
+                    or _contact_id_from_target(target_ref)
+                )
+            if _sync_contact_item(item, source=source):
+                synced += 1
+    except ValueError as exc:
+        return {"ok": False, "error": str(exc)}
+    return {"ok": True, "source": source, "contacts_synced": synced}
+
+
+def _sync_group_item(item: dict[str, Any]) -> bool:
+    alias = str(item.get("alias") or item.get("name") or "").strip()
+    target_ref = str(item.get("target_ref") or "").strip()
+    kind = str(item.get("kind") or "group").strip().lower()
+    if kind not in {"group", "list"}:
+        return False
+    if not alias or not target_ref:
+        raise ValueError("allowlist_entry_invalid")
+    now = utc_now()
+    list_id = "list_" + hash_text(target_ref)[:16]
+    metadata = {
+        "source": "env",
+        "target_ref_hash": hash_text(target_ref),
+        "allow_receive": bool(item.get("allow_receive", True)),
+        "allow_send": bool(item.get("allow_send", False)),
+    }
+    with _connect() as conn:
+        conn.execute(
+            """
+            INSERT INTO lists (id, name, name_norm, allowed, target_ref_enc, metadata_json, created_at, updated_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+            ON CONFLICT(name_norm) DO UPDATE SET
+                name=excluded.name,
+                allowed=excluded.allowed,
+                target_ref_enc=excluded.target_ref_enc,
+                metadata_json=excluded.metadata_json,
+                updated_at=excluded.updated_at
+            """,
+            (
+                list_id,
+                alias,
+                _normalize(alias),
+                1 if bool(item.get("allow_send", False)) else 0,
+                target_ref,
+                json.dumps(metadata, ensure_ascii=False, sort_keys=True),
+                now,
+                now,
+            ),
+        )
+    return True
+
+
+def sync_allowlist_from_env() -> dict[str, Any]:
+    """Sync Infisical-rendered allowlist env into the local runtime cache.
+
+    Infisical/env is the source of truth for raw WhatsApp refs. SQLite keeps a
+    derived, sanitized operational cache: target refs are converted to stable
+    hashes/ids and never returned by this function.
+    """
+    init_db()
+    try:
+        contacts = _load_allowlist_json("CONTACTS_JSON", [], "WHATSAPP_OPS_ALLOWLIST_CONTACTS_JSON")
+        groups = _load_allowlist_json("GROUPS_JSON", [], "WHATSAPP_OPS_ALLOWLIST_GROUPS_JSON")
+        alias_map = _load_allowlist_json("ALIAS_MAP_JSON", {}, "WHATSAPP_OPS_ALIAS_MAP_JSON")
+    except ValueError as exc:
+        return {"ok": False, "error": str(exc)}
+
+    if not isinstance(contacts, list) or not isinstance(groups, list):
+        return {"ok": False, "error": "allowlist_json_invalid"}
+
+    contact_items = [*contacts, *_iter_alias_map_entries(alias_map)]
+    contacts_synced = 0
+    groups_synced = 0
+    try:
+        for item in contact_items:
+            if not isinstance(item, dict):
+                raise ValueError("allowlist_entry_invalid")
+            if _sync_contact_item(item):
+                contacts_synced += 1
+        for item in groups:
+            if not isinstance(item, dict):
+                raise ValueError("allowlist_entry_invalid")
+            if _sync_group_item(item):
+                groups_synced += 1
+    except ValueError as exc:
+        return {"ok": False, "error": str(exc)}
+
+    return {
+        "ok": True,
+        "source": "env",
+        "contacts_synced": contacts_synced,
+        "groups_synced": groups_synced,
+    }
+
+
+# ---------------------------------------------------------------------------
+# Drafts & approvals
+# ---------------------------------------------------------------------------
+
+
+def create_draft(
+    targets: list[dict[str, Any]],
+    message: str,
+    send_at: str | None = None,
+    created_by: str | None = None,
+    media: dict[str, Any] | None = None,
+) -> dict[str, str]:
+    init_db()
+    if not isinstance(targets, list) or not targets:
+        raise ValueError("targets must be a non-empty list")
+    if not isinstance(message, str) or not message.strip():
+        raise ValueError("message is required")
+
+    now = utc_now()
+    draft_id = "draft_" + uuid.uuid4().hex[:12]
+    media_json = json.dumps(media or {}, ensure_ascii=False, sort_keys=True) if media else None
+    message_hash = hash_text(message)
+    idempotency_key = hash_text(
+        json.dumps(targets, sort_keys=True, ensure_ascii=False)
+        + "\n"
+        + message
+        + "\n"
+        + str(send_at or "")
+        + "\n"
+        + str(media_json or "")
+    )
+    with _connect() as conn:
+        conn.execute(
+            """
+            INSERT INTO drafts (
+                id, targets_json, message, message_hash, media_json, send_at, status,
+                idempotency_key, created_by, created_at, updated_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                draft_id,
+                json.dumps(targets, ensure_ascii=False, sort_keys=True),
+                message,
+                message_hash,
+                media_json,
+                send_at,
+                "draft",
+                idempotency_key,
+                created_by,
+                now,
+                now,
+            ),
+        )
+    return {
+        "draft_id": draft_id,
+        "status": "draft",
+        "message_hash": message_hash,
+        "idempotency_key": idempotency_key,
+    }
+
+
+def draft_signature_matches(draft: dict[str, Any]) -> bool:
+    """Verify that the stored key still signs targets, message, schedule and media."""
+    try:
+        targets = json.loads(str(draft.get("targets_json") or "[]"))
+    except (TypeError, json.JSONDecodeError):
+        return False
+    if not isinstance(targets, list):
+        return False
+    expected = hash_text(
+        json.dumps(targets, sort_keys=True, ensure_ascii=False)
+        + "\n"
+        + str(draft.get("message") or "")
+        + "\n"
+        + str(draft.get("send_at") or "")
+        + "\n"
+        + str(draft.get("media_json") or "")
+    )
+    return secrets.compare_digest(expected, str(draft.get("idempotency_key") or ""))
+
+
+def get_draft(draft_id: str) -> dict[str, Any] | None:
+    init_db()
+    with _connect() as conn:
+        return _row_to_dict(conn.execute("SELECT * FROM drafts WHERE id=?", (draft_id,)).fetchone())
+
+
+def get_contact_crm_binding(contact_id: str) -> dict[str, str] | None:
+    """Return the trusted CRM identity bound to one local contact.
+
+    WhatsApp/local contact IDs and CRM IDs are different namespaces.  The
+    explicit local contact metadata is the authority that binds them.
+    """
+    local_id = str(contact_id or "").strip()
+    if not local_id:
+        return None
+    init_db()
+    with _connect() as conn:
+        row = conn.execute("SELECT metadata_json FROM contacts WHERE id=?", (local_id,)).fetchone()
+    if row is None:
+        return None
+    try:
+        metadata = json.loads(str(row["metadata_json"] or "{}"))
+    except (TypeError, json.JSONDecodeError):
+        return None
+    if not isinstance(metadata, dict):
+        return None
+    lead_id = str(metadata.get("crm_lead_id") or "").strip()
+    crm_contact_id = str(metadata.get("crm_contact_id") or "").strip()
+    if (
+        not _CRM_BINDING_ID_RE.fullmatch(lead_id)
+        or not _CRM_BINDING_ID_RE.fullmatch(crm_contact_id)
+    ):
+        return None
+    return {"lead_id": lead_id, "contact_id": crm_contact_id}
+
+
+def create_approval(draft_id: str, timeout_minutes: int = 60) -> dict[str, str]:
+    init_db()
+    draft = get_draft(draft_id)
+    if draft is None:
+        raise ValueError("draft not found")
+    approval_id = "approval_" + uuid.uuid4().hex[:12]
+    token_hash = hash_text(secrets.token_urlsafe(32))
+    now_dt = datetime.now(timezone.utc)
+    now = now_dt.isoformat()
+    expires_at = (now_dt + timedelta(minutes=timeout_minutes)).isoformat()
+    with _connect() as conn:
+        conn.execute(
+            """
+            INSERT INTO approvals (
+                id, draft_id, approval_token_hash, approver_ref_hash,
+                message_hash, draft_idempotency_key, status, expires_at, created_at, resolved_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                approval_id,
+                draft_id,
+                token_hash,
+                None,
+                draft["message_hash"],
+                draft["idempotency_key"],
+                "pending",
+                expires_at,
+                now,
+                None,
+            ),
+        )
+        conn.execute(
+            "UPDATE drafts SET status=?, updated_at=? WHERE id=?",
+            ("pending_approval", now, draft_id),
+        )
+    return {"approval_id": approval_id, "status": "pending", "expires_at": expires_at}
+
+
+def get_valid_approval(draft_id: str, approval_token: str | None = None) -> dict[str, Any] | None:
+    """Return the latest approved approval for a draft.
+
+    ``approval_token`` is retained for backward-compatible direct calls. The
+    public tool no longer exposes or requires it; production approval is state-
+    based after a trusted human resolve action.
+    """
+    init_db()
+    params: tuple[Any, ...]
+    token_clause = ""
+    if approval_token:
+        token_clause = " AND approval_token_hash=?"
+        params = (draft_id, hash_text(approval_token))
+    else:
+        params = (draft_id,)
+    with _connect() as conn:
+        return _row_to_dict(
+            conn.execute(
+                f"""
+                SELECT * FROM approvals
+                WHERE draft_id=? AND status='approved'{token_clause}
+                ORDER BY resolved_at DESC, created_at DESC LIMIT 1
+                """,
+                params,
+            ).fetchone()
+        )
+
+
+def get_latest_approval(draft_id: str) -> dict[str, Any] | None:
+    init_db()
+    with _connect() as conn:
+        return _row_to_dict(
+            conn.execute(
+                """
+                SELECT * FROM approvals
+                WHERE draft_id=?
+                ORDER BY created_at DESC LIMIT 1
+                """,
+                (draft_id,),
+            ).fetchone()
+        )
+
+
+def resolve_approval(approval_id: str, decision: str, approver_ref: str | None = None) -> dict[str, Any]:
+    init_db()
+    decision_norm = str(decision or "").strip().lower()
+    if decision_norm not in {"approved", "denied", "edit_requested"}:
+        return {"ok": False, "approval_id": approval_id, "error": "decision_invalid"}
+    now = utc_now()
+    with _connect() as conn:
+        row = conn.execute("SELECT * FROM approvals WHERE id=?", (approval_id,)).fetchone()
+        if row is None:
+            return {"ok": False, "approval_id": approval_id, "error": "approval_not_found"}
+        approval = dict(row)
+        if approval.get("status") != "pending":
+            return {"ok": False, "approval_id": approval_id, "error": "approval_not_pending", "status": approval.get("status")}
+        try:
+            expires = datetime.fromisoformat(str(approval.get("expires_at", "")).replace("Z", "+00:00"))
+            if expires.tzinfo is None:
+                expires = expires.replace(tzinfo=timezone.utc)
+        except ValueError:
+            expires = datetime.now(timezone.utc) - timedelta(seconds=1)
+        if expires <= datetime.now(timezone.utc):
+            conn.execute(
+                "UPDATE approvals SET status=?, resolved_at=? WHERE id=?",
+                ("expired", now, approval_id),
+            )
+            return {"ok": False, "approval_id": approval_id, "error": "approval_expired", "status": "expired"}
+        approver_hash = hash_text(str(approver_ref)) if approver_ref else None
+        conn.execute(
+            "UPDATE approvals SET status=?, approver_ref_hash=?, resolved_at=? WHERE id=?",
+            (decision_norm, approver_hash, now, approval_id),
+        )
+        draft_status = "needs_edit" if decision_norm == "edit_requested" else decision_norm
+        conn.execute(
+            "UPDATE drafts SET status=?, updated_at=? WHERE id=?",
+            (draft_status, now, approval["draft_id"]),
+        )
+    return {"ok": True, "approval_id": approval_id, "draft_id": approval["draft_id"], "status": decision_norm}
+
+
+def idempotency_used(idempotency_key: str) -> bool:
+    init_db()
+    with _connect() as conn:
+        row = conn.execute(
+            "SELECT 1 FROM outbox WHERE idempotency_key=? LIMIT 1",
+            (idempotency_key,),
+        ).fetchone()
+    return row is not None
+
+
+def mark_outbox_blocked(draft_id: str, idempotency_key: str, reason: str) -> None:
+    init_db()
+    now = utc_now()
+    with _connect() as conn:
+        conn.execute(
+            """
+            INSERT OR IGNORE INTO outbox (
+                id, draft_id, idempotency_key, status, attempt_count,
+                last_error, scheduled_for, sent_at, created_at, updated_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                "outbox_" + uuid.uuid4().hex[:12],
+                draft_id,
+                idempotency_key,
+                "blocked",
+                0,
+                reason[:500],
+                None,
+                None,
+                now,
+                now,
+            ),
+        )
+
+
+def mark_outbox_result(draft_id: str, idempotency_key: str, status: str, last_error: str | None = None) -> None:
+    init_db()
+    now = utc_now()
+    sent_at = now if status == "sent" else None
+    with _connect() as conn:
+        conn.execute(
+            """
+            INSERT INTO outbox (
+                id, draft_id, idempotency_key, status, attempt_count,
+                last_error, scheduled_for, sent_at, created_at, updated_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            ON CONFLICT(idempotency_key) DO UPDATE SET
+                status=excluded.status,
+                attempt_count=outbox.attempt_count + 1,
+                last_error=excluded.last_error,
+                sent_at=excluded.sent_at,
+                updated_at=excluded.updated_at
+            """,
+            (
+                "outbox_" + uuid.uuid4().hex[:12],
+                draft_id,
+                idempotency_key,
+                status,
+                1,
+                (last_error or "")[:500] if last_error else None,
+                None,
+                sent_at,
+                now,
+                now,
+            ),
+        )
+
+
+def reserve_outbox_send(draft_id: str, idempotency_key: str) -> bool:
+    init_db()
+    now = utc_now()
+    with _connect() as conn:
+        try:
+            conn.execute(
+                """
+                INSERT INTO outbox (
+                    id, draft_id, idempotency_key, status, attempt_count,
+                    last_error, scheduled_for, sent_at, created_at, updated_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    "outbox_" + uuid.uuid4().hex[:12],
+                    draft_id,
+                    idempotency_key,
+                    "sending",
+                    0,
+                    None,
+                    None,
+                    None,
+                    now,
+                    now,
+                ),
+            )
+            return True
+        except sqlite3.IntegrityError:
+            return False
+
+
+def reserve_crm_append(idempotency_key: str, event_id: str) -> dict[str, Any]:
+    """Atomically reserve one append-only CRM event.
+
+    Existing reservations are never overwritten. Callers must treat both
+    ``reserved`` and ``failed_unknown`` duplicates as uncertain external state
+    and must not retry the Google append blindly.
+    """
+    init_db()
+    now = utc_now()
+    with _connect() as conn:
+        try:
+            conn.execute(
+                """
+                INSERT INTO crm_append_log (
+                    id, idempotency_key, event_id, status, last_reason,
+                    created_at, updated_at, appended_at
+                ) VALUES (?, ?, ?, 'reserved', NULL, ?, ?, NULL)
+                """,
+                (
+                    "crm_append_" + uuid.uuid4().hex[:12],
+                    str(idempotency_key),
+                    str(event_id),
+                    now,
+                    now,
+                ),
+            )
+            return {"reserved": True, "status": "reserved"}
+        except sqlite3.IntegrityError:
+            row = conn.execute(
+                "SELECT status FROM crm_append_log WHERE idempotency_key=?",
+                (str(idempotency_key),),
+            ).fetchone()
+            return {
+                "reserved": False,
+                "status": str(row["status"] if row is not None else "failed_unknown"),
+            }
+
+
+def mark_crm_append_result(idempotency_key: str, *, status: str, reason: str) -> None:
+    """Finalize a CRM reservation without storing provider payloads or PII."""
+    if status not in {"appended", "failed_unknown"}:
+        raise ValueError("crm_append_status_invalid")
+    init_db()
+    now = utc_now()
+    safe_reason = re.sub(r"[^a-z0-9_.-]+", "_", str(reason or "unknown").lower())[:80]
+    with _connect() as conn:
+        conn.execute(
+            """
+            UPDATE crm_append_log
+            SET status=?, last_reason=?, updated_at=?, appended_at=?
+            WHERE idempotency_key=? AND status='reserved'
+            """,
+            (
+                status,
+                safe_reason,
+                now,
+                now if status == "appended" else None,
+                str(idempotency_key),
+            ),
+        )
+
+
+def record_crm_audit(
+    event_type: str,
+    *,
+    event_id: str,
+    reason: str,
+    status: str,
+    error_class: str = "",
+) -> None:
+    """Record a narrow, sanitized CRM audit event.
+
+    The signature intentionally accepts no arbitrary payload, spreadsheet
+    coordinates, target, message, or credential fields.
+    """
+    allowed_events = {
+        "crm_append_succeeded",
+        "crm_append_failed",
+        "crm_append_blocked",
+    }
+    if event_type not in allowed_events:
+        raise ValueError("crm_audit_event_invalid")
+
+    def safe_token(value: Any, *, fallback: str) -> str:
+        token = re.sub(r"[^A-Za-z0-9_.:-]+", "_", str(value or ""))[:128]
+        return token or fallback
+
+    safe_event_id = safe_token(event_id, fallback="crm_event_unknown")
+    safe_reason = safe_token(reason, fallback="unknown")
+    safe_status = safe_token(status, fallback="unknown")
+    metadata = {"reason": safe_reason, "status": safe_status}
+    if error_class:
+        metadata["error_class"] = safe_token(error_class, fallback="Error")
+    now = utc_now()
+    with _connect() as conn:
+        conn.execute(
+            """
+            INSERT INTO audit_log (
+                id, event_type, entity_type, entity_id, actor_ref_hash,
+                safe_summary, metadata_redacted_json, created_at
+            ) VALUES (?, ?, 'crm_append', ?, NULL, ?, ?, ?)
+            """,
+            (
+                "audit_" + uuid.uuid4().hex[:12],
+                event_type,
+                safe_event_id,
+                f"{event_type}:{safe_reason}",
+                json.dumps(metadata, sort_keys=True),
+                now,
+            ),
+        )
+
+
+def _sanitize_payload(value: Any) -> Any:
+    secret_keys = {"token", "api_key", "apikey", "authorization", "password", "secret", "key"}
+    pii_keys = {"id", "wid", "lid", "phone", "phone_e164", "number", "contact", "contact_ref", "chatid", "chat_id", "thread_ref"}
+    url_keys = {"url", "mediaurl", "media_url", "fileurl", "file_url", "downloadurl", "download_url", "thumbnailurl", "thumbnail_url"}
+    media_meta_keys = {"directpath", "filesha256", "fileencsha256", "mediakey", "mediakeytimestamp"}
+    thumbnail_keys = {"jpegthumbnail", "thumbnail"}
+    binary_keys = {"base64", "blob"}
+    if isinstance(value, dict):
+        safe: dict[str, Any] = {}
+        for key, item in value.items():
+            key_str = str(key)
+            key_norm = key_str.strip().lower()
+            if key_norm in secret_keys or any(part in key_norm for part in ("token", "secret", "password", "api_key")):
+                safe[key_str] = "<redacted>"
+            elif key_norm in {"phone", "phone_e164", "number"}:
+                safe[key_str] = _safe_existing_phone_mask(item) or "<redacted>"
+            elif key_norm in pii_keys:
+                safe[key_str] = "<redacted>"
+            elif key_norm in url_keys or key_norm.endswith("url") or key_norm.endswith("uri"):
+                safe[key_str] = "<redacted-url>"
+            elif key_norm in media_meta_keys:
+                safe[key_str] = "<redacted>"
+            elif key_norm in thumbnail_keys:
+                safe[key_str] = "<redacted>"
+            elif key_norm in binary_keys:
+                safe[key_str] = "<redacted>"
+            else:
+                safe[key_str] = _sanitize_payload(item)
+        return safe
+    if isinstance(value, list):
+        return [_sanitize_payload(item) for item in value[:50]]
+    if isinstance(value, str):
+        cleaned = value[:500]
+        # data: and blob: URLs (including data: URIs with base64 payloads)
+        if re.match(r"(?i)^(?:data|blob):", cleaned):
+            return "<redacted-url>"
+        if re.match(r"(?i)^https?://", cleaned):
+            return "<redacted-url>"
+        # Long bare base64 strings (>=32 chars of base64 alphabet with optional padding)
+        if re.match(r"^[A-Za-z0-9+/=]{32,}$", cleaned):
+            return "<redacted-base64>"
+        # Text bodies may contain pasted links/data URIs even when the key is not URL-like.
+        # Keep the surrounding text for operator context, but remove fetchable media/link targets.
+        cleaned = re.sub(r"(?i)\bhttps?://[^\s<>\]\)\"']+", "<redacted-url>", cleaned)
+        cleaned = re.sub(r"(?i)\b(?:data|blob):[^\s<>\]\)\"']+", "<redacted-url>", cleaned)
+        cleaned = re.sub(r"(?i)\b[\w.+:-]+@(?:lid|g\.us|s\.whatsapp\.net)\b", "<redacted-wa-ref>", cleaned)
+        cleaned = _replace_phone_mentions_with_names(cleaned)
+        cleaned = re.sub(r"\+?\d[\d\s().-]{6,}\d", lambda match: _mask_phone_fragment(match.group(0)), cleaned)
+        cleaned = re.sub(r"(?i)<redacted-phone>[:\w.+-]*@(?:lid|g\.us|s\.whatsapp\.net)\b", "<redacted-wa-ref>", cleaned)
+        return cleaned
+    return value
+
+
+def record_inbound_event(
+    *,
+    source_event_id: str,
+    contact_ref: str = "",
+    thread_ref: str = "",
+    payload: dict[str, Any] | None = None,
+    status: str = "received",
+) -> dict[str, Any]:
+    init_db()
+    if not source_event_id:
+        return {"ok": False, "error": "source_event_id_required"}
+    event_id = "inbound_" + uuid.uuid4().hex[:12]
+    now = utc_now()
+    safe_payload = _sanitize_payload(payload or {})
+    with _connect() as conn:
+        try:
+            conn.execute(
+                """
+                INSERT INTO inbound_events (
+                    id, source_event_id_hash, contact_ref_hash, thread_ref_hash,
+                    payload_redacted_json, status, created_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    event_id,
+                    hash_text(source_event_id),
+                    hash_text(contact_ref) if contact_ref else None,
+                    hash_text(thread_ref) if thread_ref else None,
+                    json.dumps(safe_payload, ensure_ascii=False, sort_keys=True),
+                    str(status or "received")[:40],
+                    now,
+                ),
+            )
+        except sqlite3.IntegrityError:
+            row = conn.execute(
+                "SELECT id FROM inbound_events WHERE source_event_id_hash=?",
+                (hash_text(source_event_id),),
+            ).fetchone()
+            return {"ok": True, "event_id": row["id"] if row else "", "deduped": True}
+    return {"ok": True, "event_id": event_id, "deduped": False, "status": str(status or "received")[:40]}
+
+
+def persist_inbound_event_resolution(event_id: str, contact_id: str) -> bool:
+    """Persist a known contact only when it is still explicitly whitelisted."""
+    try:
+        event_value = str(event_id or "").strip()
+        contact_value = str(contact_id or "").strip()
+        if not event_value or not contact_value:
+            return False
+        with _connect() as conn:
+            updated = conn.execute(
+                """
+                UPDATE inbound_events
+                SET resolved_contact_id=?
+                WHERE id=?
+                  AND (resolved_contact_id IS NULL OR TRIM(resolved_contact_id)='')
+                  AND EXISTS (
+                      SELECT 1 FROM contacts
+                      WHERE id=? AND whitelisted=1
+                  )
+                """,
+                (contact_value, event_value, contact_value),
+            )
+        return updated.rowcount == 1
+    except Exception:
+        return False
+
+
+def lookup_inbound_events(thread: str = "", contact: str = "", limit: int = 20) -> list[dict[str, Any]]:
+    init_db()
+    limit = max(1, min(int(limit or 20), 100))
+    clauses: list[str] = []
+    params: list[Any] = []
+    if thread:
+        clauses.append("thread_ref_hash=?")
+        params.append(hash_text(thread))
+    if contact:
+        clauses.append("contact_ref_hash=?")
+        params.append(hash_text(contact))
+    where = " WHERE " + " AND ".join(clauses) if clauses else ""
+    params.append(limit)
+    with _connect() as conn:
+        rows = conn.execute(
+            f"""
+            SELECT id, payload_redacted_json, status, created_at
+            FROM inbound_events
+            {where}
+            ORDER BY created_at DESC
+            LIMIT ?
+            """,
+            tuple(params),
+        ).fetchall()
+    events: list[dict[str, Any]] = []
+    for row in rows:
+        try:
+            payload = json.loads(row["payload_redacted_json"] or "{}")
+        except json.JSONDecodeError:
+            payload = {}
+        events.append(
+            {
+                "event_id": row["id"],
+                "status": row["status"],
+                "created_at": row["created_at"],
+                "payload": payload,
+            }
+        )
+    return events
+
+
+_CONTEXT_MODES = {"summary", "operator", "debug"}
+_TEXT_PREVIEW_KEYS = {"text", "body", "conversation", "caption", "content"}
+_MEDIA_MESSAGE_KEYS = {
+    "imageMessage": "image",
+    "audioMessage": "audio",
+    "videoMessage": "video",
+    "documentMessage": "document",
+}
+_MEDIA_META_KEYS = {
+    "mimetype",
+    "mime",
+    "filelength",
+    "file_length",
+    "filesize",
+    "fileName",
+    "filename",
+    "seconds",
+    "duration",
+    "width",
+    "height",
+}
+
+
+def _truncate_text(value: str, max_chars: int) -> str:
+    text = re.sub(r"\s+", " ", str(value or "")).strip()
+    if max_chars <= 0:
+        return ""
+    if len(text) <= max_chars:
+        return text
+    return text[: max(0, max_chars - 1)].rstrip() + "…"
+
+
+def _first_text_preview(value: Any, max_chars: int) -> str:
+    if isinstance(value, dict):
+        for key, item in value.items():
+            key_norm = str(key or "").strip()
+            if key_norm in _TEXT_PREVIEW_KEYS and isinstance(item, str):
+                return _truncate_text(item, max_chars)
+            nested = _first_text_preview(item, max_chars)
+            if nested:
+                return nested
+    if isinstance(value, list):
+        for item in value[:20]:
+            nested = _first_text_preview(item, max_chars)
+            if nested:
+                return nested
+    return ""
+
+
+def _message_type_from_payload(payload: dict[str, Any]) -> str:
+    for key in ("messageType", "type"):
+        raw = str(payload.get(key) or "").strip().lower()
+        if raw:
+            return raw[:40]
+    stack: list[Any] = [payload]
+    while stack:
+        value = stack.pop()
+        if isinstance(value, dict):
+            for key, item in value.items():
+                if key in _MEDIA_MESSAGE_KEYS:
+                    return _MEDIA_MESSAGE_KEYS[key]
+                if isinstance(item, (dict, list)):
+                    stack.append(item)
+        elif isinstance(value, list):
+            stack.extend(value[:20])
+    return "text" if _first_text_preview(payload, 1) else "unknown"
+
+
+def _collect_media_metadata(value: Any, media: dict[str, Any]) -> None:
+    if len(media) >= 12:
+        return
+    if isinstance(value, dict):
+        for key, item in value.items():
+            key_norm = str(key or "")
+            if key_norm in _MEDIA_MESSAGE_KEYS:
+                media["type"] = _MEDIA_MESSAGE_KEYS[key_norm]
+            key_lower = key_norm.casefold()
+            if key_lower in {name.casefold() for name in _MEDIA_META_KEYS} and not isinstance(item, (dict, list)):
+                if "url" not in key_lower and "token" not in key_lower:
+                    media[key_norm] = item
+            if isinstance(item, (dict, list)):
+                _collect_media_metadata(item, media)
+    elif isinstance(value, list):
+        for item in value[:20]:
+            _collect_media_metadata(item, media)
+
+
+def _media_summary_from_payload(payload: dict[str, Any], message_type: str) -> dict[str, Any]:
+    media: dict[str, Any] = {}
+    _collect_media_metadata(payload, media)
+    if message_type in {"image", "audio", "video", "document", "media"}:
+        media.setdefault("type", message_type)
+    if not media:
+        return {}
+    media["has_media"] = True
+    return media
+
+
+def _suggested_actions(message_type: str, has_media: bool) -> list[str]:
+    actions = ["wpp_inbound_lookup", "wpp_register_staging_status"]
+    if has_media and message_type in {"audio", "video"}:
+        actions.append("wpp_transcribe_media")
+    if has_media and message_type in {"image", "document"}:
+        actions.append("review_media_metadata")
+    return actions
+
+
+def _event_context(event: dict[str, Any], mode: str, max_text_chars: int) -> dict[str, Any]:
+    payload_obj = event.get("payload")
+    payload: dict[str, Any] = payload_obj if isinstance(payload_obj, dict) else {}
+    message_type = _message_type_from_payload(payload)
+    media = _media_summary_from_payload(payload, message_type)
+    item: dict[str, Any] = {
+        "safe_event_id": event.get("event_id", ""),
+        "status": event.get("status", ""),
+        "created_at": event.get("created_at", ""),
+        "message_type": message_type,
+        "has_media": bool(media),
+        "suggested_actions": _suggested_actions(message_type, bool(media)),
+    }
+    if mode in {"operator", "debug"}:
+        preview = _first_text_preview(payload, max_text_chars)
+        if preview:
+            item["text_preview"] = preview
+        if media:
+            item["media"] = media
+    if mode == "debug":
+        item["payload_redacted"] = payload
+    return item
+
+
+def get_thread_context(
+    thread: str = "",
+    contact: str = "",
+    limit: int = 20,
+    mode: str = "summary",
+    max_text_chars: int = 160,
+) -> dict[str, Any]:
+    """Return a bounded, sanitized local-store context view for a WPP thread.
+
+    Uses only already-ingested local inbound events.  It never fetches provider
+    history, never sends, and never exposes raw WhatsApp refs or media URLs.
+    """
+    mode_norm = str(mode or "summary").strip().lower()
+    if mode_norm not in _CONTEXT_MODES:
+        mode_norm = "summary"
+    max_text = max(0, min(int(max_text_chars or 160), 500))
+    events_raw = lookup_inbound_events(thread=thread, contact=contact, limit=limit)
+    events = [_event_context(event, mode_norm, max_text) for event in events_raw]
+    type_counts: dict[str, int] = {}
+    media_counts: dict[str, int] = {}
+    for event in events:
+        msg_type = str(event.get("message_type") or "unknown")
+        type_counts[msg_type] = type_counts.get(msg_type, 0) + 1
+        if event.get("has_media"):
+            media_counts[msg_type] = media_counts.get(msg_type, 0) + 1
+    return {
+        "ok": True,
+        "source": "local_inbound_store",
+        "mode": mode_norm,
+        "thread_filter_set": bool(thread),
+        "contact_filter_set": bool(contact),
+        "message_count": len(events),
+        "type_counts": type_counts,
+        "media_counts": media_counts,
+        "events": events,
+    }
+
+
+def _seconds_between(start: Any, end: Any) -> int:
+    first = _parse_iso_datetime(start)
+    last = _parse_iso_datetime(end)
+    if first is None or last is None:
+        return 0
+    return max(0, int((last - first).total_seconds()))
+
+
+def _safe_burst_id(key: tuple[str, str], first_created_at: Any, last_created_at: Any) -> str:
+    return "burst_" + hash_text("|".join([key[0], key[1], str(first_created_at), str(last_created_at)]))[:12]
+
+
+def _burst_state(message_count: int, quorum: int) -> str:
+    return "quorum" if message_count >= quorum else "collecting"
+
+
+def _burst_primary_action(state: str) -> str:
+    return "review_coalesced_context" if state == "quorum" else "wait_for_more_inbound"
+
+
+def _burst_operator_summary(message_count: int, state: str, window_seconds: int) -> str:
+    if state == "quorum":
+        return f"{message_count} mensagens agrupadas em até {window_seconds}s; revisar contexto consolidado antes de responder"
+    return f"{message_count} mensagem em janela de {window_seconds}s; aguardar mais inbound antes de draft/resposta"
+
+
+def get_inbound_burst_status(
+    thread: str = "",
+    contact: str = "",
+    limit: int = 50,
+    window_seconds: int = 60,
+    quorum: int = 2,
+    max_text_chars: int = 160,
+) -> dict[str, Any]:
+    """Return deterministic read-only coalescing windows for recent inbound.
+
+    This is deliberately observational: no draft, approval, send, CRM write,
+    provider-history pull, summary persistence, or LLM call.  It groups already
+    sanitized local inbound events by hashed thread/contact refs and time window
+    so operator/draft code can decide to wait for a burst to settle before
+    responding.
+    """
+    init_db()
+    limit_value, limit_clamped = _clamp_int(limit, 50, 1, 200)
+    window_value, window_clamped = _clamp_int(window_seconds, 60, 30, 90)
+    quorum_value, quorum_clamped = _clamp_int(quorum, 2, 2, 10)
+    max_text = max(0, min(int(max_text_chars or 160), 500))
+    clauses: list[str] = []
+    params: list[Any] = []
+    if thread:
+        clauses.append("thread_ref_hash=?")
+        params.append(hash_text(thread))
+    if contact:
+        clauses.append("contact_ref_hash=?")
+        params.append(hash_text(contact))
+    where = " WHERE " + " AND ".join(clauses) if clauses else ""
+    params.append(limit_value)
+    with _connect() as conn:
+        rows = conn.execute(
+            f"""
+            SELECT id, contact_ref_hash, thread_ref_hash, payload_redacted_json, status, created_at
+            FROM inbound_events
+            {where}
+            ORDER BY created_at DESC
+            LIMIT ?
+            """,
+            tuple(params),
+        ).fetchall()
+
+    events: list[dict[str, Any]] = []
+    for row in rows:
+        try:
+            payload = json.loads(row["payload_redacted_json"] or "{}")
+        except json.JSONDecodeError:
+            payload = {}
+        payload = payload if isinstance(payload, dict) else {}
+        if _message_type_from_payload(payload) == "system":
+            continue
+        if _payload_from_self(payload):
+            continue
+        parsed = _parse_iso_datetime(row["created_at"])
+        events.append({
+            "event_id": row["id"],
+            "status": row["status"],
+            "created_at": row["created_at"],
+            "_created_dt": parsed,
+            "_key": (str(row["thread_ref_hash"] or ""), str(row["contact_ref_hash"] or "")),
+            "payload": payload,
+        })
+    events.sort(key=lambda item: item.get("_created_dt") or datetime.min.replace(tzinfo=timezone.utc))
+
+    grouped: dict[tuple[str, str], list[list[dict[str, Any]]]] = {}
+    for event in events:
+        key = event["_key"]
+        buckets = grouped.setdefault(key, [])
+        if not buckets:
+            buckets.append([event])
+            continue
+        last_bucket = buckets[-1]
+        previous = last_bucket[-1].get("_created_dt")
+        current = event.get("_created_dt")
+        gap = (current - previous).total_seconds() if previous and current else 0
+        if gap <= window_value:
+            last_bucket.append(event)
+        else:
+            buckets.append([event])
+
+    bursts: list[dict[str, Any]] = []
+    for key, buckets in grouped.items():
+        for bucket in buckets:
+            if not bucket:
+                continue
+            first_created_at = bucket[0].get("created_at")
+            last_created_at = bucket[-1].get("created_at")
+            state = _burst_state(len(bucket), quorum_value)
+            public_events = [
+                _event_context(
+                    {
+                        "event_id": event["event_id"],
+                        "status": event["status"],
+                        "created_at": event["created_at"],
+                        "payload": event["payload"],
+                    },
+                    "operator",
+                    max_text,
+                )
+                for event in bucket
+            ]
+            bursts.append({
+                "safe_burst_id": _safe_burst_id(key, first_created_at, last_created_at),
+                "state": state,
+                "message_count": len(bucket),
+                "first_created_at": first_created_at,
+                "last_created_at": last_created_at,
+                "duration_seconds": _seconds_between(first_created_at, last_created_at),
+                "window_seconds": window_value,
+                "quorum": quorum_value,
+                "operator_state": "ACTION_REQUIRED" if state == "quorum" else "WAITING_FOR_BURST",
+                "operator_title": "Revisar rajada inbound" if state == "quorum" else "Aguardar rajada inbound",
+                "operator_summary": _burst_operator_summary(len(bucket), state, window_value),
+                "why_it_matters": "evita draft/resposta prematura enquanto o lead ainda está mandando mensagens em sequência",
+                "primary_action": _burst_primary_action(state),
+                "secondary_actions": ["wpp_thread_context", "wpp_conversation_summary", "wpp_actionable_queue"],
+                "events": public_events[:10],
+            })
+    bursts.sort(key=lambda item: str(item.get("last_created_at") or ""), reverse=True)
+    counts = {
+        "events_considered": len(events),
+        "bursts": len(bursts),
+        "quorum_bursts": sum(1 for burst in bursts if burst.get("state") == "quorum"),
+        "collecting_bursts": sum(1 for burst in bursts if burst.get("state") == "collecting"),
+    }
+    warnings = []
+    if limit_clamped:
+        warnings.append("limit_clamped")
+    if window_clamped:
+        warnings.append("window_seconds_clamped")
+    if quorum_clamped:
+        warnings.append("quorum_clamped")
+    if not bursts:
+        warnings.append("empty_burst_status")
+    return {
+        "ok": True,
+        "source": "local_inbound_store",
+        "generated_by": "deterministic_local_v1",
+        "read_only": True,
+        "local_store_only": True,
+        "thread_filter_set": bool(thread),
+        "contact_filter_set": bool(contact),
+        "send_performed": False,
+        "draft_created": False,
+        "approval_resolved": False,
+        "crm_write_performed": False,
+        "provider_history_used": False,
+        "summary_persisted": False,
+        "llm_used": False,
+        "exposes_raw_refs": False,
+        "coalescing": {
+            "window_seconds": window_value,
+            "quorum": quorum_value,
+            "mode": "read_only_status",
+        },
+        "counts": counts,
+        "bursts": bursts,
+        "warnings": warnings,
+    }
+
+
+_TRANSCRIBABLE_MEDIA_TYPES = {"audio", "voice", "video", "ptt"}
+_TRANSCRIPTION_SAFETY_FLAGS = {
+    "transcription_performed": False,
+    "download_performed": False,
+    "stt_provider_called": False,
+    "provider_history_used": False,
+    "send_performed": False,
+    "llm_used": False,
+    "transcript_persisted": False,
+    "raw_media_exposed": False,
+}
+
+
+def _transcription_safety_flags() -> dict[str, bool]:
+    return dict(_TRANSCRIPTION_SAFETY_FLAGS)
+
+
+def _safe_inbound_event_id(value: Any) -> str:
+    event_id = str(value or "").strip()
+    if re.fullmatch(r"inbound_[A-Za-z0-9_-]{1,80}", event_id):
+        return event_id
+    return ""
+
+
+def _safe_short_token(value: Any, default: str, max_len: int = 40) -> str:
+    token = str(value or "").strip().lower()[:max_len]
+    if re.fullmatch(r"[a-z0-9][a-z0-9_-]{0,79}", token):
+        return token
+    return default
+
+
+def _safe_language(value: Any) -> str:
+    language = str(value or "").strip().lower()[:32]
+    if not language:
+        return ""
+    if re.fullmatch(r"[a-z]{2,8}(?:[-_][a-z0-9]{2,8})?", language):
+        return language
+    return ""
+
+
+def _payload_has_voice_hint(value: Any) -> bool:
+    if isinstance(value, dict):
+        for key, item in value.items():
+            key_norm = str(key or "").strip().lower()
+            if key_norm in {"ptt", "voice", "isvoice", "is_voice"} and bool(item):
+                return True
+            if key_norm in {"messagetype", "type"} and str(item or "").strip().lower() in {"ptt", "voice"}:
+                return True
+            if isinstance(item, (dict, list)) and _payload_has_voice_hint(item):
+                return True
+    elif isinstance(value, list):
+        return any(_payload_has_voice_hint(item) for item in value[:20])
+    return False
+
+
+def _transcribable_media_from_payload(payload: dict[str, Any]) -> tuple[bool, str, dict[str, Any]]:
+    message_type = _message_type_from_payload(payload)
+    media = _media_summary_from_payload(payload, message_type)
+    media_type = str(media.get("type") or message_type or "unknown").strip().lower()[:40]
+    if media_type == "audio" and _payload_has_voice_hint(payload):
+        media_type = "voice"
+    is_transcribable = media_type in _TRANSCRIBABLE_MEDIA_TYPES
+    safe_media = _safe_media_for_summary(media) if media else {}
+    if is_transcribable:
+        safe_media.setdefault("type", "voice" if media_type == "ptt" else media_type)
+    return is_transcribable, ("voice" if media_type == "ptt" else media_type), safe_media
+
+
+def _media_transcription_row_to_status(row: sqlite3.Row) -> dict[str, Any]:
+    try:
+        media = json.loads(row["media_metadata_json"] or "{}")
+    except json.JSONDecodeError:
+        media = {}
+    try:
+        flags = json.loads(row["safety_flags_json"] or "{}")
+    except json.JSONDecodeError:
+        flags = {}
+    safe_flags = _transcription_safety_flags()
+    if isinstance(flags, dict):
+        for key in safe_flags:
+            safe_flags[key] = bool(flags.get(key, safe_flags[key]))
+    return {
+        "status_id": row["id"],
+        "event_id": row["event_id"],
+        "status": row["status"],
+        "reason": row["reason"],
+        "mode": row["mode"],
+        "language": row["language"] or "",
+        "provider": row["provider"],
+        "media_type": row["media_type"],
+        "media": media if isinstance(media, dict) else {},
+        **safe_flags,
+        "status_persisted": True,
+        "created_at": row["created_at"],
+        "updated_at": row["updated_at"],
+    }
+
+
+def request_media_transcription(
+    event_id: str,
+    mode: str = "on_request",
+    language: str = "",
+    provider: str = "disabled",
+    force: bool = False,
+    persist_status: bool = True,
+) -> dict[str, Any]:
+    """Request fail-closed local transcription status for a sanitized inbound media event.
+
+    Phase 1 intentionally does not download media, call STT/cloud/LLM, fetch
+    provider history, send messages, expose raw media, or persist transcripts.
+    It only records a local status row for safe ``inbound_*`` event IDs whose
+    already-sanitized payload indicates audio/voice/video media.
+    """
+    init_db()
+    safe_event_id = _safe_inbound_event_id(event_id)
+    flags = _transcription_safety_flags()
+    if not safe_event_id:
+        return {
+            "ok": False,
+            "status": "invalid_event_id",
+            "error": "event_id_must_be_internal_inbound_id",
+            "event_id_accepted": False,
+            "status_persisted": False,
+            **flags,
+        }
+
+    mode_norm = _safe_short_token(mode, "on_request")
+    if mode_norm != "on_request":
+        mode_norm = "on_request"
+    language_norm = _safe_language(language)
+    provider_norm = _safe_short_token(provider, "disabled")
+    now = utc_now()
+
+    with _connect() as conn:
+        event = conn.execute(
+            """
+            SELECT id, payload_redacted_json, status, created_at
+            FROM inbound_events
+            WHERE id=?
+            """,
+            (safe_event_id,),
+        ).fetchone()
+        if event is None:
+            return {
+                "ok": False,
+                "event_id": safe_event_id,
+                "status": "not_found",
+                "error": "inbound_event_not_found",
+                "status_persisted": False,
+                **flags,
+            }
+        try:
+            payload = json.loads(event["payload_redacted_json"] or "{}")
+        except json.JSONDecodeError:
+            payload = {}
+        payload = payload if isinstance(payload, dict) else {}
+        is_transcribable, media_type, media = _transcribable_media_from_payload(payload)
+        if not is_transcribable:
+            return {
+                "ok": False,
+                "event_id": safe_event_id,
+                "status": "no_transcribable_media",
+                "reason": "event_has_no_audio_voice_or_video_media",
+                "message_type": _message_type_from_payload(payload),
+                "status_persisted": False,
+                **flags,
+            }
+
+        status_id = "transcription_" + uuid.uuid4().hex[:12]
+        existing = conn.execute(
+            "SELECT * FROM media_transcriptions WHERE event_id=?",
+            (safe_event_id,),
+        ).fetchone()
+        if persist_status and existing is not None and not force:
+            status = _media_transcription_row_to_status(existing)
+            return {
+                "ok": True,
+                "source": "local_inbound_store",
+                "local_status_only": True,
+                "existing_status": True,
+                **status,
+            }
+
+        result: dict[str, Any] = {
+            "ok": True,
+            "source": "local_inbound_store",
+            "event_id": safe_event_id,
+            "status": "blocked",
+            "reason": "provider_not_configured",
+            "mode": mode_norm,
+            "language": language_norm,
+            "provider": provider_norm,
+            "media_type": media_type,
+            "media": media,
+            "local_status_only": True,
+            "transcript_available": False,
+            "status_persisted": False,
+            **flags,
+        }
+        if persist_status:
+            if existing is None:
+                conn.execute(
+                    """
+                    INSERT INTO media_transcriptions (
+                        id, event_id, status, reason, mode, language, provider,
+                        media_type, media_metadata_json, safety_flags_json,
+                        created_at, updated_at
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    """,
+                    (
+                        status_id,
+                        safe_event_id,
+                        "blocked",
+                        "provider_not_configured",
+                        mode_norm,
+                        language_norm,
+                        provider_norm,
+                        media_type,
+                        json.dumps(media, ensure_ascii=False, sort_keys=True),
+                        json.dumps(flags, ensure_ascii=False, sort_keys=True),
+                        now,
+                        now,
+                    ),
+                )
+            else:
+                status_id = existing["id"]
+                conn.execute(
+                    """
+                    UPDATE media_transcriptions
+                    SET status=?, reason=?, mode=?, language=?, provider=?,
+                        media_type=?, media_metadata_json=?, safety_flags_json=?,
+                        updated_at=?
+                    WHERE event_id=?
+                    """,
+                    (
+                        "blocked",
+                        "provider_not_configured",
+                        mode_norm,
+                        language_norm,
+                        provider_norm,
+                        media_type,
+                        json.dumps(media, ensure_ascii=False, sort_keys=True),
+                        json.dumps(flags, ensure_ascii=False, sort_keys=True),
+                        now,
+                        safe_event_id,
+                    ),
+                )
+            result["status_id"] = status_id
+            result["status_persisted"] = True
+        return result
+
+
+def get_media_transcription_status(event_id: str = "", limit: int = 20) -> dict[str, Any]:
+    """Read fail-closed media transcription status rows from the local store only."""
+    init_db()
+    try:
+        limit_value = int(limit or 20)
+    except (TypeError, ValueError):
+        limit_value = 20
+    limit_value = max(1, min(limit_value, 100))
+    safe_event_id = _safe_inbound_event_id(event_id) if str(event_id or "").strip() else ""
+    if str(event_id or "").strip() and not safe_event_id:
+        return {
+            "ok": False,
+            "status": "invalid_event_id",
+            "error": "event_id_must_be_internal_inbound_id",
+            "event_id_accepted": False,
+            "statuses": [],
+            **_transcription_safety_flags(),
+        }
+    with _connect() as conn:
+        if safe_event_id:
+            rows = conn.execute(
+                """
+                SELECT * FROM media_transcriptions
+                WHERE event_id=?
+                ORDER BY updated_at DESC
+                LIMIT ?
+                """,
+                (safe_event_id, limit_value),
+            ).fetchall()
+        else:
+            rows = conn.execute(
+                """
+                SELECT * FROM media_transcriptions
+                ORDER BY updated_at DESC
+                LIMIT ?
+                """,
+                (limit_value,),
+            ).fetchall()
+    return {
+        "ok": True,
+        "source": "local_inbound_store",
+        "local_status_only": True,
+        "event_filter_set": bool(safe_event_id),
+        "limit": limit_value,
+        "count": len(rows),
+        "statuses": [_media_transcription_row_to_status(row) for row in rows],
+        **_transcription_safety_flags(),
+    }
+
+
+def get_inbound_transcription_eligibility(event_id: str) -> dict[str, Any]:
+    """Return sanitized local media eligibility before any acquisition occurs."""
+    init_db()
+    safe_event_id = _safe_inbound_event_id(event_id)
+    if not safe_event_id:
+        return {"ok": False, "status": "invalid_event_id", "eligible": False}
+    with _connect() as conn:
+        row = conn.execute(
+            "SELECT payload_redacted_json FROM inbound_events WHERE id=?",
+            (safe_event_id,),
+        ).fetchone()
+    if row is None:
+        return {"ok": False, "status": "not_found", "eligible": False}
+    try:
+        payload = json.loads(row["payload_redacted_json"] or "{}")
+    except json.JSONDecodeError:
+        payload = {}
+    eligible, media_type, _ = _transcribable_media_from_payload(
+        payload if isinstance(payload, dict) else {}
+    )
+    return {
+        "ok": True,
+        "status": "eligible" if eligible else "no_transcribable_media",
+        "eligible": bool(eligible),
+        "media_type": media_type,
+    }
+
+
+def persist_media_transcription(
+    *,
+    event_id: str,
+    transcript_text: str,
+    transcript_sha256: str,
+    transcript_truncated: bool,
+    detected_language: str,
+    duration_seconds: float,
+    provider: str,
+    model: str,
+) -> dict[str, Any]:
+    """Persist one bounded local transcript without returning its text."""
+    init_db()
+    safe_event_id = _safe_inbound_event_id(event_id)
+    if not safe_event_id:
+        return {"ok": False, "status": "invalid_event_id"}
+    if type(transcript_text) is not str:
+        return {"ok": False, "status": "transcript_invalid"}
+    bounded_text = transcript_text[:4_000]
+    was_truncated = bool(transcript_truncated or len(transcript_text) > 4_000)
+    actual_sha = hash_text(bounded_text)
+    if str(transcript_sha256 or "").lower() != actual_sha:
+        return {"ok": False, "status": "transcript_hash_mismatch"}
+    language = _safe_language(detected_language)
+    provider_token = _safe_short_token(provider, "local_faster_whisper")
+    model_token = _safe_short_token(model, "small")
+    try:
+        duration = float(duration_seconds)
+    except (TypeError, ValueError):
+        duration = 0.0
+    if duration < 0 or duration != duration or duration == float("inf"):
+        duration = 0.0
+    now = utc_now()
+    flags = _transcription_safety_flags()
+    flags.update(
+        {
+            "transcription_performed": True,
+            "download_performed": True,
+            "stt_provider_called": True,
+            "transcript_persisted": True,
+        }
+    )
+    with _connect() as conn:
+        event = conn.execute(
+            "SELECT payload_redacted_json FROM inbound_events WHERE id=?",
+            (safe_event_id,),
+        ).fetchone()
+        if event is None:
+            return {"ok": False, "status": "not_found"}
+        try:
+            payload = json.loads(event["payload_redacted_json"] or "{}")
+        except json.JSONDecodeError:
+            payload = {}
+        is_transcribable, media_type, media = _transcribable_media_from_payload(
+            payload if isinstance(payload, dict) else {}
+        )
+        if not is_transcribable:
+            return {"ok": False, "status": "no_transcribable_media"}
+        existing = conn.execute(
+            "SELECT id, created_at FROM media_transcriptions WHERE event_id=?",
+            (safe_event_id,),
+        ).fetchone()
+        status_id = str(existing["id"]) if existing else "transcription_" + uuid.uuid4().hex[:12]
+        created_at = str(existing["created_at"]) if existing else now
+        conn.execute(
+            """
+            INSERT INTO media_transcriptions (
+                id, event_id, status, reason, mode, language, provider,
+                media_type, media_metadata_json, safety_flags_json,
+                transcript_text, transcript_sha256, transcript_truncated,
+                detected_language, duration_seconds, model, created_at, updated_at
+            ) VALUES (?, ?, 'completed', 'completed_local', 'on_request', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            ON CONFLICT(event_id) DO UPDATE SET
+                status='completed', reason='completed_local', mode='on_request',
+                language=excluded.language, provider=excluded.provider,
+                media_type=excluded.media_type,
+                media_metadata_json=excluded.media_metadata_json,
+                safety_flags_json=excluded.safety_flags_json,
+                transcript_text=excluded.transcript_text,
+                transcript_sha256=excluded.transcript_sha256,
+                transcript_truncated=excluded.transcript_truncated,
+                detected_language=excluded.detected_language,
+                duration_seconds=excluded.duration_seconds,
+                model=excluded.model,
+                updated_at=excluded.updated_at
+            """,
+            (
+                status_id,
+                safe_event_id,
+                language,
+                provider_token,
+                media_type,
+                json.dumps(media, ensure_ascii=False, sort_keys=True),
+                json.dumps(flags, ensure_ascii=False, sort_keys=True),
+                bounded_text,
+                actual_sha,
+                int(was_truncated),
+                language,
+                duration,
+                model_token,
+                created_at,
+                now,
+            ),
+        )
+    return {
+        "ok": True,
+        "status": "completed",
+        "event_id": safe_event_id,
+        "status_id": status_id,
+        "transcript_sha256": actual_sha,
+        "transcript_chars": len(bounded_text),
+        "transcript_truncated": was_truncated,
+        "transcript_persisted": True,
+        "send_performed": False,
+        "crm_write_performed": False,
+        "provider_history_used": False,
+    }
+
+
+def get_media_transcript(event_id: str) -> dict[str, Any]:
+    """Read transcript text only for one exact internal inbound event id."""
+    init_db()
+    safe_event_id = _safe_inbound_event_id(event_id)
+    if not safe_event_id:
+        return {"ok": False, "status": "invalid_event_id", "transcript": ""}
+    with _connect() as conn:
+        row = conn.execute(
+            """
+            SELECT event_id, status, transcript_text, transcript_sha256,
+                   transcript_truncated, detected_language, duration_seconds,
+                   provider, model, updated_at
+            FROM media_transcriptions
+            WHERE event_id=? AND status='completed' AND transcript_text IS NOT NULL
+            """,
+            (safe_event_id,),
+        ).fetchone()
+    if row is None:
+        return {"ok": False, "status": "not_found", "event_id": safe_event_id, "transcript": ""}
+    return {
+        "ok": True,
+        "status": "completed",
+        "event_id": row["event_id"],
+        "transcript": str(row["transcript_text"] or ""),
+        "transcript_sha256": str(row["transcript_sha256"] or ""),
+        "transcript_truncated": bool(row["transcript_truncated"]),
+        "detected_language": str(row["detected_language"] or ""),
+        "duration_seconds": float(row["duration_seconds"] or 0.0),
+        "provider": str(row["provider"] or ""),
+        "model": str(row["model"] or ""),
+        "updated_at": row["updated_at"],
+        "explicit_read": True,
+        "local_store_only": True,
+        "retention_policy": "manual_explicit_purge",
+        "backup_contains_plaintext_transcript": True,
+    }
+
+
+def purge_media_transcript(event_id: str) -> dict[str, Any]:
+    """Explicitly purge transcript content while retaining sanitized audit status."""
+    init_db()
+    safe_event_id = _safe_inbound_event_id(event_id)
+    if not safe_event_id:
+        return {"ok": False, "status": "invalid_event_id", "purged": False}
+    now = utc_now()
+    with _connect() as conn:
+        row = conn.execute(
+            "SELECT id, transcript_text FROM media_transcriptions WHERE event_id=?",
+            (safe_event_id,),
+        ).fetchone()
+        if row is None:
+            return {"ok": False, "status": "not_found", "purged": False}
+        had_transcript = row["transcript_text"] is not None
+        flags = _transcription_safety_flags()
+        conn.execute(
+            """
+            UPDATE media_transcriptions
+            SET status='purged', reason='explicit_purge',
+                transcript_text=NULL, transcript_sha256=NULL,
+                transcript_truncated=0, detected_language=NULL,
+                duration_seconds=NULL, model=NULL,
+                safety_flags_json=?, updated_at=?
+            WHERE event_id=?
+            """,
+            (json.dumps(flags, ensure_ascii=False, sort_keys=True), now, safe_event_id),
+        )
+    return {
+        "ok": True,
+        "status": "purged",
+        "event_id": safe_event_id,
+        "purged": bool(had_transcript),
+        "retention_policy": "manual_explicit_purge",
+    }
+
+
+_SUMMARY_MODES = {"stats", "brief", "timeline", "evidence", "chunks"}
+_SUMMARY_SECRET_ASSIGNMENT_RE = re.compile(
+    r"(?i)\b(token|api[_-]?key|authorization|password|secret|access[_-]?token)\s*[:=]\s*[^\s,;]+"
+)
+_SUMMARY_BEARER_RE = re.compile(r"(?i)\bBearer\s+[A-Za-z0-9._~+/-]{8,}")
+_SUMMARY_TOKEN_PREFIX_RE = re.compile(r"\b(?:sk|ghp|xoxb)-[A-Za-z0-9_-]{8,}\b")
+_SUMMARY_URL_RE = re.compile(r"(?i)\b(?:https?://|data:|blob:)[^\s]+")
+_SUMMARY_PHONE_RE = re.compile(r"(?<!\d)\+?\d{10,15}(?!\d)")
+_SUMMARY_WA_REF_RE = re.compile(r"@[A-Za-z0-9._-]*(?:g\.us|lid|s\.whatsapp\.net)", re.IGNORECASE)
+_SUMMARY_LONG_B64_RE = re.compile(r"\b[A-Za-z0-9+/]{32,}={0,2}\b")
+
+
+def _sanitize_summary_text(value: Any, max_chars: int = 500) -> str:
+    text = _truncate_text(str(value or ""), max_chars)
+    if not text:
+        return ""
+    text = _SUMMARY_URL_RE.sub("<redacted-url>", text)
+    text = _SUMMARY_SECRET_ASSIGNMENT_RE.sub(lambda match: f"{match.group(1)}=<redacted>", text)
+    text = _SUMMARY_BEARER_RE.sub("Bearer <redacted>", text)
+    text = _SUMMARY_TOKEN_PREFIX_RE.sub("<redacted-token>", text)
+    text = _SUMMARY_WA_REF_RE.sub("<redacted-ref>", text)
+    text = _replace_phone_mentions_with_names(text)
+    text = _SUMMARY_PHONE_RE.sub(lambda match: _mask_phone_fragment(match.group(0)), text)
+    text = _SUMMARY_LONG_B64_RE.sub("<redacted-base64>", text)
+    return _truncate_text(text, max_chars)
+
+
+def _clamp_int(value: Any, default: int, low: int, high: int) -> tuple[int, bool]:
+    try:
+        number = int(value)
+    except (TypeError, ValueError):
+        return default, True
+    clamped = max(low, min(number, high))
+    return clamped, clamped != number
+
+
+def _summary_window(events_asc: list[dict[str, Any]]) -> dict[str, Any]:
+    if not events_asc:
+        return {"first_created_at": None, "last_created_at": None}
+    return {
+        "first_created_at": events_asc[0].get("created_at") or None,
+        "last_created_at": events_asc[-1].get("created_at") or None,
+    }
+
+
+def _filter_summary_events_by_window(
+    events_desc: list[dict[str, Any]],
+    *,
+    window_days: int,
+) -> tuple[list[dict[str, Any]], dict[str, Any]]:
+    """Filter local events by a recent-day window without provider access."""
+    info: dict[str, Any] = {
+        "requested_days": int(window_days or 0),
+        "applied": bool(window_days and int(window_days) > 0),
+        "cutoff_at": None,
+        "excluded_by_window": 0,
+    }
+    if not info["applied"]:
+        return events_desc, info
+    cutoff = datetime.now(timezone.utc) - timedelta(days=int(window_days))
+    info["cutoff_at"] = cutoff.isoformat()
+    filtered: list[dict[str, Any]] = []
+    excluded = 0
+    for event in events_desc:
+        created = _parse_iso_datetime(event.get("created_at") if isinstance(event, dict) else "")
+        if created is not None and created < cutoff:
+            excluded += 1
+            continue
+        filtered.append(event)
+    info["excluded_by_window"] = excluded
+    return filtered, info
+
+
+def _summary_chunks(events_asc: list[dict[str, Any]], chunk_size: int) -> list[dict[str, Any]]:
+    chunks: list[dict[str, Any]] = []
+    if chunk_size <= 0:
+        return chunks
+    for start in range(0, len(events_asc), chunk_size):
+        chunk_events = events_asc[start : start + chunk_size]
+        if not chunk_events:
+            continue
+        type_counts, media_counts, status_counts = _summary_counts(chunk_events)
+        highlights = [
+            str(event.get("text_preview") or "")
+            for event in chunk_events
+            if str(event.get("text_preview") or "").strip()
+        ][:2]
+        chunks.append(
+            {
+                "chunk_id": f"chunk_{len(chunks) + 1:02d}",
+                "index": len(chunks) + 1,
+                "event_count": len(chunk_events),
+                "window": _summary_window(chunk_events),
+                "type_counts": type_counts,
+                "media_counts": media_counts,
+                "status_counts": status_counts,
+                "highlights": highlights,
+            }
+        )
+    return chunks
+
+
+def _safe_media_for_summary(media: dict[str, Any]) -> dict[str, Any]:
+    safe: dict[str, Any] = {}
+    for key, value in media.items():
+        key_text = str(key or "")[:80]
+        key_lower = key_text.casefold()
+        if any(part in key_lower for part in ("url", "uri", "token", "secret", "key", "path", "sha")):
+            continue
+        if isinstance(value, bool):
+            safe[key_text] = value
+        elif isinstance(value, int | float):
+            safe[key_text] = value
+        elif isinstance(value, str):
+            cleaned = _sanitize_summary_text(_sanitize_payload(value), 120)
+            if not isinstance(cleaned, str):
+                continue
+            if cleaned.startswith("<redacted") or re.search(r"(?i)(?:https?://|data:|blob:)", cleaned):
+                continue
+            safe[key_text] = cleaned
+    return safe
+
+
+def _participant_payload(payload: dict[str, Any]) -> dict[str, Any]:
+    for key in ("participant", "sender", "author", "from"):
+        value = payload.get(key)
+        if isinstance(value, dict):
+            return value
+    body = payload.get("body") if isinstance(payload.get("body"), dict) else {}
+    for key in ("participant", "sender", "author", "from"):
+        value = body.get(key)
+        if isinstance(value, dict):
+            return value
+    return {}
+
+
+def _sender_label_from_payload(payload: dict[str, Any]) -> tuple[str, str, str]:
+    participant = _participant_payload(payload)
+    name = ""
+    for key in ("pushName", "displayName", "name", "title", "notify", "verifiedName"):
+        name = _safe_person_name(participant.get(key), limit=60)
+        if name:
+            break
+    phone_masked = ""
+    for key in ("phone", "phone_e164", "number"):
+        phone_masked = _safe_existing_phone_mask(participant.get(key))
+        if phone_masked:
+            break
+    if name and phone_masked:
+        return f"{name} ({phone_masked})", name, phone_masked
+    if name:
+        return name, name, ""
+    if phone_masked:
+        return phone_masked, "", phone_masked
+    return "", "", ""
+
+
+def _summary_event(event: dict[str, Any], max_text_chars: int) -> dict[str, Any]:
+    payload_obj = event.get("payload")
+    payload: dict[str, Any] = payload_obj if isinstance(payload_obj, dict) else {}
+    message_type = _message_type_from_payload(payload)
+    media = _safe_media_for_summary(_media_summary_from_payload(payload, message_type))
+    item: dict[str, Any] = {
+        "safe_event_id": event.get("event_id", ""),
+        "created_at": event.get("created_at", ""),
+        "status": event.get("status", ""),
+        "message_type": message_type,
+        "has_media": bool(media),
+    }
+    if media:
+        item["media"] = media
+    sender_label, sender_display_name, sender_phone_masked = _sender_label_from_payload(payload)
+    if sender_label:
+        item["sender_label"] = sender_label
+    if sender_display_name:
+        item["sender_display_name"] = sender_display_name
+    if sender_phone_masked:
+        item["sender_phone_masked"] = sender_phone_masked
+    if max_text_chars > 0:
+        preview = _first_text_preview(payload, max_text_chars)
+        if preview:
+            item["text_preview"] = _sanitize_summary_text(preview, max_text_chars)
+    return item
+
+
+def _summary_counts(events: list[dict[str, Any]]) -> tuple[dict[str, int], dict[str, int], dict[str, int]]:
+    type_counts: dict[str, int] = {}
+    media_counts: dict[str, int] = {}
+    status_counts: dict[str, int] = {}
+    for event in events:
+        message_type = str(event.get("message_type") or "unknown")
+        status = str(event.get("status") or "unknown")
+        type_counts[message_type] = type_counts.get(message_type, 0) + 1
+        status_counts[status] = status_counts.get(status, 0) + 1
+        if event.get("has_media"):
+            media_type = str((event.get("media") or {}).get("type") or message_type or "media")
+            media_counts[media_type] = media_counts.get(media_type, 0) + 1
+    return type_counts, media_counts, status_counts
+
+
+def _conversation_headline(message_count: int, type_counts: dict[str, int], media_counts: dict[str, int]) -> str:
+    if message_count == 0:
+        return "Nenhum evento local encontrado."
+    type_bits = ", ".join(f"{key}: {value}" for key, value in sorted(type_counts.items())) or "sem tipo"
+    media_total = sum(media_counts.values())
+    media_bit = f"; {media_total} com mídia" if media_total else ""
+    return f"{message_count} evento(s) local(is); tipos: {type_bits}{media_bit}."
+
+
+def _conversation_bullets(
+    message_count: int,
+    events_desc: list[dict[str, Any]],
+    type_counts: dict[str, int],
+    status_counts: dict[str, int],
+) -> list[str]:
+    if message_count == 0:
+        return ["Sem mensagens no inbound_events local para o escopo solicitado."]
+    bullets = [
+        f"Total local analisado: {message_count} evento(s).",
+        "Tipos: " + (", ".join(f"{key}={value}" for key, value in sorted(type_counts.items())) or "nenhum"),
+        "Status: " + (", ".join(f"{key}={value}" for key, value in sorted(status_counts.items())) or "nenhum"),
+    ]
+    latest = events_desc[0] if events_desc else {}
+    if latest:
+        bullets.append(
+            "Mais recente: "
+            f"{latest.get('message_type', 'unknown')} em {latest.get('created_at') or 'data_indisponivel'}."
+        )
+    return bullets
+
+
+def get_conversation_summary(
+    thread: str = "",
+    contact: str = "",
+    limit: int = 50,
+    mode: str = "brief",
+    max_text_chars: int = 160,
+    include_evidence: bool = False,
+    window_days: int = 0,
+    chunk_size: int = 25,
+) -> dict[str, Any]:
+    """Return a deterministic, read-only summary from the local inbound store.
+
+    This lane uses only ``lookup_inbound_events`` / ``inbound_events`` data that
+    has already been sanitized at ingest time. It never calls an LLM, provider
+    history, send/draft/approval/outbox paths, and never persists the summary.
+    Raw thread/contact filters are intentionally not echoed back.
+    """
+    warnings: list[str] = []
+    mode_norm = str(mode or "brief").strip().lower()
+    if mode_norm not in _SUMMARY_MODES:
+        mode_norm = "brief"
+        warnings.append("invalid_mode_defaulted_to_brief")
+
+    limit_value, limit_clamped = _clamp_int(limit, 50, 1, 100)
+    if limit_clamped:
+        warnings.append("limit_clamped")
+    max_text_value, max_text_clamped = _clamp_int(max_text_chars, 160, 0, 500)
+    if max_text_clamped:
+        warnings.append("max_text_chars_clamped")
+    window_days_value, window_days_clamped = _clamp_int(window_days, 0, 0, 365)
+    if window_days_clamped:
+        warnings.append("window_days_clamped")
+    chunk_size_value, chunk_size_clamped = _clamp_int(chunk_size, 25, 1, 50)
+    if chunk_size_clamped:
+        warnings.append("chunk_size_clamped")
+
+    thread_value = str(thread or "").strip()
+    contact_value = str(contact or "").strip()
+    thread_filter_set = bool(thread_value)
+    contact_filter_set = bool(contact_value)
+    if not thread_filter_set and not contact_filter_set:
+        warnings.append("unscoped_local_scan")
+
+    raw_events_desc_all = lookup_inbound_events(thread=thread_value, contact=contact_value, limit=limit_value)
+    raw_events_desc_unwindowed = []
+    hidden_system_events = 0
+    for event in raw_events_desc_all:
+        payload_obj = event.get("payload") if isinstance(event, dict) else {}
+        payload = payload_obj if isinstance(payload_obj, dict) else {}
+        if _payload_message_type(payload) == "system":
+            hidden_system_events += 1
+            continue
+        raw_events_desc_unwindowed.append(event)
+    raw_events_desc, history_window = _filter_summary_events_by_window(
+        raw_events_desc_unwindowed,
+        window_days=window_days_value,
+    )
+    if hidden_system_events:
+        warnings.append("system_events_hidden")
+    if history_window.get("excluded_by_window"):
+        warnings.append("history_window_applied")
+    events_desc = [_summary_event(event, max_text_value) for event in raw_events_desc]
+    events_asc = list(reversed(events_desc))
+    if not events_desc:
+        warnings.append("no_local_events")
+
+    type_counts, media_counts, status_counts = _summary_counts(events_desc)
+    result: dict[str, Any] = {
+        "ok": True,
+        "source": "local_inbound_store",
+        "generated_by": "deterministic_local_v1",
+        "llm_used": False,
+        "provider_history_used": False,
+        "send_performed": False,
+        "summary_persisted": False,
+        "read_only": True,
+        "local_store_only": True,
+        "sends_messages": False,
+        "fetches_provider_history": False,
+        "exposes_raw_refs": False,
+        "mode": mode_norm,
+        "thread_filter_set": thread_filter_set,
+        "contact_filter_set": contact_filter_set,
+        "limit": limit_value,
+        "max_text_chars": max_text_value,
+        "window_days": window_days_value,
+        "chunk_size": chunk_size_value,
+        "message_count": len(events_desc),
+        "type_counts": type_counts,
+        "media_counts": media_counts,
+        "status_counts": status_counts,
+        "window": _summary_window(events_asc),
+        "history_window": history_window,
+        "warnings": warnings,
+        "hidden_system_events": hidden_system_events,
+    }
+
+    if mode_norm == "brief":
+        result["headline"] = _conversation_headline(len(events_desc), type_counts, media_counts)
+        result["bullets"] = _conversation_bullets(len(events_desc), events_desc, type_counts, status_counts)
+        previews = [
+            {
+                key: event[key]
+                for key in ("safe_event_id", "created_at", "message_type", "text_preview")
+                if key in event
+            }
+            for event in events_desc[:5]
+            if event.get("text_preview")
+        ]
+        if previews:
+            result["latest_previews"] = previews
+        actions: list[str] = []
+        for event in events_desc:
+            for action in _suggested_actions(str(event.get("message_type") or "unknown"), bool(event.get("has_media"))):
+                if action not in actions:
+                    actions.append(action)
+        result["suggested_actions"] = actions
+    elif mode_norm == "timeline":
+        result["timeline"] = events_asc
+    elif mode_norm == "chunks":
+        chunks = _summary_chunks(events_asc, chunk_size_value)
+        result["chunk_count"] = len(chunks)
+        result["chunks"] = chunks
+        result["headline"] = _conversation_headline(len(events_desc), type_counts, media_counts)
+        result["bullets"] = _conversation_bullets(len(events_desc), events_desc, type_counts, status_counts)
+    elif mode_norm == "evidence":
+        result["timeline"] = events_asc
+        result["evidence"] = [
+            {
+                key: event[key]
+                for key in ("safe_event_id", "created_at", "status", "message_type", "has_media", "media", "text_preview")
+                if key in event
+            }
+            for event in events_asc
+        ]
+
+    if include_evidence and mode_norm != "evidence":
+        result["evidence"] = [
+            {
+                key: event[key]
+                for key in ("safe_event_id", "created_at", "status", "message_type", "has_media", "media", "text_preview")
+                if key in event
+            }
+            for event in events_asc
+        ]
+
+    return result
+
+
+_COUNT_QUERIES = {
+    "contacts": "SELECT count(*) FROM contacts",
+    "lists": "SELECT count(*) FROM lists",
+    "inbound_events": "SELECT count(*) FROM inbound_events",
+}
+
+_STATUS_COUNT_QUERIES = {
+    "drafts": "SELECT status, count(*) AS count FROM drafts GROUP BY status ORDER BY status",
+    "approvals": "SELECT status, count(*) AS count FROM approvals GROUP BY status ORDER BY status",
+    "outbox": "SELECT status, count(*) AS count FROM outbox GROUP BY status ORDER BY status",
+}
+
+
+def _count_rows(conn: sqlite3.Connection, table: str) -> int:
+    query = _COUNT_QUERIES[table]
+    return int(conn.execute(query).fetchone()[0])
+
+
+def _count_by_status(conn: sqlite3.Connection, table: str) -> dict[str, int]:
+    query = _STATUS_COUNT_QUERIES[table]
+    rows = conn.execute(query).fetchall()
+    return {str(row["status"] or "unknown"): int(row["count"]) for row in rows}
+
+
+def get_cockpit_overview(limit: int = 10) -> dict[str, Any]:
+    """Return a sanitized admin cockpit snapshot.
+
+    This is read-only and intentionally contains no raw WhatsApp refs, phone
+    numbers, message IDs, approval tokens, endpoint URLs, or API keys.
+    """
+    init_db()
+    limit = max(1, min(int(limit or 10), 50))
+    with _connect() as conn:
+        counts = {
+            "contacts": _count_rows(conn, "contacts"),
+            "lists": _count_rows(conn, "lists"),
+            "inbound_events": _count_rows(conn, "inbound_events"),
+            "drafts_by_status": _count_by_status(conn, "drafts"),
+            "approvals_by_status": _count_by_status(conn, "approvals"),
+            "outbox_by_status": _count_by_status(conn, "outbox"),
+        }
+        approval_rows = conn.execute(
+            """
+            SELECT id, draft_id, status, expires_at, created_at, resolved_at
+            FROM approvals
+            WHERE status='pending'
+            ORDER BY created_at DESC
+            LIMIT ?
+            """,
+            (limit,),
+        ).fetchall()
+        draft_rows = conn.execute(
+            """
+            SELECT id, status, message_hash, send_at, created_at, updated_at
+            FROM drafts
+            ORDER BY created_at DESC
+            LIMIT ?
+            """,
+            (limit,),
+        ).fetchall()
+    pending_approvals = [
+        {
+            "approval_id": row["id"],
+            "draft_id": row["draft_id"],
+            "status": row["status"],
+            "expires_at": row["expires_at"],
+            "created_at": row["created_at"],
+            "resolved_at": row["resolved_at"],
+        }
+        for row in approval_rows
+    ]
+    recent_drafts = [
+        {
+            "draft_id": row["id"],
+            "status": row["status"],
+            "message_hash": row["message_hash"],
+            "send_at": row["send_at"],
+            "created_at": row["created_at"],
+            "updated_at": row["updated_at"],
+        }
+        for row in draft_rows
+    ]
+    return {
+        "ok": True,
+        "counts": counts,
+        "pending_approvals": pending_approvals,
+        "recent_drafts": recent_drafts,
+        "recent_inbound": lookup_inbound_events(limit=limit),
+        "operator_actions": [
+            "wpp_sync_allowlist",
+            "wpp_inbound_lookup",
+            "wpp_resolve_contact",
+            "wpp_list_contacts",
+            "wpp_request_approval",
+            "wpp_status",
+            "wpp_cancel",
+            "wpp_register_alias",
+        ],
+    }
+
+
+def _queue_registration_item(item: dict[str, Any], index: int) -> dict[str, Any]:
+    subtype = str(item.get("kind") or "contact").strip().lower()
+    command = "/addgp" if subtype == "group" else "/addct"
+    label = "grupo" if subtype == "group" else "contato"
+    title = str(item.get("display_name") or item.get("phone_masked") or item.get("safe_id") or "sem nome")[:120]
+    suggested_name = title if title and title != "sem nome" else "Nome"
+    primary_action = f"{command} {suggested_name} --item {index}"
+    origin = str(item.get("source_group_name") or item.get("source_group_safe_id") or "").strip()
+    message_type = str(item.get("last_message_type") or "").strip()
+    why = (
+        "grupo novo com atividade recente; cadastrar libera contexto e ações controladas"
+        if subtype == "group"
+        else "contato novo com interação recente; cadastrar evita perder follow-up comercial"
+    )
+    details: list[str] = []
+    if origin:
+        details.append(f"origem: {origin}")
+    if message_type:
+        details.append(f"última msg: {message_type}")
+    if item.get("message_count") and int(item.get("message_count") or 0) > 1:
+        details.append(f"{int(item.get('message_count') or 0)} mensagens")
+    if subtype == "contact" and item.get("phone_status") == "unresolved":
+        details.append("número não resolvido")
+    if item.get("last_text_preview"):
+        details.append(f"msg: {str(item.get('last_text_preview'))[:80]}")
+    result: dict[str, Any] = {
+        "kind": "registration",
+        "subtype": subtype,
+        "priority": "normal",
+        "title": f"Cadastrar {label}: {title}",
+        "operator_state": "ACTION_REQUIRED",
+        "operator_title": f"Cadastrar {label}",
+        "operator_summary": " · ".join(details) if details else why,
+        "why_it_matters": why,
+        "suggested_label": suggested_name,
+        "safe_origin": origin,
+        "primary_action": primary_action,
+        "ignore_action": f"/ignorar {index}",
+        "secondary_actions": [f"/ignorar {index}", "/ctxwpp", "/fila debug"],
+        "staging_id": item.get("staging_id", ""),
+        "display_name": title,
+        "safe_id": item.get("safe_id", ""),
+        "message_count": int(item.get("message_count") or 1),
+        "created_at": item.get("created_at"),
+        "last_seen_at": item.get("last_seen_at") or item.get("created_at"),
+        "actions": [primary_action],
+    }
+    for key in (
+        "phone_masked", "last4", "source_group_safe_id", "source_group_name",
+        "last_message_type", "has_media", "last_text_preview", "context_summary",
+        "recent_messages", "phone_status", "identity_note",
+    ):
+        if item.get(key) not in (None, "", []):
+            result[key] = item[key]
+    return result
+
+
+def _queue_context_item(event: dict[str, Any]) -> dict[str, Any]:
+    context = _event_context(event, "operator", 140)
+    preview = context.get("text_preview")
+    if preview:
+        context["text_preview"] = _sanitize_summary_text(preview, 140)
+    message_type = context.get("message_type") or "unknown"
+    has_media = bool(context.get("has_media"))
+    safe_preview = context.get("text_preview", "")
+    operator_summary = safe_preview or ("mídia recebida" if has_media else f"mensagem {message_type} recebida")
+    return {
+        "kind": "context",
+        "priority": "info",
+        "title": f"Inbound recente: {message_type}",
+        "operator_state": "ACTION_REQUIRED" if safe_preview or has_media else "INFO",
+        "operator_title": "Revisar mensagem recente",
+        "operator_summary": operator_summary,
+        "why_it_matters": "contexto recente pode exigir resposta, cadastro ou follow-up",
+        "safe_preview": safe_preview,
+        "primary_action": "/ctxwpp",
+        "secondary_actions": ["/fila debug"],
+        "safe_event_id": context.get("safe_event_id", ""),
+        "created_at": context.get("created_at", ""),
+        "status": context.get("status", ""),
+        "message_type": message_type,
+        "has_media": has_media,
+        "text_preview": safe_preview,
+        "media": context.get("media", {}),
+        "actions": list(context.get("suggested_actions") or []),
+    }
+
+
+def _queue_operator_summary(items: list[dict[str, Any]], counts: dict[str, Any], warnings: list[str], latest_inbound_created_at: Any) -> dict[str, Any]:
+    total = int(counts.get("total") or len(items) or 0)
+    if total:
+        headline = f"{total} " + ("ação" if total == 1 else "ações") + " no WhatsApp profissional"
+        health = "warning" if warnings else "ok"
+    elif "stale_local_inbound_store" in warnings:
+        headline = "Sem ação atual — contexto antigo oculto"
+        health = "warning"
+    else:
+        headline = "Sem ação agora no WhatsApp profissional"
+        health = "ok"
+
+    best_item = next((item for item in items if item.get("primary_action")), None)
+    best_next_action = ""
+    if best_item:
+        title = str(best_item.get("operator_title") or best_item.get("title") or "agir").strip()
+        action = str(best_item.get("primary_action") or "").strip()
+        best_next_action = f"{title}: {action}" if action else title
+    elif not items:
+        best_next_action = "Aguardar novo inbound ou abrir /crm next"
+
+    risk_bits: list[str] = []
+    if "expired_pending_approvals_hidden" in warnings:
+        risk_bits.append(f"{counts.get('expired_pending_approvals', 0)} approval(s) expirado(s) oculto(s)")
+    if "stale_local_inbound_store" in warnings:
+        risk_bits.append("contexto local antigo oculto")
+
+    return {
+        "headline": headline,
+        "health": health,
+        "best_next_action": best_next_action,
+        "risk_note": "; ".join(risk_bits),
+        "identity_note": "fila usa local_inbound_store recente; raw refs permanecem ocultas",
+        "latest_inbound_created_at": latest_inbound_created_at,
+    }
+
+
+def get_actionable_queue(limit: int = 10) -> dict[str, Any]:
+    """Return a read-only sanitized operator queue for WhatsApp Ops.
+
+    Combines pending approvals, registration staging, and recent local inbound
+    context. This never sends, drafts, approves, fetches provider history, or
+    exposes raw WhatsApp refs/message ids/approval tokens.
+    """
+    init_db()
+    limit_value, limit_clamped = _clamp_int(limit, 10, 1, 50)
+    with _connect() as conn:
+        approval_rows = conn.execute(
+            """
+            SELECT id, draft_id, status, expires_at, created_at, resolved_at
+            FROM approvals
+            WHERE status='pending' AND expires_at > ?
+            ORDER BY created_at DESC
+            LIMIT ?
+            """,
+            (utc_now(), limit_value),
+        ).fetchall()
+        expired_pending_approvals = int(conn.execute(
+            "SELECT COUNT(*) FROM approvals WHERE status='pending' AND expires_at <= ?",
+            (utc_now(),),
+        ).fetchone()[0])
+        counts = {
+            "pending_approvals": int(approval_rows and len(approval_rows) or 0),
+            "expired_pending_approvals": expired_pending_approvals,
+            "active_staging": 0,
+            "inbound_events": _count_rows(conn, "inbound_events"),
+            "drafts_by_status": _count_by_status(conn, "drafts"),
+            "outbox_by_status": _count_by_status(conn, "outbox"),
+        }
+
+    items: list[dict[str, Any]] = []
+    for row in approval_rows:
+        draft_id = row["draft_id"]
+        items.append({
+            "kind": "approval",
+            "priority": "high",
+            "title": "Aprovação WhatsApp pendente",
+            "operator_state": "WAITING_APPROVAL",
+            "operator_title": "Aprovar ou negar WhatsApp",
+            "operator_summary": "há um draft aguardando decisão humana no card Telegram",
+            "why_it_matters": "sem clique humano o Hunter não deve enviar nem executar ação real",
+            "primary_action": "aprovar/negar no card Telegram",
+            "secondary_actions": [f"wpp_status({draft_id})", "/fila debug"],
+            "approval_id": row["id"],
+            "draft_id": draft_id,
+            "status": row["status"],
+            "created_at": row["created_at"],
+            "expires_at": row["expires_at"],
+            "resolved_at": row["resolved_at"],
+            "actions": [
+                "aprovar/negar no card Telegram",
+                f"wpp_status({draft_id})",
+                f"wpp_send_approved({draft_id}) após aprovação",
+            ],
+        })
+
+    staged_all = peek_staging()
+    staged = [
+        item for item in staged_all
+        if str(item.get("last_message_type") or "").strip().lower() != "system"
+    ][:limit_value]
+    counts["active_staging"] = len(staged)
+    for index, staged_item in enumerate(staged, 1):
+        items.append(_queue_registration_item(staged_item, index))
+
+    latest_inbound_created_at = None
+    max_context_age = timedelta(hours=24)
+    recent_events: list[dict[str, Any]] = []
+    for event in lookup_inbound_events(limit=max(limit_value * 5, 20)):
+        payload = event.get("payload") if isinstance(event.get("payload"), dict) else {}
+        if _message_type_from_payload(payload) == "system":
+            continue
+        if is_synthetic_contact_sync_payload(payload):
+            continue
+        if latest_inbound_created_at is None:
+            latest_inbound_created_at = event.get("created_at") or None
+        if _payload_from_self(payload):
+            continue
+        if not _is_recent_iso(event.get("created_at"), max_age=max_context_age):
+            continue
+        recent_events.append(event)
+        if len(recent_events) >= limit_value:
+            break
+    for event in recent_events:
+        items.append(_queue_context_item(event))
+
+    counts["registration_items"] = len(staged)
+    counts["context_items"] = len(recent_events)
+    counts["total"] = len(items)
+    warnings = ["limit_clamped"] if limit_clamped else []
+    if latest_inbound_created_at and not _is_recent_iso(latest_inbound_created_at, max_age=max_context_age):
+        warnings.append("stale_local_inbound_store")
+    if expired_pending_approvals:
+        warnings.append("expired_pending_approvals_hidden")
+    if not items:
+        warnings.append("empty_queue")
+    operator_summary = _queue_operator_summary(items, counts, warnings, latest_inbound_created_at)
+    return {
+        "ok": True,
+        "source": "local_inbound_store",
+        "generated_by": "deterministic_local_v1",
+        "read_only": True,
+        "local_store_only": True,
+        "send_performed": False,
+        "draft_created": False,
+        "approval_resolved": False,
+        "provider_history_used": False,
+        "summary_persisted": False,
+        "exposes_raw_refs": False,
+        "limit": limit_value,
+        "context_max_age_hours": int(max_context_age.total_seconds() // 3600),
+        "latest_inbound_created_at": latest_inbound_created_at,
+        "operator_summary": operator_summary,
+        "counts": counts,
+        "items": items[: limit_value * 3],
+        "operator_actions": [
+            "wpp_actionable_queue",
+            "wpp_cockpit_overview",
+            "wpp_thread_context",
+            "wpp_conversation_summary",
+            "wpp_register_staging_status",
+            "wpp_request_approval",
+            "wpp_send_approved",
+        ],
+        "warnings": warnings,
+    }
+
+
+def get_send_allowlist_ids() -> dict[str, list[str]]:
+    """Return sanitized IDs currently allowed for send from derived runtime cache."""
+    init_db()
+    with _connect() as conn:
+        contact_rows = conn.execute(
+            "SELECT id FROM contacts WHERE whitelisted=1 ORDER BY id"
+        ).fetchall()
+        group_rows = conn.execute(
+            "SELECT id FROM lists WHERE allowed=1 ORDER BY id"
+        ).fetchall()
+    return {
+        "contacts": [_safe_contact_id(str(row["id"])) for row in contact_rows],
+        "groups": [str(row["id"]) for row in group_rows],
+    }
+
+
+def update_draft_status(draft_id: str, status: str, send_at: str | None = None) -> None:
+    init_db()
+    with _connect() as conn:
+        if send_at is None:
+            conn.execute(
+                "UPDATE drafts SET status=?, updated_at=? WHERE id=?",
+                (status, utc_now(), draft_id),
+            )
+        else:
+            conn.execute(
+                "UPDATE drafts SET status=?, send_at=?, updated_at=? WHERE id=?",
+                (status, send_at, utc_now(), draft_id),
+            )
+
+
+# ---------------------------------------------------------------------------
+# Mission envelope and autonomy-run ledger (internal, no tool registration)
+# ---------------------------------------------------------------------------
+
+
+def _mission_error(code: str) -> dict[str, Any]:
+    return {"ok": False, "error": code}
+
+
+def _strict_utc_timestamp(value: Any) -> tuple[str, datetime] | None:
+    if type(value) is not str or not value.strip():
+        return None
+    try:
+        parsed = datetime.fromisoformat(value.replace("Z", "+00:00"))
+    except ValueError:
+        return None
+    if parsed.tzinfo is None or parsed.utcoffset() != timedelta(0):
+        return None
+    parsed = parsed.astimezone(timezone.utc)
+    return parsed.isoformat(), parsed
+
+
+def _mission_now() -> datetime:
+    parsed = _strict_utc_timestamp(utc_now())
+    if parsed is None:  # pragma: no cover - utc_now is internal and UTC by contract
+        raise RuntimeError("mission clock invalid")
+    return parsed[1]
+
+
+def _canonical_mission_json(payload: dict[str, Any]) -> str:
+    return json.dumps(
+        payload,
+        ensure_ascii=False,
+        sort_keys=True,
+        separators=(",", ":"),
+        allow_nan=False,
+    )
+
+
+def _safe_mission_envelope(row: dict[str, Any]) -> dict[str, Any]:
+    return {
+        "ok": True,
+        "envelope_digest": str(row["envelope_digest"]),
+        "project_ref": str(row["project_ref"]),
+        "sales_pack_digest": str(row["sales_pack_digest"]),
+        "mode": str(row["mode"]),
+        "max_items": int(row["max_items"]),
+        "max_local_writes": int(row["max_local_writes"]),
+        "window_ref": str(row["window_ref"]),
+        "expires_at": str(row["expires_at"]),
+        "active": bool(row["active"]),
+        "killed": bool(row["killed"]),
+    }
+
+
+def register_mission_envelope(
+    *,
+    project_ref: str,
+    sales_pack_digest: str,
+    mode: str,
+    max_items: int,
+    max_local_writes: int,
+    window_ref: str,
+    expires_at: str,
+    active: bool = True,
+    kill_switch: bool = False,
+) -> dict[str, Any]:
+    """Persist one immutable, sanitized mission manifest and its control state."""
+
+    if not is_opaque_ref(project_ref) or not is_opaque_ref(window_ref):
+        return _mission_error("mission_envelope_ref_invalid")
+    if type(sales_pack_digest) is not str or not _MISSION_DIGEST_RE.fullmatch(
+        sales_pack_digest
+    ):
+        return _mission_error("sales_pack_digest_invalid")
+    if type(mode) is not str or mode not in _MISSION_MODES:
+        return _mission_error("mission_envelope_mode_invalid")
+    if (
+        type(max_items) is not int
+        or type(max_local_writes) is not int
+        or not 1 <= max_items <= _MISSION_MAX_ITEMS
+        or not 0 <= max_local_writes <= _MISSION_MAX_LOCAL_WRITES
+        or max_local_writes > max_items
+        or (mode != "safe_auto" and max_local_writes != 0)
+    ):
+        return _mission_error("mission_envelope_caps_invalid")
+    if type(active) is not bool or type(kill_switch) is not bool:
+        return _mission_error("mission_envelope_flags_invalid")
+    expiry = _strict_utc_timestamp(expires_at)
+    if expiry is None:
+        return _mission_error("mission_envelope_expiry_invalid")
+    expires_canonical, expires_dt = expiry
+    if expires_dt <= _mission_now():
+        return _mission_error("mission_envelope_expired")
+
+    effective_active = bool(active and not kill_switch)
+    payload = {
+        "project_ref": project_ref,
+        "sales_pack_digest": sales_pack_digest,
+        "mode": mode,
+        "caps": {
+            "max_items": max_items,
+            "max_local_writes": max_local_writes,
+        },
+        "window_ref": window_ref,
+        "expires_at": expires_canonical,
+        "active": effective_active,
+        "kill_switch": kill_switch,
+    }
+    payload_json = _canonical_mission_json(payload)
+    envelope_digest = hash_text(payload_json)
+    now = utc_now()
+    init_db()
+    with _connect() as conn:
+        conn.execute(
+            """
+            INSERT OR IGNORE INTO mission_envelopes (
+                envelope_digest, project_ref, sales_pack_digest, mode,
+                max_items, max_local_writes, window_ref, expires_at,
+                active, killed, payload_json, created_at, updated_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                envelope_digest,
+                project_ref,
+                sales_pack_digest,
+                mode,
+                max_items,
+                max_local_writes,
+                window_ref,
+                expires_canonical,
+                int(effective_active),
+                int(kill_switch),
+                payload_json,
+                now,
+                now,
+            ),
+        )
+        row = conn.execute(
+            "SELECT * FROM mission_envelopes WHERE envelope_digest=?",
+            (envelope_digest,),
+        ).fetchone()
+        validated, error = _validated_mission_envelope(
+            conn,
+            envelope_digest,
+            allow_inactive=True,
+        )
+    if row is None:  # pragma: no cover - protected by the insert/select transaction
+        return _mission_error("mission_envelope_write_failed")
+    if error is not None or validated is None:
+        return _mission_error(error or "mission_envelope_changed")
+    return _safe_mission_envelope(validated)
+
+
+def _validated_mission_envelope(
+    conn: sqlite3.Connection,
+    envelope_digest: str,
+    *,
+    requires_local_write: bool = False,
+    allow_inactive: bool = False,
+) -> tuple[dict[str, Any] | None, str | None]:
+    row = conn.execute(
+        "SELECT * FROM mission_envelopes WHERE envelope_digest=?",
+        (envelope_digest,),
+    ).fetchone()
+    if row is None:
+        return None, "mission_envelope_not_found"
+    stored = dict(row)
+    try:
+        payload = json.loads(str(stored["payload_json"]))
+        if type(payload) is not dict:
+            raise ValueError
+        caps = payload.get("caps")
+        if type(caps) is not dict:
+            raise ValueError
+        payload_keys = {
+            "project_ref",
+            "sales_pack_digest",
+            "mode",
+            "caps",
+            "window_ref",
+            "expires_at",
+            "active",
+            "kill_switch",
+        }
+        if set(payload) != payload_keys or set(caps) != {
+            "max_items",
+            "max_local_writes",
+        }:
+            raise ValueError
+        if hash_text(_canonical_mission_json(payload)) != envelope_digest:
+            raise ValueError
+        immutable_pairs = (
+            (payload["project_ref"], stored["project_ref"]),
+            (payload["sales_pack_digest"], stored["sales_pack_digest"]),
+            (payload["mode"], stored["mode"]),
+            (payload["window_ref"], stored["window_ref"]),
+            (payload["expires_at"], stored["expires_at"]),
+            (caps["max_items"], stored["max_items"]),
+            (caps["max_local_writes"], stored["max_local_writes"]),
+        )
+        if any(left != right for left, right in immutable_pairs):
+            raise ValueError
+        if type(payload["active"]) is not bool or type(payload["kill_switch"]) is not bool:
+            raise ValueError
+        runtime_active = int(stored["active"])
+        runtime_killed = int(stored["killed"])
+        if runtime_active not in {0, 1} or runtime_killed not in {0, 1}:
+            raise ValueError
+        initial_controls = (
+            int(payload["active"]),
+            int(payload["kill_switch"]),
+        )
+        runtime_controls = (runtime_active, runtime_killed)
+        if runtime_controls != initial_controls and runtime_controls != (0, 1):
+            raise ValueError
+        if not is_opaque_ref(stored["project_ref"]) or not is_opaque_ref(
+            stored["window_ref"]
+        ):
+            raise ValueError
+        if not _MISSION_DIGEST_RE.fullmatch(str(stored["sales_pack_digest"])):
+            raise ValueError
+        if str(stored["mode"]) not in _MISSION_MODES:
+            raise ValueError
+        expiry = _strict_utc_timestamp(stored["expires_at"])
+        if expiry is None:
+            raise ValueError
+    except (KeyError, TypeError, ValueError, json.JSONDecodeError):
+        return None, "mission_envelope_changed"
+
+    if not allow_inactive:
+        if bool(stored["killed"]):
+            return None, "mission_envelope_killed"
+        if not bool(stored["active"]):
+            return None, "mission_envelope_inactive"
+    if expiry[1] <= _mission_now():
+        return None, "mission_envelope_expired"
+    if requires_local_write and (
+        stored["mode"] != "safe_auto" or int(stored["max_local_writes"]) < 1
+    ):
+        return None, "mission_envelope_local_write_denied"
+    return stored, None
+
+
+def inspect_mission_envelope(
+    envelope_digest: str,
+    *,
+    requires_local_write: bool = False,
+) -> dict[str, Any]:
+    """Inspect one exact active envelope without creating ledger/business rows.
+
+    The returned shape is the same sanitized immutable/control snapshot used by
+    registration.  Payload JSON, timestamps, fences, and internal row state are
+    never exposed.  Validation covers digest integrity, immutable-field tamper,
+    current active/kill controls, expiry, and the optional local-write gate.
+    """
+
+    if type(envelope_digest) is not str or not _MISSION_DIGEST_RE.fullmatch(
+        envelope_digest
+    ):
+        return _mission_error("mission_envelope_digest_invalid")
+    if type(requires_local_write) is not bool:
+        return _mission_error("mission_envelope_local_write_flag_invalid")
+    try:
+        with _connect_read_only() as conn:
+            envelope, error = _validated_mission_envelope(
+                conn,
+                envelope_digest,
+                requires_local_write=requires_local_write,
+            )
+    except sqlite3.Error:
+        return _mission_error("mission_envelope_store_unavailable")
+    if error is not None or envelope is None:
+        return _mission_error(error or "mission_envelope_changed")
+    return _safe_mission_envelope(envelope)
+
+
+def _autonomy_draft_content_safe(message: Any) -> bool:
+    if type(message) is not str or not message.strip() or len(message) > 600:
+        return False
+    checks = (
+        r"(?i)https?://",
+        r"(?i)@(?:g\.us|lid|s\.whatsapp\.net|c\.us|whatsapp\.net)\b",
+        r"(?i)\b(?:api[_-]?key|secret|token|authorization|bearer)\s*[=:]",
+        r"(?<![\w-])\+?\d[\d\s().-]{7,}\d(?![\w-])",
+    )
+    return not any(re.search(pattern, message) for pattern in checks)
+
+
+def create_autonomy_draft_approval(
+    envelope_digest: str,
+    run_key: str,
+    fence: str,
+    *,
+    target: dict[str, Any],
+    message: str,
+) -> dict[str, Any]:
+    """Atomically validate the exact leased mission and queue one local item.
+
+    The envelope/run validation, draft insert, approval insert, and bounded
+    progress counter share one ``BEGIN IMMEDIATE`` transaction.  A concurrent
+    kill therefore happens either before validation (zero writes) or after the
+    complete local item commits; partial draft-without-approval state is never
+    created by this path.
+    """
+
+    if type(envelope_digest) is not str or not _MISSION_DIGEST_RE.fullmatch(
+        envelope_digest
+    ):
+        raise ValueError("mission_envelope_digest_invalid")
+    if not is_opaque_ref(run_key) or type(fence) is not str or not fence:
+        raise ValueError("autonomy_run_fence_stale")
+    if (
+        type(target) is not dict
+        or set(target) != {"type", "contact_id"}
+        or target.get("type") != "contact"
+        or not is_opaque_ref(target.get("contact_id"))
+        or not _autonomy_draft_content_safe(message)
+    ):
+        raise ValueError("autonomy_local_write_payload_invalid")
+
+    init_db()
+    targets = [dict(target)]
+    targets_json = json.dumps(targets, ensure_ascii=False, sort_keys=True)
+    message_hash = hash_text(message)
+    idempotency_key = hash_text(targets_json + "\n" + message + "\n\n")
+    draft_id = "draft_" + uuid.uuid4().hex[:12]
+    approval_id = "approval_" + uuid.uuid4().hex[:12]
+    approval_token_hash = hash_text(secrets.token_urlsafe(32))
+    approval_expires_at = ""
+
+    with _connect() as conn:
+        conn.execute("BEGIN IMMEDIATE")
+        now_dt = _mission_now()
+        now = now_dt.isoformat()
+        approval_expires_at = (now_dt + timedelta(minutes=60)).isoformat()
+        envelope, error = _validated_mission_envelope(
+            conn,
+            envelope_digest,
+            requires_local_write=True,
+        )
+        if error is not None or envelope is None:
+            raise ValueError(error or "mission_envelope_changed")
+        row = conn.execute(
+            "SELECT * FROM autonomy_runs WHERE run_key=?",
+            (run_key,),
+        ).fetchone()
+        if row is None:
+            raise ValueError("autonomy_run_not_found")
+        run = dict(row)
+        if run["envelope_digest"] != envelope_digest or run["status"] != "started":
+            raise ValueError("autonomy_run_state_changed")
+        if not secrets.compare_digest(str(run["fence_hash"]), hash_text(fence)):
+            raise ValueError("autonomy_run_fence_stale")
+        lease = _strict_utc_timestamp(run["lease_expires_at"])
+        if lease is None or lease[1] <= now_dt:
+            raise ValueError("autonomy_run_lease_expired")
+        local_write_count = int(run["local_write_count"])
+        if local_write_count >= min(int(envelope["max_local_writes"]), _MISSION_MAX_LOCAL_WRITES):
+            raise ValueError("autonomy_run_caps_exceeded")
+
+        conn.execute(
+            """
+            INSERT INTO drafts (
+                id, targets_json, message, message_hash, media_json, send_at,
+                status, idempotency_key, created_by, created_at, updated_at
+            ) VALUES (?, ?, ?, ?, NULL, NULL, 'pending_approval', ?, ?, ?, ?)
+            """,
+            (
+                draft_id,
+                targets_json,
+                message,
+                message_hash,
+                idempotency_key,
+                "hunter_autonomous:" + str(run["run_id"]),
+                now,
+                now,
+            ),
+        )
+        conn.execute(
+            """
+            INSERT INTO approvals (
+                id, draft_id, approval_token_hash, approver_ref_hash,
+                message_hash, draft_idempotency_key, status, expires_at,
+                created_at, resolved_at
+            ) VALUES (?, ?, ?, NULL, ?, ?, 'pending', ?, ?, NULL)
+            """,
+            (
+                approval_id,
+                draft_id,
+                approval_token_hash,
+                message_hash,
+                idempotency_key,
+                approval_expires_at,
+                now,
+            ),
+        )
+        conn.execute(
+            "UPDATE autonomy_runs SET local_write_count=local_write_count+1, "
+            "updated_at=? WHERE run_key=? AND status='started' AND fence_hash=?",
+            (now, run_key, hash_text(fence)),
+        )
+
+    return {
+        "draft": {
+            "draft_id": draft_id,
+            "status": "pending_approval",
+            "message_hash": message_hash,
+            "idempotency_key": idempotency_key,
+        },
+        "approval": {
+            "approval_id": approval_id,
+            "status": "pending",
+            "expires_at": approval_expires_at,
+        },
+    }
+
+
+def kill_mission_envelope(envelope_digest: str) -> dict[str, Any]:
+    """Idempotently stop one exact mission envelope without rewriting its digest."""
+
+    if type(envelope_digest) is not str or not _MISSION_DIGEST_RE.fullmatch(
+        envelope_digest
+    ):
+        return _mission_error("mission_envelope_digest_invalid")
+    init_db()
+    with _connect() as conn:
+        conn.execute("BEGIN IMMEDIATE")
+        row = conn.execute(
+            "SELECT * FROM mission_envelopes WHERE envelope_digest=?",
+            (envelope_digest,),
+        ).fetchone()
+        if row is None:
+            return _mission_error("mission_envelope_not_found")
+        conn.execute(
+            "UPDATE mission_envelopes SET active=0, killed=1, updated_at=? "
+            "WHERE envelope_digest=?",
+            (utc_now(), envelope_digest),
+        )
+        updated = conn.execute(
+            "SELECT * FROM mission_envelopes WHERE envelope_digest=?",
+            (envelope_digest,),
+        ).fetchone()
+    return _safe_mission_envelope(dict(updated))
+
+
+def _safe_autonomy_run(row: dict[str, Any]) -> dict[str, Any]:
+    return {
+        "ok": True,
+        "run_id": str(row["run_id"]),
+        "envelope_digest": str(row["envelope_digest"]),
+        "run_key": str(row["run_key"]),
+        "status": str(row["status"]),
+        "lease_expires_at": str(row["lease_expires_at"]),
+        "started_at": str(row["started_at"]),
+        "completed_at": row["completed_at"],
+        "counters": {
+            "items": int(row["items_count"]),
+            "local_writes": int(row["local_write_count"]),
+        },
+        "result_class": row["result_class"],
+    }
+
+
+def reserve_autonomy_run(
+    envelope_digest: str,
+    run_key: str,
+    lease_seconds: int = 300,
+    *,
+    requires_local_write: bool = False,
+    renew_expired: bool = False,
+) -> dict[str, Any]:
+    """Reserve one idempotent run, optionally renewing an expired lease."""
+
+    if type(envelope_digest) is not str or not _MISSION_DIGEST_RE.fullmatch(
+        envelope_digest
+    ):
+        return _mission_error("mission_envelope_not_found")
+    if not is_opaque_ref(run_key):
+        return _mission_error("autonomy_run_key_invalid")
+    if (
+        type(lease_seconds) is not int
+        or not _AUTONOMY_MIN_LEASE_SECONDS
+        <= lease_seconds
+        <= _AUTONOMY_MAX_LEASE_SECONDS
+    ):
+        return _mission_error("autonomy_run_lease_invalid")
+    if type(requires_local_write) is not bool or type(renew_expired) is not bool:
+        return _mission_error("autonomy_run_local_write_flag_invalid")
+
+    init_db()
+    now_dt = _mission_now()
+    now = now_dt.isoformat()
+    lease_expires_at = (now_dt + timedelta(seconds=lease_seconds)).isoformat()
+    with _connect() as conn:
+        conn.execute("BEGIN IMMEDIATE")
+        envelope, error = _validated_mission_envelope(
+            conn,
+            envelope_digest,
+            requires_local_write=requires_local_write,
+        )
+        if error is not None:
+            return _mission_error(error)
+        existing = conn.execute(
+            "SELECT * FROM autonomy_runs WHERE run_key=?", (run_key,)
+        ).fetchone()
+        if existing is not None:
+            existing_dict = dict(existing)
+            if existing_dict["envelope_digest"] != envelope_digest:
+                return _mission_error("autonomy_run_key_conflict")
+            if existing_dict["status"] == "completed":
+                result = _safe_autonomy_run(existing_dict)
+                result["deduped"] = True
+                return result
+            existing_lease = _strict_utc_timestamp(existing_dict["lease_expires_at"])
+            if existing_lease is None:
+                return _mission_error("autonomy_run_state_changed")
+            if existing_lease[1] > now_dt or not renew_expired:
+                result = _safe_autonomy_run(existing_dict)
+                result["deduped"] = True
+                if existing_lease[1] <= now_dt:
+                    result["lease_expired"] = True
+                return result
+
+            fence = secrets.token_urlsafe(32)
+            conn.execute(
+                "UPDATE autonomy_runs SET fence_hash=?, lease_expires_at=?, "
+                "updated_at=? WHERE run_key=? AND status='started'",
+                (hash_text(fence), lease_expires_at, now, run_key),
+            )
+            renewed_row = conn.execute(
+                "SELECT * FROM autonomy_runs WHERE run_key=?", (run_key,)
+            ).fetchone()
+            result = _safe_autonomy_run(dict(renewed_row))
+            result.update(
+                {"deduped": True, "renewed": True, "fence": fence}
+            )
+            return result
+
+        fence = secrets.token_urlsafe(32)
+        run_id = "autonomy_" + hash_text(envelope_digest + ":" + run_key)[:20]
+        conn.execute(
+            """
+            INSERT INTO autonomy_runs (
+                run_id, envelope_digest, run_key, status, fence_hash,
+                lease_expires_at, started_at, completed_at, items_count,
+                local_write_count, result_class, updated_at
+            ) VALUES (?, ?, ?, 'started', ?, ?, ?, NULL, 0, 0, NULL, ?)
+            """,
+            (
+                run_id,
+                envelope_digest,
+                run_key,
+                hash_text(fence),
+                lease_expires_at,
+                now,
+                now,
+            ),
+        )
+        created = conn.execute(
+            "SELECT * FROM autonomy_runs WHERE run_key=?", (run_key,)
+        ).fetchone()
+    result = _safe_autonomy_run(dict(created))
+    result.update({"deduped": False, "renewed": False, "fence": fence})
+    return result
+
+
+def _validated_run_counters(counters: Any) -> dict[str, int] | None:
+    if type(counters) is not dict or set(counters) != {"items", "local_writes"}:
+        return None
+    items = counters["items"]
+    local_writes = counters["local_writes"]
+    if (
+        type(items) is not int
+        or type(local_writes) is not int
+        or items < 0
+        or local_writes < 0
+    ):
+        return None
+    return {"items": items, "local_writes": local_writes}
+
+
+def complete_autonomy_run(
+    run_key: str,
+    fence: str,
+    *,
+    counters: dict[str, Any],
+    result_class: str,
+) -> dict[str, Any]:
+    """Complete one leased run once; stale fences and changed envelopes fail closed."""
+
+    if not is_opaque_ref(run_key):
+        return _mission_error("autonomy_run_key_invalid")
+    if type(fence) is not str or not fence:
+        return _mission_error("autonomy_run_fence_stale")
+    safe_counters = _validated_run_counters(counters)
+    if safe_counters is None:
+        return _mission_error("autonomy_run_counters_invalid")
+    if type(result_class) is not str or result_class not in _AUTONOMY_RESULT_CLASSES:
+        return _mission_error("autonomy_run_result_class_invalid")
+
+    init_db()
+    now_dt = _mission_now()
+    now = now_dt.isoformat()
+    with _connect() as conn:
+        conn.execute("BEGIN IMMEDIATE")
+        row = conn.execute(
+            "SELECT * FROM autonomy_runs WHERE run_key=?", (run_key,)
+        ).fetchone()
+        if row is None:
+            return _mission_error("autonomy_run_not_found")
+        run = dict(row)
+        if not secrets.compare_digest(str(run["fence_hash"]), hash_text(fence)):
+            return _mission_error("autonomy_run_fence_stale")
+        envelope, error = _validated_mission_envelope(
+            conn, str(run["envelope_digest"])
+        )
+        if error is not None:
+            return _mission_error(error)
+        if run["status"] == "completed":
+            result = _safe_autonomy_run(run)
+            result["deduped"] = True
+            return result
+        lease = _strict_utc_timestamp(run["lease_expires_at"])
+        if lease is None or lease[1] <= now_dt:
+            return _mission_error("autonomy_run_lease_expired")
+        if (
+            safe_counters["local_writes"] > safe_counters["items"]
+            or safe_counters["local_writes"] < int(run["local_write_count"])
+            or safe_counters["items"] > int(envelope["max_items"])
+            or safe_counters["local_writes"]
+            > int(envelope["max_local_writes"])
+        ):
+            return _mission_error("autonomy_run_caps_exceeded")
+        conn.execute(
+            """
+            UPDATE autonomy_runs
+            SET status='completed', completed_at=?, items_count=?,
+                local_write_count=?, result_class=?, updated_at=?
+            WHERE run_key=? AND status='started' AND fence_hash=?
+            """,
+            (
+                now,
+                safe_counters["items"],
+                safe_counters["local_writes"],
+                result_class,
+                now,
+                run_key,
+                hash_text(fence),
+            ),
+        )
+        completed = conn.execute(
+            "SELECT * FROM autonomy_runs WHERE run_key=?", (run_key,)
+        ).fetchone()
+    return _safe_autonomy_run(dict(completed))
+
+
+# ---------------------------------------------------------------------------
+# Exact-three campaign ledger (internal, local-only)
+# ---------------------------------------------------------------------------
+
+
+def _campaign_error(code: str) -> dict[str, Any]:
+    return {"ok": False, "error": code}
+
+
+def _canonical_campaign_json(payload: dict[str, Any]) -> str:
+    return json.dumps(
+        payload,
+        ensure_ascii=False,
+        sort_keys=True,
+        separators=(",", ":"),
+        allow_nan=False,
+    )
+
+
+def _campaign_item_ref_is_opaque(key: str, value: Any) -> bool:
+    """Accept generated local IDs without mistaking random hex digits for PII."""
+
+    if is_opaque_ref(value):
+        return True
+    if type(value) is not str:
+        return False
+    patterns = {
+        "draft_id": r"draft_[0-9a-f]{12}",
+        "approval_id": r"approval_[0-9a-f]{12}",
+        "contact_id": r"contact_[0-9a-f]{16}",
+        "channel_id": r"channel_[0-9a-f]{20}",
+    }
+    pattern = patterns.get(key)
+    return pattern is not None and re.fullmatch(pattern, value) is not None
+
+
+def _normalize_campaign_manifest(
+    manifest: Any, *, require_open_window: bool
+) -> tuple[dict[str, Any] | None, str | None]:
+    top_keys = {
+        "schema",
+        "campaign_ref",
+        "project_ref",
+        "start_at",
+        "end_at",
+        "timezone",
+        "sales_pack_digest",
+        "max_followups",
+        "items",
+    }
+    item_keys = {
+        "ordinal",
+        "draft_id",
+        "approval_id",
+        "contact_id",
+        "channel_id",
+        "classification",
+        "segment",
+        "draft_hash",
+        "message_hash",
+    }
+    if type(manifest) is not dict or set(manifest) != top_keys:
+        return None, "campaign_manifest_invalid"
+    if manifest.get("schema") != _CAMPAIGN_SCHEMA:
+        return None, "campaign_manifest_schema_invalid"
+    if not is_opaque_ref(manifest.get("campaign_ref")) or not is_opaque_ref(
+        manifest.get("project_ref")
+    ):
+        return None, "campaign_manifest_ref_invalid"
+    start = _strict_utc_timestamp(manifest.get("start_at"))
+    end = _strict_utc_timestamp(manifest.get("end_at"))
+    if start is None or end is None or start[1] >= end[1]:
+        return None, "campaign_window_invalid"
+    if require_open_window and end[1] <= _mission_now():
+        return None, "campaign_window_expired"
+    timezone_name = manifest.get("timezone")
+    if type(timezone_name) is not str or not 1 <= len(timezone_name) <= 64:
+        return None, "campaign_timezone_invalid"
+    try:
+        ZoneInfo(timezone_name)
+    except (ValueError, ZoneInfoNotFoundError):
+        return None, "campaign_timezone_invalid"
+    sales_pack_digest = manifest.get("sales_pack_digest")
+    if type(sales_pack_digest) is not str or not _CAMPAIGN_DIGEST_RE.fullmatch(
+        sales_pack_digest
+    ):
+        return None, "campaign_sales_pack_digest_invalid"
+    max_followups = manifest.get("max_followups")
+    if type(max_followups) is not int or not 0 <= max_followups <= 3:
+        return None, "campaign_followups_invalid"
+    items = manifest.get("items")
+    if type(items) is not list or len(items) != 3:
+        return None, "campaign_items_exact_three_required"
+
+    normalized_items: list[dict[str, Any]] = []
+    uniques = {key: set() for key in ("draft_id", "approval_id", "contact_id", "channel_id")}
+    for expected_ordinal, item in enumerate(items, 1):
+        if type(item) is not dict or set(item) != item_keys:
+            return None, "campaign_item_invalid"
+        if type(item.get("ordinal")) is not int or item["ordinal"] != expected_ordinal:
+            return None, "campaign_item_order_invalid"
+        for key in ("draft_id", "approval_id", "contact_id", "channel_id"):
+            value = item.get(key)
+            if not _campaign_item_ref_is_opaque(key, value) or value in uniques[key]:
+                return None, "campaign_item_ref_invalid"
+            uniques[key].add(value)
+        if item.get("classification") not in _CAMPAIGN_CLASSIFICATIONS:
+            return None, "campaign_item_classification_invalid"
+        segment = item.get("segment")
+        if not is_opaque_ref(segment) or len(segment) > 64:
+            return None, "campaign_item_segment_invalid"
+        if any(
+            type(item.get(key)) is not str
+            or _CAMPAIGN_DIGEST_RE.fullmatch(item[key]) is None
+            for key in ("draft_hash", "message_hash")
+        ):
+            return None, "campaign_item_hash_invalid"
+        normalized_items.append(dict(item))
+
+    return {
+        "schema": _CAMPAIGN_SCHEMA,
+        "campaign_ref": manifest["campaign_ref"],
+        "project_ref": manifest["project_ref"],
+        "start_at": start[0],
+        "end_at": end[0],
+        "timezone": timezone_name,
+        "sales_pack_digest": sales_pack_digest,
+        "max_followups": max_followups,
+        "items": normalized_items,
+    }, None
+
+
+def campaign_manifest_digest(manifest: dict[str, Any]) -> dict[str, Any]:
+    """Validate and digest the strict manifest without touching local state."""
+
+    normalized, error = _normalize_campaign_manifest(
+        manifest, require_open_window=True
+    )
+    if error is not None or normalized is None:
+        return _campaign_error(error or "campaign_manifest_invalid")
+    return {
+        "ok": True,
+        "schema": _CAMPAIGN_SCHEMA,
+        "manifest_digest": hash_text(_canonical_campaign_json(normalized)),
+        "item_count": 3,
+    }
+
+
+def preview_campaign_manifest(manifest: dict[str, Any]) -> dict[str, Any]:
+    """Validate a cash-ready three-lead manifest without writing local state.
+
+    Cash-Ready excludes ``cold`` even though the generic D1 campaign ledger
+    keeps supporting it. This narrower preflight always runs before the bridge
+    calls :func:`register_campaign_manifest`.
+    """
+
+    normalized, error = _normalize_campaign_manifest(
+        manifest, require_open_window=True
+    )
+    if error is not None or normalized is None:
+        return _campaign_error(error or "campaign_manifest_invalid")
+    if any(
+        item["classification"] not in {"known", "warm", "reactivation"}
+        for item in normalized["items"]
+    ):
+        return _campaign_error("campaign_item_classification_invalid")
+
+    try:
+        with _connect_read_only() as conn:
+            now_dt = _mission_now()
+            for item in normalized["items"]:
+                draft_row = conn.execute(
+                    "SELECT * FROM drafts WHERE id=?", (item["draft_id"],)
+                ).fetchone()
+                if draft_row is None:
+                    return _campaign_error("campaign_draft_not_found")
+                draft = dict(draft_row)
+                if draft["status"] != "pending_approval":
+                    return _campaign_error("campaign_item_not_eligible")
+                if (
+                    draft["message_hash"] != item["message_hash"]
+                    or draft["idempotency_key"] != item["draft_hash"]
+                    or not draft_signature_matches(draft)
+                ):
+                    return _campaign_error("campaign_draft_changed")
+                try:
+                    targets = json.loads(str(draft["targets_json"]))
+                except (TypeError, json.JSONDecodeError):
+                    targets = None
+                if (
+                    type(targets) is not list
+                    or len(targets) != 1
+                    or type(targets[0]) is not dict
+                    or set(targets[0]) != {"type", "contact_id"}
+                    or targets[0].get("type") != "contact"
+                    or targets[0].get("contact_id") != item["contact_id"]
+                ):
+                    return _campaign_error("campaign_draft_not_one_to_one")
+
+                approval_row = conn.execute(
+                    "SELECT * FROM approvals WHERE id=?", (item["approval_id"],)
+                ).fetchone()
+                if approval_row is None:
+                    return _campaign_error("campaign_approval_not_found")
+                approval = dict(approval_row)
+                expiry = _strict_utc_timestamp(approval["expires_at"])
+                if (
+                    approval["draft_id"] != item["draft_id"]
+                    or approval["status"] != "pending"
+                    or approval["message_hash"] != draft["message_hash"]
+                    or approval["draft_idempotency_key"] != draft["idempotency_key"]
+                    or expiry is None
+                    or expiry[1] <= now_dt
+                ):
+                    return _campaign_error("campaign_approval_changed")
+
+                contact = conn.execute(
+                    "SELECT whitelisted FROM contacts WHERE id=?",
+                    (item["contact_id"],),
+                ).fetchone()
+                channel = conn.execute(
+                    "SELECT * FROM contact_channels WHERE id=?",
+                    (item["channel_id"],),
+                ).fetchone()
+                if (
+                    contact is None
+                    or not bool(contact["whitelisted"])
+                    or channel is None
+                    or channel["contact_id"] != item["contact_id"]
+                    or channel["channel_type"] != "whatsapp"
+                    or not bool(channel["is_active"])
+                    or channel["validation_status"] != "validated"
+                    or not bool(channel["allow_send"])
+                    or channel["revoked_at"] is not None
+                ):
+                    return _campaign_error("campaign_channel_ineligible")
+    except (FileNotFoundError, sqlite3.Error):
+        return _campaign_error("campaign_store_unavailable")
+
+    window = {
+        "start_at": normalized["start_at"],
+        "end_at": normalized["end_at"],
+        "timezone": normalized["timezone"],
+    }
+    return {
+        "ok": True,
+        "schema": _CAMPAIGN_SCHEMA,
+        "manifest_digest": hash_text(_canonical_campaign_json(normalized)),
+        "campaign_ref": normalized["campaign_ref"],
+        "project_ref": normalized["project_ref"],
+        "eligible_count": 3,
+        "items": [
+            {
+                "ordinal": item["ordinal"],
+                "classification": item["classification"],
+                "segment": item["segment"],
+                "draft_id": item["draft_id"],
+                "approval_id": item["approval_id"],
+                "contact_id": item["contact_id"],
+                "channel_id": item["channel_id"],
+                "draft_hash": item["draft_hash"],
+                "message_hash": item["message_hash"],
+                "window": dict(window),
+                "crm_context": {
+                    "contact_id": item["contact_id"],
+                    "channel_id": item["channel_id"],
+                },
+            }
+            for item in normalized["items"]
+        ],
+    }
+
+
+def _append_campaign_event(
+    conn: sqlite3.Connection,
+    *,
+    campaign_id: str,
+    event_type: str,
+    campaign_item_id: str | None = None,
+    ordinal: int | None = None,
+    state: str | None = None,
+    reason: str | None = None,
+    created_at: str | None = None,
+) -> None:
+    conn.execute(
+        """
+        INSERT INTO campaign_events (
+            event_id, campaign_id, campaign_item_id, event_type,
+            ordinal, state, reason, created_at
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+        """,
+        (
+            "campaign_event_" + uuid.uuid4().hex[:16],
+            campaign_id,
+            campaign_item_id,
+            event_type,
+            ordinal,
+            state,
+            reason,
+            created_at or utc_now(),
+        ),
+    )
+
+
+def _safe_campaign_item(row: dict[str, Any]) -> dict[str, Any]:
+    return {
+        "ordinal": int(row["ordinal"]),
+        "classification": str(row["classification"]),
+        "segment": str(row["segment"]),
+        "state": str(row["state"]),
+        "suppression_reason": row.get("suppression_reason"),
+        "followup_count": int(row["followup_count"]),
+        "lease_expires_at": row.get("lease_expires_at"),
+    }
+
+
+def _validated_campaign_locked(
+    conn: sqlite3.Connection, campaign_id: str
+) -> tuple[dict[str, Any] | None, list[dict[str, Any]] | None, str | None]:
+    row = conn.execute(
+        "SELECT * FROM campaigns WHERE campaign_id=?", (str(campaign_id),)
+    ).fetchone()
+    if row is None:
+        return None, None, "campaign_not_found"
+    campaign = dict(row)
+    try:
+        manifest_raw = json.loads(str(campaign["manifest_json"]))
+    except (TypeError, json.JSONDecodeError):
+        return None, None, "campaign_manifest_changed"
+    manifest, error = _normalize_campaign_manifest(
+        manifest_raw, require_open_window=False
+    )
+    if error is not None or manifest is None:
+        return None, None, "campaign_manifest_changed"
+    canonical = _canonical_campaign_json(manifest)
+    immutable = (
+        (hash_text(canonical), campaign["manifest_digest"]),
+        (manifest["campaign_ref"], campaign["campaign_ref"]),
+        (manifest["project_ref"], campaign["project_ref"]),
+        (manifest["start_at"], campaign["start_at"]),
+        (manifest["end_at"], campaign["end_at"]),
+        (manifest["timezone"], campaign["timezone"]),
+        (manifest["sales_pack_digest"], campaign["sales_pack_digest"]),
+        (manifest["max_followups"], campaign["max_followups"]),
+    )
+    if any(left != right for left, right in immutable):
+        return None, None, "campaign_manifest_changed"
+    items = [
+        dict(item)
+        for item in conn.execute(
+            "SELECT * FROM campaign_items WHERE campaign_id=? ORDER BY ordinal",
+            (campaign_id,),
+        ).fetchall()
+    ]
+    if len(items) != 3:
+        return None, None, "campaign_manifest_changed"
+    immutable_item_keys = (
+        "ordinal",
+        "draft_id",
+        "approval_id",
+        "contact_id",
+        "channel_id",
+        "classification",
+        "segment",
+        "draft_hash",
+        "message_hash",
+    )
+    for stored, expected in zip(items, manifest["items"], strict=True):
+        if any(stored[key] != expected[key] for key in immutable_item_keys):
+            return None, None, "campaign_manifest_changed"
+    return campaign, items, None
+
+
+def _safe_campaign(
+    campaign: dict[str, Any], items: list[dict[str, Any]], *, deduped: bool = False
+) -> dict[str, Any]:
+    return {
+        "ok": True,
+        "campaign_id": str(campaign["campaign_id"]),
+        "manifest_digest": str(campaign["manifest_digest"]),
+        "campaign_ref": str(campaign["campaign_ref"]),
+        "project_ref": str(campaign["project_ref"]),
+        "start_at": str(campaign["start_at"]),
+        "end_at": str(campaign["end_at"]),
+        "timezone": str(campaign["timezone"]),
+        "sales_pack_digest": str(campaign["sales_pack_digest"]),
+        "max_followups": int(campaign["max_followups"]),
+        "state": str(campaign["state"]),
+        "paused": bool(campaign["paused"]),
+        "killed": bool(campaign["killed"]),
+        "item_count": len(items),
+        "items": [_safe_campaign_item(item) for item in items],
+        "deduped": deduped,
+    }
+
+
+def register_campaign_manifest(manifest: dict[str, Any]) -> dict[str, Any]:
+    """Atomically admit exactly three pre-created pending 1:1 drafts."""
+
+    normalized, error = _normalize_campaign_manifest(
+        manifest, require_open_window=True
+    )
+    if error is not None or normalized is None:
+        return _campaign_error(error or "campaign_manifest_invalid")
+    init_db()
+    try:
+        with _connect() as conn:
+            conn.execute("BEGIN IMMEDIATE")
+            normalized, error = _normalize_campaign_manifest(
+                manifest, require_open_window=True
+            )
+            if error is not None or normalized is None:
+                return _campaign_error(error or "campaign_manifest_invalid")
+            manifest_json = _canonical_campaign_json(normalized)
+            manifest_digest = hash_text(manifest_json)
+            existing = conn.execute(
+                "SELECT campaign_id FROM campaigns WHERE manifest_digest=?",
+                (manifest_digest,),
+            ).fetchone()
+            if existing is None:
+                conflict = conn.execute(
+                    "SELECT 1 FROM campaigns WHERE campaign_ref=?",
+                    (normalized["campaign_ref"],),
+                ).fetchone()
+                if conflict is not None:
+                    return _campaign_error("campaign_ref_conflict")
+
+            now_dt = _mission_now()
+            now = now_dt.isoformat()
+            for item in normalized["items"]:
+                draft_row = conn.execute(
+                    "SELECT * FROM drafts WHERE id=?", (item["draft_id"],)
+                ).fetchone()
+                if draft_row is None:
+                    return _campaign_error("campaign_draft_not_found")
+                draft = dict(draft_row)
+                if draft["status"] != "pending_approval":
+                    return _campaign_error("campaign_item_not_eligible")
+                if (
+                    draft["message_hash"] != item["message_hash"]
+                    or draft["idempotency_key"] != item["draft_hash"]
+                    or not draft_signature_matches(draft)
+                ):
+                    return _campaign_error("campaign_draft_changed")
+                try:
+                    targets = json.loads(str(draft["targets_json"]))
+                except (TypeError, json.JSONDecodeError):
+                    targets = None
+                if (
+                    type(targets) is not list
+                    or len(targets) != 1
+                    or type(targets[0]) is not dict
+                    or set(targets[0]) != {"type", "contact_id"}
+                    or targets[0].get("type") != "contact"
+                    or targets[0].get("contact_id") != item["contact_id"]
+                ):
+                    return _campaign_error("campaign_draft_not_one_to_one")
+
+                approval_row = conn.execute(
+                    "SELECT * FROM approvals WHERE id=?", (item["approval_id"],)
+                ).fetchone()
+                if approval_row is None:
+                    return _campaign_error("campaign_approval_not_found")
+                approval = dict(approval_row)
+                expiry = _strict_utc_timestamp(approval["expires_at"])
+                if (
+                    approval["draft_id"] != item["draft_id"]
+                    or approval["status"] != "pending"
+                    or approval["message_hash"] != draft["message_hash"]
+                    or approval["draft_idempotency_key"] != draft["idempotency_key"]
+                    or expiry is None
+                    or expiry[1] <= now_dt
+                ):
+                    return _campaign_error("campaign_approval_changed")
+
+                contact = conn.execute(
+                    "SELECT whitelisted FROM contacts WHERE id=?",
+                    (item["contact_id"],),
+                ).fetchone()
+                channel = conn.execute(
+                    "SELECT * FROM contact_channels WHERE id=?",
+                    (item["channel_id"],),
+                ).fetchone()
+                if (
+                    contact is None
+                    or not bool(contact["whitelisted"])
+                    or channel is None
+                    or channel["contact_id"] != item["contact_id"]
+                    or channel["channel_type"] != "whatsapp"
+                    or not bool(channel["is_active"])
+                    or channel["validation_status"] != "validated"
+                    or not bool(channel["allow_send"])
+                    or channel["revoked_at"] is not None
+                ):
+                    return _campaign_error("campaign_channel_ineligible")
+
+            if existing is not None:
+                campaign, items, changed = _validated_campaign_locked(
+                    conn, str(existing["campaign_id"])
+                )
+                if changed is not None or campaign is None or items is None:
+                    return _campaign_error(changed or "campaign_manifest_changed")
+                return _safe_campaign(campaign, items, deduped=True)
+
+            campaign_id = "campaign_" + manifest_digest[:20]
+            conn.execute(
+                """
+                INSERT INTO campaigns (
+                    campaign_id, manifest_digest, campaign_ref, project_ref,
+                    start_at, end_at, timezone, sales_pack_digest, max_followups,
+                    state, paused, killed, manifest_json, created_at, updated_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 'queued', 0, 0, ?, ?, ?)
+                """,
+                (
+                    campaign_id,
+                    manifest_digest,
+                    normalized["campaign_ref"],
+                    normalized["project_ref"],
+                    normalized["start_at"],
+                    normalized["end_at"],
+                    normalized["timezone"],
+                    normalized["sales_pack_digest"],
+                    normalized["max_followups"],
+                    manifest_json,
+                    now,
+                    now,
+                ),
+            )
+            for item in normalized["items"]:
+                item_id = f"{campaign_id}_item_{item['ordinal']}"
+                conn.execute(
+                    """
+                    INSERT INTO campaign_items (
+                        campaign_item_id, campaign_id, ordinal, draft_id, approval_id,
+                        contact_id, channel_id, classification, segment, draft_hash,
+                        message_hash, state, suppression_reason, followup_count,
+                        lease_fence_hash, lease_expires_at, leased_at, created_at, updated_at
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'staged', NULL, 0,
+                              NULL, NULL, NULL, ?, ?)
+                    """,
+                    (
+                        item_id,
+                        campaign_id,
+                        item["ordinal"],
+                        item["draft_id"],
+                        item["approval_id"],
+                        item["contact_id"],
+                        item["channel_id"],
+                        item["classification"],
+                        item["segment"],
+                        item["draft_hash"],
+                        item["message_hash"],
+                        now,
+                        now,
+                    ),
+                )
+            _append_campaign_event(
+                conn,
+                campaign_id=campaign_id,
+                event_type="campaign_registered",
+                state="queued",
+                created_at=now,
+            )
+            campaign, items, changed = _validated_campaign_locked(conn, campaign_id)
+            if changed is not None or campaign is None or items is None:
+                raise ValueError(changed or "campaign_manifest_changed")
+        return _safe_campaign(campaign, items)
+    except sqlite3.IntegrityError:
+        return _campaign_error("campaign_item_reservation_conflict")
+
+
+def get_campaign(campaign_id: str) -> dict[str, Any]:
+    init_db()
+    with _connect() as conn:
+        campaign, items, error = _validated_campaign_locked(conn, campaign_id)
+    if error is not None or campaign is None or items is None:
+        return _campaign_error(error or "campaign_manifest_changed")
+    return _safe_campaign(campaign, items)
+
+
+def _safe_one_campaign_item(row: dict[str, Any]) -> dict[str, Any]:
+    result = _safe_campaign_item(row)
+    result["ok"] = True
+    return result
+
+
+def transition_campaign(campaign_id: str, state: str) -> dict[str, Any]:
+    if type(state) is not str or state not in _CAMPAIGN_TRANSITIONS:
+        return _campaign_error("campaign_state_invalid")
+    init_db()
+    with _connect() as conn:
+        conn.execute("BEGIN IMMEDIATE")
+        campaign, items, error = _validated_campaign_locked(conn, campaign_id)
+        if error is not None or campaign is None or items is None:
+            return _campaign_error(error or "campaign_manifest_changed")
+        current = str(campaign["state"])
+        if state not in _CAMPAIGN_TRANSITIONS[current]:
+            return _campaign_error("campaign_transition_illegal")
+        if bool(campaign["killed"]):
+            return _campaign_error("campaign_killed")
+        now = utc_now()
+        conn.execute(
+            "UPDATE campaigns SET state=?, killed=?, updated_at=? WHERE campaign_id=?",
+            (state, int(state == "killed"), now, campaign_id),
+        )
+        _append_campaign_event(
+            conn,
+            campaign_id=campaign_id,
+            event_type="campaign_state_changed",
+            state=state,
+            created_at=now,
+        )
+        updated, updated_items, changed = _validated_campaign_locked(conn, campaign_id)
+    if changed is not None or updated is None or updated_items is None:
+        return _campaign_error(changed or "campaign_manifest_changed")
+    return _safe_campaign(updated, updated_items)
+
+
+def transition_campaign_item(
+    campaign_id: str, ordinal: int, state: str, *, fence: str = ""
+) -> dict[str, Any]:
+    if type(ordinal) is not int or ordinal not in {1, 2, 3}:
+        return _campaign_error("campaign_item_ordinal_invalid")
+    if type(state) is not str or state not in _CAMPAIGN_ITEM_TRANSITIONS:
+        return _campaign_error("campaign_item_state_invalid")
+    if state == "leased":
+        return _campaign_error("campaign_item_transition_illegal")
+    init_db()
+    with _connect() as conn:
+        conn.execute("BEGIN IMMEDIATE")
+        campaign, _, error = _validated_campaign_locked(conn, campaign_id)
+        if error is not None or campaign is None:
+            return _campaign_error(error or "campaign_manifest_changed")
+        if bool(campaign["killed"]):
+            return _campaign_error("campaign_killed")
+        row = conn.execute(
+            "SELECT * FROM campaign_items WHERE campaign_id=? AND ordinal=?",
+            (campaign_id, ordinal),
+        ).fetchone()
+        if row is None:
+            return _campaign_error("campaign_item_not_found")
+        item = dict(row)
+        current = str(item["state"])
+        if state not in _CAMPAIGN_ITEM_TRANSITIONS[current]:
+            return _campaign_error("campaign_item_transition_illegal")
+        if current == "staged" and state == "approved":
+            if bool(campaign["paused"]):
+                return _campaign_error("campaign_paused")
+            if campaign["state"] not in {"approved", "executing"}:
+                return _campaign_error("campaign_parent_not_executable")
+        now_dt = _mission_now()
+        if current == "leased":
+            if type(fence) is not str or not fence or not secrets.compare_digest(
+                str(item["lease_fence_hash"] or ""), hash_text(fence)
+            ):
+                return _campaign_error("campaign_item_fence_stale")
+            expiry = _strict_utc_timestamp(item["lease_expires_at"])
+            if expiry is None or expiry[1] <= now_dt:
+                return _campaign_error("campaign_item_lease_expired")
+        now = now_dt.isoformat()
+        conn.execute(
+            "UPDATE campaign_items SET state=?, updated_at=? WHERE campaign_item_id=?",
+            (state, now, item["campaign_item_id"]),
+        )
+        _append_campaign_event(
+            conn,
+            campaign_id=campaign_id,
+            campaign_item_id=item["campaign_item_id"],
+            event_type="campaign_item_state_changed",
+            ordinal=ordinal,
+            state=state,
+            created_at=now,
+        )
+        updated = conn.execute(
+            "SELECT * FROM campaign_items WHERE campaign_item_id=?",
+            (item["campaign_item_id"],),
+        ).fetchone()
+    return _safe_one_campaign_item(dict(updated))
+
+
+def acquire_campaign_item_lease(
+    campaign_id: str,
+    ordinal: int,
+    *,
+    fence: str,
+    lease_seconds: int = 300,
+) -> dict[str, Any]:
+    if type(ordinal) is not int or ordinal not in {1, 2, 3}:
+        return _campaign_error("campaign_item_ordinal_invalid")
+    if type(fence) is not str or not 8 <= len(fence) <= 256:
+        return _campaign_error("campaign_item_fence_invalid")
+    if (
+        type(lease_seconds) is not int
+        or not _CAMPAIGN_MIN_LEASE_SECONDS <= lease_seconds <= _CAMPAIGN_MAX_LEASE_SECONDS
+    ):
+        return _campaign_error("campaign_item_lease_invalid")
+    init_db()
+    with _connect() as conn:
+        conn.execute("BEGIN IMMEDIATE")
+        campaign, _, error = _validated_campaign_locked(conn, campaign_id)
+        if error is not None or campaign is None:
+            return _campaign_error(error or "campaign_manifest_changed")
+        if bool(campaign["killed"]):
+            return _campaign_error("campaign_killed")
+        if bool(campaign["paused"]):
+            return _campaign_error("campaign_paused")
+        if campaign["state"] not in {"approved", "executing"}:
+            return _campaign_error("campaign_parent_not_executable")
+        row = conn.execute(
+            "SELECT * FROM campaign_items WHERE campaign_id=? AND ordinal=?",
+            (campaign_id, ordinal),
+        ).fetchone()
+        if row is None:
+            return _campaign_error("campaign_item_not_found")
+        item = dict(row)
+        if item["state"] == "suppressed":
+            return _campaign_error("campaign_item_suppressed")
+        now_dt = _mission_now()
+        start = _strict_utc_timestamp(campaign["start_at"])
+        end = _strict_utc_timestamp(campaign["end_at"])
+        if (
+            start is None
+            or end is None
+            or not start[1] <= now_dt < end[1]
+        ):
+            return _campaign_error("campaign_window_not_open")
+        if item["state"] == "leased":
+            expiry = _strict_utc_timestamp(item["lease_expires_at"])
+            if expiry is None or expiry[1] <= now_dt:
+                return _campaign_error("campaign_item_lease_expired")
+            return _campaign_error("campaign_item_not_leasable")
+        if item["state"] != "approved":
+            return _campaign_error("campaign_item_not_leasable")
+        channel = conn.execute(
+            "SELECT * FROM contact_channels WHERE id=?", (item["channel_id"],)
+        ).fetchone()
+        if (
+            channel is None
+            or channel["contact_id"] != item["contact_id"]
+            or not bool(channel["is_active"])
+            or channel["validation_status"] != "validated"
+            or not bool(channel["allow_send"])
+            or channel["revoked_at"] is not None
+        ):
+            return _campaign_error("campaign_channel_ineligible")
+        now = now_dt.isoformat()
+        lease_expires_at = (now_dt + timedelta(seconds=lease_seconds)).isoformat()
+        conn.execute(
+            """
+            UPDATE campaign_items
+            SET state='leased', lease_fence_hash=?, lease_expires_at=?,
+                leased_at=?, updated_at=?
+            WHERE campaign_item_id=? AND state='approved'
+            """,
+            (
+                hash_text(fence),
+                lease_expires_at,
+                now,
+                now,
+                item["campaign_item_id"],
+            ),
+        )
+        _append_campaign_event(
+            conn,
+            campaign_id=campaign_id,
+            campaign_item_id=item["campaign_item_id"],
+            event_type="campaign_item_leased",
+            ordinal=ordinal,
+            state="leased",
+            created_at=now,
+        )
+        updated = conn.execute(
+            "SELECT * FROM campaign_items WHERE campaign_item_id=?",
+            (item["campaign_item_id"],),
+        ).fetchone()
+    return _safe_one_campaign_item(dict(updated))
+
+
+def suppress_campaign_item(
+    campaign_id: str, ordinal: int, *, reason: str
+) -> dict[str, Any]:
+    if type(ordinal) is not int or ordinal not in {1, 2, 3}:
+        return _campaign_error("campaign_item_ordinal_invalid")
+    if type(reason) is not str or reason not in _CAMPAIGN_SUPPRESSION_REASONS:
+        return _campaign_error("campaign_suppression_reason_invalid")
+    init_db()
+    with _connect() as conn:
+        conn.execute("BEGIN IMMEDIATE")
+        campaign, _, error = _validated_campaign_locked(conn, campaign_id)
+        if error is not None or campaign is None:
+            return _campaign_error(error or "campaign_manifest_changed")
+        if bool(campaign["killed"]):
+            return _campaign_error("campaign_killed")
+        row = conn.execute(
+            "SELECT * FROM campaign_items WHERE campaign_id=? AND ordinal=?",
+            (campaign_id, ordinal),
+        ).fetchone()
+        if row is None:
+            return _campaign_error("campaign_item_not_found")
+        item = dict(row)
+        if item["state"] == "suppressed":
+            return _safe_one_campaign_item(item)
+        if item["state"] not in {"staged", "approved", "leased"}:
+            return _campaign_error("campaign_item_transition_illegal")
+        now = utc_now()
+        conn.execute(
+            """
+            UPDATE campaign_items
+            SET state='suppressed', suppression_reason=?, lease_fence_hash=NULL,
+                lease_expires_at=NULL, updated_at=? WHERE campaign_item_id=?
+            """,
+            (reason, now, item["campaign_item_id"]),
+        )
+        _append_campaign_event(
+            conn,
+            campaign_id=campaign_id,
+            campaign_item_id=item["campaign_item_id"],
+            event_type="campaign_item_suppressed",
+            ordinal=ordinal,
+            state="suppressed",
+            reason=reason,
+            created_at=now,
+        )
+        updated = conn.execute(
+            "SELECT * FROM campaign_items WHERE campaign_item_id=?",
+            (item["campaign_item_id"],),
+        ).fetchone()
+    return _safe_one_campaign_item(dict(updated))
+
+
+def increment_campaign_item_followup(campaign_id: str, ordinal: int) -> dict[str, Any]:
+    if type(ordinal) is not int or ordinal not in {1, 2, 3}:
+        return _campaign_error("campaign_item_ordinal_invalid")
+    init_db()
+    with _connect() as conn:
+        conn.execute("BEGIN IMMEDIATE")
+        campaign, _, error = _validated_campaign_locked(conn, campaign_id)
+        if error is not None or campaign is None:
+            return _campaign_error(error or "campaign_manifest_changed")
+        if bool(campaign["killed"]) or bool(campaign["paused"]):
+            return _campaign_error("campaign_reservations_blocked")
+        row = conn.execute(
+            "SELECT * FROM campaign_items WHERE campaign_id=? AND ordinal=?",
+            (campaign_id, ordinal),
+        ).fetchone()
+        if row is None:
+            return _campaign_error("campaign_item_not_found")
+        item = dict(row)
+        if item["state"] not in {"approved", "leased", "sent"}:
+            return _campaign_error("campaign_followup_state_invalid")
+        if int(item["followup_count"]) >= min(int(campaign["max_followups"]), 3):
+            return _campaign_error("campaign_followup_limit_reached")
+        now = utc_now()
+        conn.execute(
+            "UPDATE campaign_items SET followup_count=followup_count+1, updated_at=? "
+            "WHERE campaign_item_id=?",
+            (now, item["campaign_item_id"]),
+        )
+        _append_campaign_event(
+            conn,
+            campaign_id=campaign_id,
+            campaign_item_id=item["campaign_item_id"],
+            event_type="campaign_followup_incremented",
+            ordinal=ordinal,
+            state=item["state"],
+            created_at=now,
+        )
+        updated = conn.execute(
+            "SELECT * FROM campaign_items WHERE campaign_item_id=?",
+            (item["campaign_item_id"],),
+        ).fetchone()
+    return _safe_one_campaign_item(dict(updated))
+
+
+def pause_campaign(campaign_id: str) -> dict[str, Any]:
+    init_db()
+    with _connect() as conn:
+        conn.execute("BEGIN IMMEDIATE")
+        campaign, items, error = _validated_campaign_locked(conn, campaign_id)
+        if error is not None or campaign is None or items is None:
+            return _campaign_error(error or "campaign_manifest_changed")
+        if bool(campaign["killed"]):
+            return _campaign_error("campaign_killed")
+        if not bool(campaign["paused"]):
+            now = utc_now()
+            next_state = (
+                campaign["state"]
+                if campaign["state"] in {"sent", "failed", "failed_unknown", "killed"}
+                else "blocked"
+            )
+            conn.execute(
+                "UPDATE campaigns SET paused=1, state=?, updated_at=? WHERE campaign_id=?",
+                (next_state, now, campaign_id),
+            )
+            _append_campaign_event(
+                conn,
+                campaign_id=campaign_id,
+                event_type="campaign_paused",
+                state=next_state,
+                reason="manual_required",
+                created_at=now,
+            )
+        updated, updated_items, changed = _validated_campaign_locked(conn, campaign_id)
+    if changed is not None or updated is None or updated_items is None:
+        return _campaign_error(changed or "campaign_manifest_changed")
+    return _safe_campaign(updated, updated_items)
+
+
+def kill_campaign(campaign_id: str) -> dict[str, Any]:
+    init_db()
+    with _connect() as conn:
+        conn.execute("BEGIN IMMEDIATE")
+        campaign, items, error = _validated_campaign_locked(conn, campaign_id)
+        if error is not None or campaign is None or items is None:
+            return _campaign_error(error or "campaign_manifest_changed")
+        if not bool(campaign["killed"]):
+            if "killed" not in _CAMPAIGN_TRANSITIONS[str(campaign["state"])]:
+                return _campaign_error("campaign_transition_illegal")
+            now = utc_now()
+            conn.execute(
+                "UPDATE campaigns SET paused=1, killed=1, state='killed', updated_at=? "
+                "WHERE campaign_id=?",
+                (now, campaign_id),
+            )
+            _append_campaign_event(
+                conn,
+                campaign_id=campaign_id,
+                event_type="campaign_killed",
+                state="killed",
+                created_at=now,
+            )
+        updated, updated_items, changed = _validated_campaign_locked(conn, campaign_id)
+    if changed is not None or updated is None or updated_items is None:
+        return _campaign_error(changed or "campaign_manifest_changed")
+    return _safe_campaign(updated, updated_items)
+
+
+def list_campaign_events(campaign_id: str) -> list[dict[str, Any]]:
+    init_db()
+    with _connect() as conn:
+        campaign, _, error = _validated_campaign_locked(conn, campaign_id)
+        if error is not None or campaign is None:
+            return []
+        rows = conn.execute(
+            """
+            SELECT event_id, event_type, ordinal, state, reason, created_at
+            FROM campaign_events WHERE campaign_id=? ORDER BY created_at, event_id
+            """,
+            (campaign_id,),
+        ).fetchall()
+    return [
+        {
+            "event_id": str(row["event_id"]),
+            "event_type": str(row["event_type"]),
+            "ordinal": row["ordinal"],
+            "state": row["state"],
+            "reason": row["reason"],
+            "created_at": str(row["created_at"]),
+        }
+        for row in rows
+    ]

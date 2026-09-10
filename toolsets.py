@@ -126,6 +126,36 @@ TOOLSETS = {
         "tools": ["x_search"],
         "includes": []
     },
+
+    "whatsapp_ops": {
+        "description": "Fail-closed WhatsApp Ops tools for drafts, approvals, contact lookup, and guarded QuePasa/n8n sends",
+        "tools": [
+            "wpp_resolve_contact",
+            "wpp_list_contacts",
+            "wpp_sync_allowlist",
+            "wpp_import_contact_list",
+            "wpp_list_contact_segments",
+            "wpp_list_contact_segment_members",
+            "wpp_create_draft",
+            "wpp_request_approval",
+            "wpp_resolve_approval",
+            "wpp_schedule_draft",
+            "wpp_send_approved",
+            "wpp_cancel",
+            "wpp_status",
+            "wpp_inbound_lookup",
+            "wpp_thread_context",
+            "wpp_conversation_summary",
+            "wpp_transcribe_media",
+            "wpp_media_transcription_status",
+            "wpp_ingest_inbound_event",
+            "wpp_cockpit_overview",
+            "wpp_register_alias",
+            "wpp_register_staging_status",
+            "wpp_register_group",
+        ],
+        "includes": [],
+    },
     
     "vision": {
         "description": "Image analysis and vision tools",

@@ -17820,6 +17820,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             "footer": self._handle_footer_command,
             "help": self._handle_help_command,
             "commands": self._handle_commands_command,
+            "crgp": self._handle_wpp_create_group_command,
             "profile": self._handle_profile_command,
             "update": self._handle_update_command,
             "version": self._handle_version_command,
@@ -18700,7 +18701,10 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             # hermes_cli/commands.py) and dispatched through the single
             # resolver _dispatch_busy_slash_command below — no per-command
             # if-chain here.
-            from hermes_cli.commands import resolve_command as _resolve_cmd_inner
+            from hermes_cli.commands import (
+                is_config_gated_command_enabled as _is_config_gated_command_enabled_inner,
+                resolve_command as _resolve_cmd_inner,
+            )
             _evt_cmd = event.get_command()
             _cmd_def_inner = _resolve_cmd_inner(_evt_cmd) if _evt_cmd else None
 
@@ -18710,6 +18714,15 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 return await self._handle_status_command(event)
             if _cmd_def_inner and _cmd_def_inner.name == "context":
                 return await self._handle_context_command(event)
+
+            # Config-gated commands must not bypass their feature gate merely
+            # because this conversation already has a running agent.
+            if (
+                _cmd_def_inner
+                and _cmd_def_inner.name != "verbose"
+                and not _is_config_gated_command_enabled_inner(_cmd_def_inner.name)
+            ):
+                return f"⛔ Command /{_cmd_def_inner.name} is disabled by configuration."
 
             # Slash command access control on the running-agent fast-path.
             # Mirrors the cold-path gate further below so non-admin users
@@ -19391,6 +19404,19 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                             # has all API keys in os.environ.
                             from tools.environments.local import build_subprocess_env
                             sanitized_env = build_subprocess_env()
+                            # Honor pass_args: true so type:exec quick commands
+                            # can receive the user-typed arguments (e.g.
+                            # "/addct Nome --item N" or "/addct Nome | ref").
+                            # Without this, exec_cmd always ran with zero
+                            # arguments regardless of what the user typed,
+                            # silently discarding name/--item/ref/allow_send.
+                            # Args are appended with shlex quoting to avoid
+                            # shell-injection from user-controlled text.
+                            if qcmd.get("pass_args"):
+                                import shlex as _shlex
+                                _raw_args = (event.get_command_args() or "").strip()
+                                if _raw_args:
+                                    exec_cmd = f"{exec_cmd} {_shlex.quote(_raw_args)}"
                             proc = await asyncio.create_subprocess_shell(
                                 exec_cmd,
                                 stdout=asyncio.subprocess.PIPE,

@@ -1,0 +1,921 @@
+"""Read-only WhatsApp Ops slash-command UX helpers.
+
+These helpers intentionally expose only local, already-ingested inbound context.
+They never send WhatsApp messages, fetch provider history, or print raw WhatsApp
+refs/media URLs/operator secrets.
+"""
+
+from __future__ import annotations
+
+import json
+import re
+from collections.abc import Callable
+from typing import Any
+
+_RAW_WA_REF_RE = re.compile(r"(?i)\b[\w.-]+@(?:g\.us|lid|s\.whatsapp\.net|c\.us)\b")
+_URL_RE = re.compile(r"(?i)\bhttps?://\S+")
+_PHONE_RE = re.compile(r"\+?\d[\d\s().-]{6,}\d")
+_DATA_B64_RE = re.compile(r"(?i)data:[^\s,]*?;base64,[A-Za-z0-9+/=]{16,}")
+_LONG_B64_RE = re.compile(r"\b[A-Za-z0-9+/]{32,}={0,2}\b")
+_MEDIA_WORD_RE = re.compile(r"(?i)\b(?:base64|blob)\b")
+_SECRET_ASSIGNMENT_RE = re.compile(
+    r"(?i)\b(token|api[_-]?key|authorization|password|secret)\s*[=:]\s*\S+"
+)
+_RAW_THREAD_SUFFIXES = ("@g.us",)
+_RAW_CONTACT_SUFFIXES = ("@lid", "@s.whatsapp.net", "@c.us")
+
+
+def _redact_phone_match(match: re.Match[str]) -> str:
+    digits = re.sub(r"\D", "", match.group(0))
+    return "<telefone-redigido>" if len(digits) >= 10 else match.group(0)
+
+
+def _safe_text(value: Any, *, max_len: int = 500) -> str:
+    """Return display text with transport identifiers/media blobs redacted."""
+    text = str(value or "")
+    text = _DATA_B64_RE.sub("<midia-redigida>", text)
+    text = _SECRET_ASSIGNMENT_RE.sub(r"\1=<redigido>", text)
+    text = _URL_RE.sub("<url-redigida>", text)
+    text = _RAW_WA_REF_RE.sub("<ref-redigida>", text)
+    text = _PHONE_RE.sub(_redact_phone_match, text)
+    text = _LONG_B64_RE.sub("<midia-redigida>", text)
+    text = _MEDIA_WORD_RE.sub("midia-redigida", text)
+    text = re.sub(r"\s+", " ", text).strip()
+    if len(text) > max_len:
+        return text[: max(0, max_len - 1)].rstrip() + "…"
+    return text
+
+
+def _token_is_raw_thread_ref(token: str) -> bool:
+    lowered = str(token or "").strip().lower()
+    return lowered.endswith(_RAW_THREAD_SUFFIXES)
+
+
+def _token_is_raw_contact_ref(token: str) -> bool:
+    lowered = str(token or "").strip().lower()
+    return lowered.endswith(_RAW_CONTACT_SUFFIXES)
+
+
+def _parse_targeted_args(arg: str, *, default_limit: int, max_limit: int) -> dict[str, Any]:
+    """Parse `/ctxwpp|sumwpp [target|item N|limit]` safely."""
+    tokens = [part.strip() for part in str(arg or "").split() if part.strip()]
+    parsed: dict[str, Any] = {
+        "thread": "",
+        "contact": "",
+        "target": "",
+        "item": 0,
+        "limit": default_limit,
+        "window_days": 0,
+        "summary_mode": "brief",
+        "chunk_size": 25,
+        "help": False,
+        "error": "",
+        "technical_filter": False,
+    }
+    target_parts: list[str] = []
+    idx = 0
+    while idx < len(tokens):
+        token = tokens[idx]
+        token_lower = token.lower()
+        if token_lower in {"help", "ajuda", "?", "uso"}:
+            parsed["help"] = True
+            idx += 1
+            continue
+        window_match = re.fullmatch(r"(\d{1,3})(?:d|dia|dias)", token_lower)
+        if window_match:
+            parsed["window_days"] = max(0, min(int(window_match.group(1)), 365))
+            idx += 1
+            continue
+        if token_lower in {"chunks", "chunk", "janelas", "janela"}:
+            parsed["summary_mode"] = "chunks"
+            idx += 1
+            continue
+        if token_lower.startswith("chunk=") and token_lower.split("=", 1)[1].isdigit():
+            parsed["summary_mode"] = "chunks"
+            parsed["chunk_size"] = max(1, min(int(token_lower.split("=", 1)[1]), 50))
+            idx += 1
+            continue
+        if token_lower in {"item", "fila", "--item"}:
+            if idx + 1 < len(tokens) and tokens[idx + 1].isdigit():
+                parsed["item"] = int(tokens[idx + 1])
+                idx += 2
+                continue
+            parsed["error"] = "item_without_number"
+            idx += 1
+            continue
+        if token_lower.startswith("--item=") and token_lower.split("=", 1)[1].isdigit():
+            parsed["item"] = int(token_lower.split("=", 1)[1])
+            idx += 1
+            continue
+        if token.isdigit():
+            parsed["limit"] = max(1, min(int(token), max_limit))
+            idx += 1
+            continue
+        if token_lower in {"thread", "conversa", "grupo"}:
+            if idx + 1 < len(tokens) and not tokens[idx + 1].isdigit():
+                ref = tokens[idx + 1]
+                parsed["thread"] = ref
+                parsed["technical_filter"] = True
+                idx += 2
+                continue
+            parsed["error"] = "thread_without_ref"
+            idx += 1
+            continue
+        if token_lower in {"contact", "contato", "dm"}:
+            if idx + 1 < len(tokens) and not tokens[idx + 1].isdigit():
+                ref = tokens[idx + 1]
+                parsed["contact"] = ref
+                parsed["technical_filter"] = True
+                idx += 2
+                continue
+            parsed["error"] = "contact_without_ref"
+            idx += 1
+            continue
+        if _token_is_raw_thread_ref(token):
+            parsed["thread"] = token
+            parsed["technical_filter"] = True
+        elif _token_is_raw_contact_ref(token):
+            parsed["contact"] = token
+            parsed["technical_filter"] = True
+        else:
+            target_parts.append(token)
+        idx += 1
+    if target_parts:
+        parsed["target"] = " ".join(target_parts)
+    return parsed
+
+
+def _thread_context_usage_lines() -> list[str]:
+    return [
+        "📲 WhatsApp Ops — contexto local (somente leitura)",
+        "Uso operacional:",
+        "- /ctxwpp — mostra as últimas 10 mensagens operacionais locais já ingeridas.",
+        "- /ctxwpp 20 — mostra até 20 eventos locais; máximo 25.",
+        "- /ctxwpp H-Ops 20 — resolve grupo/contato por nome local ou fila recente.",
+        "- /ctxwpp item 1 20 — usa o item exatamente como aparece em /fila.",
+        "- /ctxwpp thread <ref> 10 ou /ctxwpp contact <ref> 10 — filtro técnico quando uma ref já é conhecida.",
+        "",
+        "Sem argumento ele NÃO adivinha um grupo por intenção; ele usa o local_inbound_store mais recente.",
+        "Não busca histórico do provedor, não envia WhatsApp e não imprime refs/telefones/URLs/mídia bruta.",
+    ]
+
+
+def _summary_usage_lines() -> list[str]:
+    return [
+        "🧾 WhatsApp Ops — resumo local determinístico (somente leitura)",
+        "Uso operacional:",
+        "- /sumwpp H-Ops 50 — resume até 50 eventos locais do grupo/contato resolvido.",
+        "- /sumwpp H-Ops 7d chunks — analisa janela local dos últimos 7 dias em chunks bounded.",
+        "- /sumwpp item 1 30d chunks — usa o item mostrado em /fila e janela dos últimos 30 dias.",
+        "- /sumwpp item 1 50 — resume o alvo do item mostrado em /fila.",
+        "- /sumwpp 50 — resumo não filtrado dos eventos locais mais recentes.",
+        "Limite padrão 50; máximo 100. Janelas aceitas: 7d, 30d, 90d etc. Não usa LLM, não busca histórico do provedor, não persiste resumo e não envia WhatsApp.",
+    ]
+
+
+def _mission_usage_lines() -> list[str]:
+    return [
+        "🎯 Hunter — missão comercial (somente leitura)",
+        "Uso operacional:",
+        "- /missao ajuda — mostra este painel.",
+        "- /missao revisar <alvo> — monta card de revisão comercial usando contexto local.",
+        "- /missao revisar item N — usa o item exatamente como aparece em /fila.",
+        "- /missao atacar base fria — prepara plano gateado; não executa outreach.",
+        "- /missao radar comercial hoje — ainda bloqueado até gate de cron/radar.",
+        "- /missao caixa ajuda — campanha supervisionada de exatamente 3 leads.",
+        "",
+        "Este corte não envia WhatsApp, não escreve CRM, não puxa provider-history, não ativa cron e não persiste resumo.",
+    ]
+
+
+def _mission_caixa_usage_lines() -> list[str]:
+    return [
+        "💰 Caixa — campanha supervisionada (3 leads)",
+        "- /missao caixa preview — valida o manifesto runtime-only sem mutação.",
+        "- /missao caixa preparar — registra exatamente 3 drafts/approvals pendentes.",
+        "- /missao caixa status <campaign_id> — lê somente o ledger canônico.",
+        "- /missao caixa pausar <campaign_id> — bloqueia novas reservas.",
+        "Preparar não envia WhatsApp e não escreve CRM; cada lead continua com approval próprio.",
+    ]
+
+
+def _render_mission_caixa(
+    rest: str,
+    *,
+    caixa_preview: Callable[[dict[str, Any]], str] | None,
+    caixa_prepare: Callable[[dict[str, Any]], str] | None,
+    caixa_status: Callable[[str], str] | None,
+    caixa_pause: Callable[[str], str] | None,
+    caixa_manifest_loader: Callable[[], dict[str, Any]] | None,
+) -> str:
+    tokens = [part.strip() for part in str(rest or "").split() if part.strip()]
+    subaction = tokens[0].lower() if tokens else "ajuda"
+    if subaction in {"help", "ajuda", "?", "uso"}:
+        return "\n".join(
+            _safe_text(line, max_len=700) for line in _mission_caixa_usage_lines()
+        )
+
+    def decode(raw: Any) -> dict[str, Any]:
+        data = json.loads(raw) if isinstance(raw, str) else raw
+        if isinstance(data, dict):
+            return data
+        return {"ok": False, "error": "campaign_response_invalid"}
+
+    guarantees = (
+        "Garantias: send_performed=false · crm_write=false · "
+        "provider_history_used=false · external_send=false · external_crm=false."
+    )
+    preview_actions = {"preview", "prever", "preflight"}
+    prepare_actions = {"preparar", "prepare"}
+    if subaction in preview_actions | prepare_actions:
+        callback_injected = (
+            caixa_preview is not None
+            if subaction in preview_actions
+            else caixa_prepare is not None
+        )
+        if caixa_manifest_loader is not None:
+            try:
+                manifest = caixa_manifest_loader()
+            except Exception as exc:
+                return "\n".join(
+                    [
+                        "💰 Caixa — campanha bloqueada",
+                        "Manifesto runtime-only indisponível: "
+                        + _safe_text(exc, max_len=160),
+                        guarantees,
+                    ]
+                )
+        elif callback_injected:
+            # Embedded callers can own the manifest source through their callback.
+            manifest = {}
+        else:
+            return "\n".join(
+                [
+                    "💰 Caixa — campanha bloqueada",
+                    "Manifesto runtime-only não foi carregado; valores complexos não são aceitos pelo texto do comando.",
+                    "Materialize o manifesto privado e repita pelo bridge profile-local.",
+                    guarantees,
+                ]
+            )
+        try:
+            if subaction in preview_actions:
+                if caixa_preview is None:
+                    from tools.whatsapp_ops_tool import (
+                        wpp_campaign_caixa_preview as callback,
+                    )
+                else:
+                    callback = caixa_preview
+            else:
+                if caixa_prepare is None:
+                    from tools.whatsapp_ops_tool import (
+                        wpp_campaign_caixa_prepare as callback,
+                    )
+                else:
+                    callback = caixa_prepare
+            data = decode(callback(manifest))
+        except Exception as exc:
+            data = {"ok": False, "error": _safe_text(exc, max_len=160)}
+        if data.get("ok") is not True:
+            return "\n".join(
+                [
+                    "💰 Caixa — campanha bloqueada",
+                    "Motivo: "
+                    + _safe_text(
+                        data.get("error") or "campaign_preflight_failed",
+                        max_len=160,
+                    ),
+                    guarantees,
+                ]
+            )
+        if subaction in preview_actions:
+            lines = [
+                "💰 Caixa — preview de campanha (3 leads)",
+                "Elegíveis: "
+                + _safe_text(data.get("eligible_count") or 0, max_len=8),
+            ]
+            items = data.get("items") if isinstance(data.get("items"), list) else []
+            for item in items[:3]:
+                if not isinstance(item, dict):
+                    continue
+                lines.extend(
+                    [
+                        f"{_safe_text(item.get('ordinal') or 0, max_len=8)}. "
+                        f"classification: {_safe_text(item.get('classification'), max_len=24)} · "
+                        f"segment: {_safe_text(item.get('segment'), max_len=64)}",
+                        f"draft: {_safe_text(item.get('draft_id'), max_len=80)} · "
+                        f"approval: {_safe_text(item.get('approval_id'), max_len=80)}",
+                        f"contact: {_safe_text(item.get('contact_id'), max_len=80)} · "
+                        f"channel: {_safe_text(item.get('channel_id'), max_len=80)}",
+                    ]
+                )
+            lines.append(guarantees)
+            return "\n".join(_safe_text(line, max_len=700) for line in lines)
+        return "\n".join(
+            [
+                "💰 Caixa — campanha preparada",
+                "campaign: " + _safe_text(data.get("campaign_id"), max_len=100),
+                "state: " + _safe_text(data.get("state"), max_len=40),
+                "items: " + _safe_text(data.get("item_count") or 0, max_len=8),
+                guarantees,
+            ]
+        )
+
+    if subaction in {"status", "pausar", "pause"}:
+        campaign_id = tokens[1] if len(tokens) > 1 else ""
+        if not campaign_id:
+            return "\n".join(_mission_caixa_usage_lines())
+        try:
+            if subaction == "status":
+                if caixa_status is None:
+                    from tools.whatsapp_ops_tool import (
+                        wpp_campaign_caixa_status as status_callback,
+                    )
+                else:
+                    status_callback = caixa_status
+                data = decode(status_callback(campaign_id))
+            else:
+                if caixa_pause is None:
+                    from tools.whatsapp_ops_tool import (
+                        wpp_campaign_caixa_pause as pause_callback,
+                    )
+                else:
+                    pause_callback = caixa_pause
+                data = decode(pause_callback(campaign_id))
+        except Exception as exc:
+            data = {"ok": False, "error": _safe_text(exc, max_len=160)}
+        if data.get("ok") is not True:
+            return "\n".join(
+                [
+                    "💰 Caixa — campanha bloqueada",
+                    "Motivo: "
+                    + _safe_text(
+                        data.get("error") or "campaign_lookup_failed", max_len=160
+                    ),
+                    guarantees,
+                ]
+            )
+        if subaction == "status":
+            lines = [
+                "💰 Caixa — status da campanha",
+                "campaign: " + _safe_text(data.get("campaign_id"), max_len=100),
+                "state: " + _safe_text(data.get("state"), max_len=40),
+                "paused: " + str(bool(data.get("paused"))).lower(),
+            ]
+            items = data.get("items") if isinstance(data.get("items"), list) else []
+            for item in items[:3]:
+                if isinstance(item, dict):
+                    lines.append(
+                        f"{_safe_text(item.get('ordinal') or 0, max_len=8)}. "
+                        f"{_safe_text(item.get('classification'), max_len=24)} · "
+                        f"{_safe_text(item.get('segment'), max_len=64)} · "
+                        f"{_safe_text(item.get('state'), max_len=32)}"
+                    )
+            lines.append(guarantees)
+            return "\n".join(_safe_text(line, max_len=700) for line in lines)
+        return "\n".join(
+            [
+                "💰 Caixa — campanha pausada",
+                "campaign: " + _safe_text(data.get("campaign_id"), max_len=100),
+                "paused: " + str(bool(data.get("paused"))).lower(),
+                "state: " + _safe_text(data.get("state"), max_len=40),
+                guarantees,
+            ]
+        )
+
+    return "\n".join(
+        _safe_text(line, max_len=700) for line in _mission_caixa_usage_lines()
+    )
+
+
+def _format_counts(counts: dict[str, Any]) -> str:
+    parts = []
+    for key, value in sorted((counts or {}).items()):
+        try:
+            count = int(value)
+        except Exception:
+            continue
+        if count <= 0:
+            continue
+        parts.append(f"{_safe_text(key, max_len=40)}={count}")
+    return ", ".join(parts) if parts else "nenhum"
+
+
+def _count_visible_events(events: list[dict[str, Any]]) -> tuple[dict[str, int], dict[str, int]]:
+    type_counts: dict[str, int] = {}
+    media_counts: dict[str, int] = {}
+    for event in events:
+        msg_type = _safe_text(event.get("message_type") or "unknown", max_len=40) or "unknown"
+        type_counts[msg_type] = type_counts.get(msg_type, 0) + 1
+        if event.get("has_media"):
+            media_counts[msg_type] = media_counts.get(msg_type, 0) + 1
+    return type_counts, media_counts
+
+
+def _format_event(event: dict[str, Any], idx: int) -> list[str]:
+    created = _safe_text(event.get("created_at", ""), max_len=32) or "sem horário"
+    msg_type = _safe_text(event.get("message_type", "unknown"), max_len=40) or "unknown"
+    status = _safe_text(event.get("status", ""), max_len=40) or "sem status"
+    has_media = "sim" if event.get("has_media") else "não"
+    lines = [f"{idx}. {created} · tipo={msg_type} · status={status} · mídia={has_media}"]
+
+    preview = _safe_text(event.get("text_preview", ""), max_len=220)
+    if preview:
+        lines.append(f"   prévia: {preview}")
+
+    media = event.get("media") if isinstance(event.get("media"), dict) else {}
+    if media:
+        safe_media: list[str] = []
+        for key, value in sorted(media.items()):
+            if key == "has_media":
+                continue
+            safe_media.append(f"{_safe_text(key, max_len=32)}={_safe_text(value, max_len=80)}")
+        if safe_media:
+            lines.append("   mídia: " + ", ".join(safe_media[:6]))
+
+    actions = event.get("suggested_actions")
+    if isinstance(actions, list) and actions:
+        safe_actions = [_safe_text(action, max_len=60) for action in actions[:5]]
+        lines.append("   ações sugeridas: " + ", ".join(action for action in safe_actions if action))
+    return lines
+
+
+def _resolve_target_for_command(
+    parsed: dict[str, Any],
+    *,
+    resolver: Callable[..., dict[str, Any]] | None = None,
+) -> tuple[dict[str, Any] | None, str, str, list[str]]:
+    """Return (target_public, thread, contact, error_lines)."""
+    if parsed.get("thread") or parsed.get("contact"):
+        return None, str(parsed.get("thread") or ""), str(parsed.get("contact") or ""), []
+    target = str(parsed.get("target") or "").strip()
+    item = int(parsed.get("item") or 0)
+    if not target and item <= 0:
+        return None, "", "", []
+    if resolver is None:
+        from tools.whatsapp_ops_store import resolve_conversation_target as default_resolver  # type: ignore[import-not-found]
+
+        resolver = default_resolver
+    assert resolver is not None
+    resolved = resolver(query=target, item_index=item, include_transport=True)
+    if not isinstance(resolved, dict) or resolved.get("ok") is not True:
+        err = _safe_text((resolved or {}).get("error") if isinstance(resolved, dict) else "resolver_invalid", max_len=120)
+        hint = _safe_text((resolved or {}).get("hint") if isinstance(resolved, dict) else "", max_len=240)
+        return None, "", "", [
+            f"Não consegui resolver o alvo: {err or 'erro desconhecido'}.",
+            hint or "Use /fila para ver itens recentes ou informe um nome mais específico.",
+        ]
+    if resolved.get("ambiguous"):
+        lines = ["Alvo ambíguo. Use /ctxwpp item N pela fila ou refine o nome."]
+        matches_obj = resolved.get("matches")
+        matches: list[Any] = matches_obj if isinstance(matches_obj, list) else []
+        for idx, match in enumerate(matches[:6], start=1):
+            if isinstance(match, dict):
+                lines.append(
+                    f"{idx}. {_safe_text(match.get('target_kind'), max_len=30)} · "
+                    f"{_safe_text(match.get('target_label'), max_len=80)} · "
+                    f"{_safe_text(match.get('source'), max_len=40)}"
+                )
+        return None, "", "", lines
+    return resolved, str(resolved.get("_thread_ref") or ""), str(resolved.get("_contact_ref") or ""), []
+
+
+def render_mission_command(
+    arg: str = "",
+    *,
+    summary_loader: Callable[..., str] | None = None,
+    target_resolver: Callable[..., dict[str, Any]] | None = None,
+    radar_loader: Callable[..., str] | None = None,
+    caixa_preview: Callable[[dict[str, Any]], str] | None = None,
+    caixa_prepare: Callable[[dict[str, Any]], str] | None = None,
+    caixa_status: Callable[[str], str] | None = None,
+    caixa_pause: Callable[[str], str] | None = None,
+    caixa_manifest_loader: Callable[[], dict[str, Any]] | None = None,
+) -> str:
+    """Render the read-only Hunter commercial mission cockpit."""
+    tokens = [part.strip() for part in str(arg or "").split() if part.strip()]
+    if not tokens or tokens[0].lower() in {"help", "ajuda", "?", "uso"}:
+        return "\n".join(_safe_text(line, max_len=700) for line in _mission_usage_lines())
+
+    action = tokens[0].lower()
+    rest = " ".join(tokens[1:]).strip()
+    if action == "caixa":
+        return _render_mission_caixa(
+            rest,
+            caixa_preview=caixa_preview,
+            caixa_prepare=caixa_prepare,
+            caixa_status=caixa_status,
+            caixa_pause=caixa_pause,
+            caixa_manifest_loader=caixa_manifest_loader,
+        )
+    if action in {"review", "revisar", "contexto", "analise", "analisar"}:
+        parsed = _parse_targeted_args(rest, default_limit=30, max_limit=50)
+        if parsed.get("help") or parsed.get("error") or not (parsed.get("target") or parsed.get("item") or parsed.get("thread") or parsed.get("contact")):
+            lines = _mission_usage_lines()
+            lines.insert(1, "Missão incompleta: informe alvo, item da /fila ou filtro técnico seguro.")
+            return "\n".join(_safe_text(line, max_len=700) for line in lines)
+
+        target_public, thread_ref, contact_ref, target_errors = _resolve_target_for_command(parsed, resolver=target_resolver)
+        if target_errors:
+            return "\n".join([
+                "🎯 Missão Hunter — revisão comercial",
+                "Estado: bloqueada antes de qualquer ação externa.",
+                *(_safe_text(line, max_len=700) for line in target_errors),
+                "Garantias: whatsapp_send=false · crm_write=false · provider_history_used=false · cron_activation=false.",
+            ])
+
+        if summary_loader is None:
+            from tools.whatsapp_ops_tool import wpp_conversation_summary as default_loader  # type: ignore[import-not-found]
+
+            loader: Callable[..., str] = default_loader
+        else:
+            loader = summary_loader
+        try:
+            raw = loader(
+                thread=thread_ref,
+                contact=contact_ref,
+                limit=parsed["limit"],
+                mode="brief",
+                max_text_chars=180,
+                include_evidence=False,
+            )
+            data = json.loads(raw) if isinstance(raw, str) else raw
+        except Exception as exc:
+            return "\n".join([
+                "🎯 Missão Hunter — revisão comercial",
+                f"Falha ao ler contexto local: {_safe_text(exc, max_len=180)}",
+                "Garantias: whatsapp_send=false · crm_write=false · provider_history_used=false · cron_activation=false.",
+            ])
+        if not isinstance(data, dict) or data.get("ok") is not True:
+            err = _safe_text((data or {}).get("error") if isinstance(data, dict) else "resposta inválida", max_len=160)
+            return "\n".join([
+                "🎯 Missão Hunter — revisão comercial",
+                f"Missão bloqueada: resumo local indisponível ({err or 'erro desconhecido'}).",
+                "Garantias: whatsapp_send=false · crm_write=false · provider_history_used=false · cron_activation=false.",
+            ])
+
+        if target_public:
+            target_line = (
+                "Alvo: "
+                f"{_safe_text(target_public.get('target_label'), max_len=100)} "
+                f"({_safe_text(target_public.get('target_kind'), max_len=30)} · {_safe_text(target_public.get('source'), max_len=40)})"
+            )
+        elif parsed.get("thread") or parsed.get("contact"):
+            target_line = "Alvo: filtro técnico informado no comando."
+        else:
+            target_line = "Alvo: contexto local recente."
+
+        warnings = data.get("warnings") if isinstance(data.get("warnings"), list) else []
+        message_count = int(data.get("message_count") or 0)
+        confidence = "alta" if message_count >= 3 and not warnings and target_public else ("média" if message_count > 0 else "baixa")
+        headline = _safe_text(data.get("headline"), max_len=300)
+        bullets = data.get("bullets") if isinstance(data.get("bullets"), list) else []
+        previews = data.get("latest_previews") if isinstance(data.get("latest_previews"), list) else []
+
+        lines = [
+            "🎯 Missão Hunter — revisão comercial",
+            "Estado: missão preparada, somente leitura.",
+            target_line,
+            f"Fonte de contexto: {_safe_text(data.get('source') or 'local_inbound_store', max_len=80)} · provider-history=false",
+            f"Confiança: {confidence} · base: {message_count} evento(s) local(is)",
+            "Gates bloqueados: WhatsApp send, CRM write, provider-history, cron/autonomia.",
+            "",
+        ]
+        if headline:
+            lines.append(f"Leitura comercial: {headline}")
+        if bullets:
+            lines.append("Sinais locais:")
+            for bullet in bullets[:5]:
+                lines.append(f"- {_safe_text(bullet, max_len=240)}")
+        if previews:
+            lines.append("Últimos sinais:")
+            for preview in previews[:3]:
+                if isinstance(preview, dict):
+                    created = _safe_text(preview.get("created_at"), max_len=32) or "sem horário"
+                    msg_type = _safe_text(preview.get("message_type"), max_len=40) or "unknown"
+                    text = _safe_text(preview.get("text_preview"), max_len=160)
+                    if text:
+                        lines.append(f"- {created} · {msg_type}: {text}")
+        if warnings:
+            lines.append("Warnings: " + ", ".join(_safe_text(w, max_len=80) for w in warnings[:5]))
+        lines.extend([
+            "",
+            "Próximo passo seguro: se o alvo for comercial, resolver Lead/Contato/Canal no CRM antes de draft proativo.",
+            "Garantias: llm_used=false · provider_history_used=false · send_performed=false · summary_persisted=false · crm_write=false.",
+        ])
+        return "\n".join(_safe_text(line, max_len=700) for line in lines)
+
+    if action == "radar" and radar_loader is not None:
+        try:
+            raw_radar = radar_loader()
+            radar = json.loads(raw_radar) if isinstance(raw_radar, str) else raw_radar
+        except Exception:
+            radar = None
+        if not isinstance(radar, dict) or radar.get("ok") is not True:
+            lines = [
+                "🎯 Missão Hunter — radar comercial",
+                "Estado: radar local indisponível; nenhuma ação foi executada.",
+                "Oportunidades: 0 · bloqueadas: 0 · ações seguras: 0.",
+                "Garantias: send_performed=false · crm_write=false · provider_history_used=false · approval_resolved=false · telegram_notification_sent=false · cron_activation=false.",
+            ]
+            return "\n".join(_safe_text(line, max_len=700) for line in lines)
+
+        raw_counts = radar.get("counters")
+        counts: dict[str, Any] = raw_counts if isinstance(raw_counts, dict) else {}
+
+        def safe_count(key: str) -> int:
+            try:
+                value = int(counts.get(key, 0))
+            except (TypeError, ValueError, OverflowError):
+                value = 0
+            return max(0, min(value, 9999))
+
+        opportunities = safe_count("opportunities")
+        blocked = safe_count("blocked")
+        actionable = safe_count("actionable")
+        lines = [
+            "🎯 Missão Hunter — radar comercial",
+            "Estado: preview local sanitizado, somente leitura.",
+            f"Oportunidades: {opportunities} · bloqueadas: {blocked} · ações seguras: {actionable}.",
+            "Nenhum alvo, telefone, URL, conteúdo bruto ou identificador interno é exibido neste painel.",
+            "Garantias: send_performed=false · crm_write=false · provider_history_used=false · approval_resolved=false · telegram_notification_sent=false · cron_activation=false.",
+        ]
+        return "\n".join(_safe_text(line, max_len=700) for line in lines)
+
+    if action in {"attack", "atacar", "reativar", "radar"}:
+        objective_raw = rest or ("radar comercial hoje" if action == "radar" else "base fria")
+        objective = _safe_text(objective_raw, max_len=120) or "base fria"
+        label = "Base fria" if objective.lower() == "base fria" else objective
+        blocked = [
+            "CRM identity",
+            "CRM contact/allowlist sync",
+            "opportunity scoring",
+            "draft approval",
+            "WhatsApp send",
+            "CRM write",
+            "provider-history",
+        ]
+        if action == "radar":
+            blocked.append("cron/radar activation")
+        lines = [
+            "🎯 Missão Hunter — ataque comercial gateado",
+            f"Objetivo: {label}",
+            "Estado: missão planejada, não executada.",
+            "Autonomia: ataque_comercial assistido — prepara fila/drafts; envio real continua por approval.",
+            "Confiança: baixa até resolver CRM identity + canal + score de oportunidade.",
+            "Gates bloqueados: " + ", ".join(blocked) + ".",
+            "",
+            "Próximo passo seguro: Batch CRM identity/sync ou `/missao revisar <lead|grupo>` para alvo específico.",
+            "Garantias: whatsapp_send=false · crm_write=false · provider_history_used=false · cron_activation=false.",
+        ]
+        return "\n".join(_safe_text(line, max_len=700) for line in lines)
+
+    # Friendly default: treat unknown non-empty text as a review target.
+    return render_mission_command(
+        f"revisar {arg}",
+        summary_loader=summary_loader,
+        target_resolver=target_resolver,
+        radar_loader=radar_loader,
+        caixa_preview=caixa_preview,
+        caixa_prepare=caixa_prepare,
+        caixa_status=caixa_status,
+        caixa_pause=caixa_pause,
+        caixa_manifest_loader=caixa_manifest_loader,
+    )
+
+
+def render_thread_context_command(
+    arg: str = "",
+    *,
+    context_loader: Callable[..., str] | None = None,
+    target_resolver: Callable[..., dict[str, Any]] | None = None,
+) -> str:
+    """Render a PT-BR, operator-safe local thread context summary."""
+    parsed = _parse_targeted_args(arg, default_limit=10, max_limit=25)
+    if parsed.get("help"):
+        return "\n".join(_safe_text(line, max_len=600) for line in _thread_context_usage_lines())
+    if parsed.get("error"):
+        lines = _thread_context_usage_lines()
+        lines.insert(1, "Filtro incompleto: use /ctxwpp item N, /ctxwpp <nome> 10, ou /ctxwpp thread <ref> 10.")
+        return "\n".join(_safe_text(line, max_len=600) for line in lines)
+
+    target_public, thread_ref, contact_ref, target_errors = _resolve_target_for_command(parsed, resolver=target_resolver)
+    if target_errors:
+        return "\n".join([
+            "📲 WhatsApp Ops — contexto local (somente leitura)",
+            *(_safe_text(line, max_len=600) for line in target_errors),
+            "Nenhum envio foi disparado e nenhum histórico do provedor foi buscado.",
+        ])
+
+    if context_loader is None:
+        from tools.whatsapp_ops_tool import wpp_thread_context as default_loader  # type: ignore[import-not-found]
+
+        loader: Callable[..., str] = default_loader
+    else:
+        loader = context_loader
+
+    try:
+        raw = loader(
+            thread=thread_ref,
+            contact=contact_ref,
+            limit=parsed["limit"],
+            mode="operator",
+            max_text_chars=180,
+        )
+        data = json.loads(raw) if isinstance(raw, str) else raw
+    except Exception as exc:
+        return "\n".join([
+            "📲 WhatsApp Ops — contexto local (somente leitura)",
+            f"Falha ao ler local_inbound_store: {_safe_text(exc, max_len=160)}",
+            "Nenhum envio foi disparado e nenhum histórico do provedor foi buscado.",
+        ])
+
+    if not isinstance(data, dict) or data.get("ok") is not True:
+        err = _safe_text((data or {}).get("error") if isinstance(data, dict) else "resposta inválida", max_len=160)
+        return "\n".join([
+            "📲 WhatsApp Ops — contexto local (somente leitura)",
+            f"Não foi possível montar o contexto: {err or 'erro desconhecido'}",
+            "Nenhum envio foi disparado e nenhum histórico do provedor foi buscado.",
+        ])
+
+    source = _safe_text(data.get("source") or "local_inbound_store", max_len=80)
+    raw_events = data.get("events")
+    all_events = raw_events if isinstance(raw_events, list) else []
+    events = [
+        event for event in all_events
+        if isinstance(event, dict) and str(event.get("message_type") or "").strip().lower() != "system"
+    ]
+    visible_type_counts, visible_media_counts = _count_visible_events(events)
+    fetched_count = len(all_events)
+    visible_count = len(events)
+    system_hidden = max(0, fetched_count - visible_count)
+    filter_bits = []
+    if data.get("thread_filter_set"):
+        filter_bits.append("conversa informada")
+    if data.get("contact_filter_set"):
+        filter_bits.append("contato informado")
+    filtro = "+".join(filter_bits) if filter_bits else "últimos eventos locais ingeridos"
+    if target_public:
+        scope_hint = (
+            "Alvo: "
+            f"{_safe_text(target_public.get('target_label'), max_len=100)} "
+            f"({_safe_text(target_public.get('target_kind'), max_len=30)} · {_safe_text(target_public.get('source'), max_len=40)})"
+        )
+    elif filter_bits:
+        scope_hint = "Escopo: filtro técnico informado no comando."
+    else:
+        scope_hint = "Escopo: sem filtro específico; usa o local_inbound_store mais recente."
+
+    lines = [
+        "📲 WhatsApp Ops — contexto local (somente leitura)",
+        f"Fonte: {source} · modo: operador",
+        scope_hint,
+        f"Filtro: {filtro}",
+        f"Limite pedido: {parsed['limit']} eventos locais (padrão 10; máximo 25) · exibidas: {visible_count}",
+    ]
+    if system_hidden:
+        lines.append(f"Ocultos: {system_hidden} evento(s) system/conexão não operacional.")
+    lines.extend([
+        f"Tipos exibidos: {_format_counts(visible_type_counts)}",
+        f"Mídias exibidas: {_format_counts(visible_media_counts)}",
+        "Garantias: não envia, não busca histórico do provedor, não imprime refs/telefones/URLs/mídia bruta.",
+    ])
+
+    if not events:
+        lines.append("Nenhuma mensagem operacional local encontrada no escopo informado.")
+    else:
+        lines.append("Eventos locais:")
+        for idx, event in enumerate(events[: parsed["limit"]], start=1):
+            if isinstance(event, dict):
+                lines.extend(_format_event(event, idx))
+
+    return "\n".join(_safe_text(line, max_len=600) for line in lines)
+
+
+def render_conversation_summary_command(
+    arg: str = "",
+    *,
+    summary_loader: Callable[..., str] | None = None,
+    target_resolver: Callable[..., dict[str, Any]] | None = None,
+) -> str:
+    """Render a deterministic local WhatsApp conversation summary."""
+    parsed = _parse_targeted_args(arg, default_limit=50, max_limit=100)
+    if parsed.get("help"):
+        return "\n".join(_safe_text(line, max_len=600) for line in _summary_usage_lines())
+    if parsed.get("error"):
+        lines = _summary_usage_lines()
+        lines.insert(1, "Filtro incompleto: use /sumwpp item N, /sumwpp <nome> 50, ou /sumwpp 50.")
+        return "\n".join(_safe_text(line, max_len=600) for line in lines)
+
+    target_public, thread_ref, contact_ref, target_errors = _resolve_target_for_command(parsed, resolver=target_resolver)
+    if target_errors:
+        return "\n".join([
+            "🧾 WhatsApp Ops — resumo local determinístico (somente leitura)",
+            *(_safe_text(line, max_len=600) for line in target_errors),
+            "Nenhum envio foi disparado, nenhum resumo foi persistido e nenhum histórico do provedor foi buscado.",
+        ])
+
+    if summary_loader is None:
+        from tools.whatsapp_ops_tool import wpp_conversation_summary as default_loader  # type: ignore[import-not-found]
+
+        loader: Callable[..., str] = default_loader
+    else:
+        loader = summary_loader
+    try:
+        raw = loader(
+            thread=thread_ref,
+            contact=contact_ref,
+            limit=parsed["limit"],
+            mode=parsed.get("summary_mode") or "brief",
+            max_text_chars=180,
+            include_evidence=False,
+            window_days=parsed.get("window_days") or 0,
+            chunk_size=parsed.get("chunk_size") or 25,
+        )
+        data = json.loads(raw) if isinstance(raw, str) else raw
+    except Exception as exc:
+        return "\n".join([
+            "🧾 WhatsApp Ops — resumo local determinístico (somente leitura)",
+            f"Falha ao resumir local_inbound_store: {_safe_text(exc, max_len=160)}",
+            "Nenhum envio foi disparado, nenhum resumo foi persistido e nenhum histórico do provedor foi buscado.",
+        ])
+
+    if not isinstance(data, dict) or data.get("ok") is not True:
+        err = _safe_text((data or {}).get("error") if isinstance(data, dict) else "resposta inválida", max_len=160)
+        return "\n".join([
+            "🧾 WhatsApp Ops — resumo local determinístico (somente leitura)",
+            f"Não foi possível montar o resumo: {err or 'erro desconhecido'}",
+            "Nenhum envio foi disparado, nenhum resumo foi persistido e nenhum histórico do provedor foi buscado.",
+        ])
+
+    if target_public:
+        scope_hint = (
+            "Alvo: "
+            f"{_safe_text(target_public.get('target_label'), max_len=100)} "
+            f"({_safe_text(target_public.get('target_kind'), max_len=30)} · {_safe_text(target_public.get('source'), max_len=40)})"
+        )
+    elif data.get("thread_filter_set") or data.get("contact_filter_set"):
+        scope_hint = "Escopo: filtro técnico informado no comando."
+    else:
+        scope_hint = "Escopo: sem filtro específico; resumo dos eventos locais mais recentes."
+
+    type_counts_obj = data.get("type_counts")
+    media_counts_obj = data.get("media_counts")
+    type_counts: dict[str, Any] = type_counts_obj if isinstance(type_counts_obj, dict) else {}
+    media_counts: dict[str, Any] = media_counts_obj if isinstance(media_counts_obj, dict) else {}
+    lines = [
+        "🧾 WhatsApp Ops — resumo local determinístico (somente leitura)",
+        scope_hint,
+        f"Fonte: {_safe_text(data.get('source'), max_len=80)} · gerador: {_safe_text(data.get('generated_by'), max_len=80)}",
+        f"Limite pedido: {parsed['limit']} eventos locais (padrão 50; máximo 100) · analisados: {int(data.get('message_count') or 0)}",
+        f"Janela local: últimos {int((data.get('history_window') or {}).get('requested_days') or 0)} dia(s) · excluídos fora da janela: {int((data.get('history_window') or {}).get('excluded_by_window') or 0)}" if (data.get('history_window') or {}).get('applied') else "Janela local: sem filtro por dias.",
+        f"Tipos: {_format_counts(type_counts)}",
+        f"Mídias: {_format_counts(media_counts)}",
+        "Garantias: llm_used=false · provider_history_used=false · send_performed=false · summary_persisted=false.",
+    ]
+    headline = _safe_text(data.get("headline"), max_len=300)
+    if headline:
+        lines.extend(["", f"Resumo: {headline}"])
+    bullets = data.get("bullets") if isinstance(data.get("bullets"), list) else []
+    if bullets:
+        lines.append("Pontos:")
+        for bullet in bullets[:8]:
+            lines.append(f"- {_safe_text(bullet, max_len=260)}")
+    previews = data.get("latest_previews") if isinstance(data.get("latest_previews"), list) else []
+    if previews:
+        lines.append("Últimas prévias:")
+        for preview in previews[:5]:
+            if isinstance(preview, dict):
+                created = _safe_text(preview.get("created_at"), max_len=32) or "sem horário"
+                msg_type = _safe_text(preview.get("message_type"), max_len=40) or "unknown"
+                text = _safe_text(preview.get("text_preview"), max_len=180)
+                if text:
+                    lines.append(f"- {created} · {msg_type}: {text}")
+    chunks_obj = data.get("chunks") if isinstance(data.get("chunks"), list) else []
+    if chunks_obj:
+        lines.append(f"Chunks locais: {int(data.get('chunk_count') or len(chunks_obj))} · até {int(data.get('chunk_size') or parsed.get('chunk_size') or 25)} eventos por chunk")
+        for chunk in chunks_obj[:5]:
+            if not isinstance(chunk, dict):
+                continue
+            window_obj = chunk.get("window")
+            window: dict[str, Any] = window_obj if isinstance(window_obj, dict) else {}
+            first = _safe_text(window.get("first_created_at"), max_len=32) or "sem início"
+            last = _safe_text(window.get("last_created_at"), max_len=32) or "sem fim"
+            type_counts_chunk_obj = chunk.get("type_counts")
+            type_counts_chunk: dict[str, Any] = type_counts_chunk_obj if isinstance(type_counts_chunk_obj, dict) else {}
+            lines.append(
+                f"- chunk {int(chunk.get('index') or 0)}: {int(chunk.get('event_count') or 0)} evento(s) · {first} → {last} · tipos: {_format_counts(type_counts_chunk)}"
+            )
+            highlights_obj = chunk.get("highlights")
+            highlights: list[Any] = highlights_obj if isinstance(highlights_obj, list) else []
+            for highlight in highlights[:2]:
+                safe_highlight = _safe_text(highlight, max_len=180)
+                if safe_highlight:
+                    lines.append(f"  · {safe_highlight}")
+    actions = data.get("suggested_actions") if isinstance(data.get("suggested_actions"), list) else []
+    if actions:
+        safe_actions = [_safe_text(action, max_len=80) for action in actions[:6]]
+        lines.append("Ações sugeridas locais: " + ", ".join(action for action in safe_actions if action))
+    warnings = data.get("warnings") if isinstance(data.get("warnings"), list) else []
+    if warnings:
+        lines.append("Warnings: " + ", ".join(_safe_text(warning, max_len=60) for warning in warnings[:6]))
+    return "\n".join(_safe_text(line, max_len=700) for line in lines)
