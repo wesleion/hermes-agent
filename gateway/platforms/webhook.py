@@ -359,12 +359,19 @@ class WebhookAdapter(BasePlatformAdapter):
         try:
             from gateway.whatsapp_ops_batch_dispatch import FriendsBatchDispatcher
             dispatcher = FriendsBatchDispatcher()
+            dispatcher.operator_adapter = self._friends_operator_adapter
             if dispatcher.enabled():
                 self._friends_dispatcher = dispatcher
                 self._friends_dispatch_task = asyncio.create_task(dispatcher.serve())
         except Exception:
             logger.exception("[webhook] friends pilot dispatcher did not start")
         return True
+
+    def _friends_operator_adapter(self):
+        # The runner's active adapter map follows the current profile. Resolve
+        # each time, so reconnect/replacement never uses a stale bot identity.
+        runner = self.gateway_runner
+        return runner.adapters.get(Platform.TELEGRAM) if runner is not None else None
 
     async def disconnect(self) -> None:
         if self._friends_dispatcher is not None:

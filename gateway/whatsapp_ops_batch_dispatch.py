@@ -12,7 +12,7 @@ import time
 from datetime import datetime, timedelta, timezone
 from typing import Any, Callable
 
-from hermes_constants import get_hermes_home
+from tools.whatsapp_ops_batch import friends_profile_id
 from tools.whatsapp_ops_batch import (
     _conn,
     _init,
@@ -54,11 +54,12 @@ class FriendsBatchDispatcher:
         enabled: Callable = _friends_enabled,
         generation_timeout_seconds: float = 90.0,
     ) -> None:
-        self.profile_id = profile_id or get_hermes_home().name
+        self.profile_id = profile_id or friends_profile_id()
         self.generator = generator or FriendsHermesGenerator(profile_id=self.profile_id)
         self.send_client, self.send_config = send_client, send_config
         self.clock, self.enabled = clock, enabled
         self.timeout = max(0.01, min(90.0, float(generation_timeout_seconds)))
+        self.operator_adapter = lambda: None
         self._stop = threading.Event()
         self._busy = threading.Lock()
         self._late: concurrent.futures.Future | None = None
@@ -346,7 +347,9 @@ class FriendsBatchDispatcher:
                     drain_friends_operator_events,
                 )
 
-                await asyncio.to_thread(drain_friends_operator_events, self.profile_id)
+                await drain_friends_operator_events(
+                    self.profile_id, adapter=self.operator_adapter()
+                )
             await asyncio.to_thread(self._stop.wait, 0.5)
 
     def stop(self) -> None:

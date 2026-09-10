@@ -5,7 +5,7 @@ from __future__ import annotations
 import json
 import sqlite3
 
-from hermes_constants import get_hermes_home
+from tools.whatsapp_ops_batch import friends_profile_id
 from hermes_cli.whatsapp_ops_commands import _safe_text
 from tools.whatsapp_ops_store import get_db_path
 
@@ -34,7 +34,7 @@ def friends_pilot_status(grant_id: str | None = None) -> dict:
                 return result
             grants = conn.execute(
                 "SELECT g.* FROM friends_grants g JOIN friends_pending_envelopes p ON p.envelope_digest=g.envelope_digest WHERE p.profile_id=? ORDER BY g.created_at DESC LIMIT 20",
-                (get_hermes_home().name,),
+                (friends_profile_id(),),
             ).fetchall()
             for grant in grants:
                 if grant_id and grant["grant_id"] != grant_id:

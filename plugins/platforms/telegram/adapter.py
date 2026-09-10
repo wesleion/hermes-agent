@@ -6479,6 +6479,38 @@ class TelegramAdapter(BasePlatformAdapter):
     def _ea_escape(self, text: str) -> str:
         return _html.escape(text)
 
+    def friends_pilot_ready(self) -> bool:
+        """Use only this connected adapter, never a process-global token."""
+        return self._bot is not None and not getattr(self, "_send_path_degraded", False)
+
+    async def send_friends_pilot_notice(self, payload: Dict[str, Any]) -> SendResult:
+        """Exact-destination card/notice; no fallback, retry or WhatsApp effect."""
+        if not self.friends_pilot_ready():
+            return SendResult(success=False, error="friends_adapter_unavailable")
+        try:
+            keyboard = payload.get("reply_markup", {}).get("inline_keyboard")
+            kwargs = {
+                "chat_id": normalize_telegram_chat_id(str(payload["chat_id"])),
+                "text": payload["text"],
+                "disable_web_page_preview": True,
+                "parse_mode": None,
+                "read_timeout": 10, "write_timeout": 10,
+                "connect_timeout": 10, "pool_timeout": 10,
+            }
+            if payload.get("message_thread_id"):
+                kwargs["message_thread_id"] = int(payload["message_thread_id"])
+            if keyboard:
+                kwargs["reply_markup"] = InlineKeyboardMarkup([
+                    [InlineKeyboardButton(**button) for button in row]
+                    for row in keyboard
+                ])
+            message = await self._bot.send_message(**kwargs)
+            if getattr(message, "message_id", None) is None:
+                return SendResult(success=False, error="friends_receipt_missing")
+            return SendResult(success=True, message_id=str(message.message_id))
+        except Exception:
+            return SendResult(success=False, error="friends_delivery_uncertain")
+
     async def send_exec_approval(
         self, chat_id: str, command: str, session_key: str,
         description: str = "dangerous command",
@@ -7495,8 +7527,8 @@ class TelegramAdapter(BasePlatformAdapter):
             try:
                 from gateway.whatsapp_ops_batch_approval import issue_authenticated_friends_authority
                 from tools.whatsapp_ops_batch import activate_friends_pending, friends_pending_binding
-                from hermes_constants import get_hermes_home
-                profile_id = str(get_hermes_home().resolve())
+                from tools.whatsapp_ops_batch import friends_profile_id
+                profile_id = friends_profile_id()
                 pending = friends_pending_binding(parts[2])
                 if not pending or pending.get("profile_id") != profile_id:
                     await query.answer(text="Friends grant is no longer available.")

@@ -18,6 +18,12 @@ _MAX_TURNS, _MAX_MESSAGES, _MAX_BLOCKS, _GLOBAL_CAP = 10, 30, 3, 90
 _MAX_WINDOW = timedelta(hours=2)
 
 
+def friends_profile_id() -> str:
+    """Canonical private identity shared by producer, callback and consumers."""
+    from hermes_constants import get_hermes_home
+    return str(get_hermes_home().resolve())
+
+
 def _now() -> datetime:
     return datetime.now(timezone.utc)
 

@@ -4,19 +4,18 @@ from __future__ import annotations
 
 import hashlib
 import json
-import os
 from datetime import datetime, timezone
-from urllib.request import Request, urlopen
 
 from hermes_cli.whatsapp_ops_commands import _safe_text
-from tools.whatsapp_ops_batch import _conn
+from tools.whatsapp_ops_batch import _conn, friends_profile_id
 
 
-def drain_friends_exceptions(
-    profile_id: str, *, client=None, token: str | None = None
-) -> int:
-    token = os.environ.get("TELEGRAM_BOT_TOKEN", "") if token is None else token
-    if not token:
+async def drain_friends_exceptions(profile_id: str, *, adapter=None) -> int:
+    if (
+        profile_id != friends_profile_id()
+        or adapter is None
+        or not adapter.friends_pilot_ready()
+    ):
         return 0
     delivered = 0
     with _conn() as conn:
@@ -67,26 +66,13 @@ def drain_friends_exceptions(
             payload["message_thread_id"] = row["thread_id"]
         status, receipt = "uncertain", None
         try:
-            request = Request(
-                f"https://api.telegram.org/bot{token}/sendMessage",
-                data=json.dumps(payload, ensure_ascii=False).encode(),
-                headers={"Content-Type": "application/json"},
-                method="POST",
-            )
-            with (client or urlopen)(request, timeout=10) as response:
-                ack = json.loads(response.read().decode())
-            if (
-                ack.get("ok") is True
-                and isinstance(ack.get("result"), dict)
-                and ack["result"].get("message_id") is not None
-            ):
+            result = await adapter.send_friends_pilot_notice(payload)
+            if result.success is True and result.message_id:
                 status = "sent"
-                receipt = hashlib.sha256(
-                    str(ack["result"]["message_id"]).encode()
-                ).hexdigest()
+                receipt = hashlib.sha256(str(result.message_id).encode()).hexdigest()
                 delivered += 1
         except Exception:
-            # Claimed/uncertain events are never automatically posted twice.
+            # A started delivery without confirmation must never be retried.
             pass
         with _conn() as conn:
             conn.execute(
@@ -96,11 +82,12 @@ def drain_friends_exceptions(
     return delivered
 
 
-def drain_friends_approval_cards(
-    profile_id: str, *, client=None, token: str | None = None
-) -> int:
-    token = os.environ.get("TELEGRAM_BOT_TOKEN", "") if token is None else token
-    if not token:
+async def drain_friends_approval_cards(profile_id: str, *, adapter=None) -> int:
+    if (
+        profile_id != friends_profile_id()
+        or adapter is None
+        or not adapter.friends_pilot_ready()
+    ):
         return 0
     stamp = datetime.now(timezone.utc).isoformat()
     delivered = 0
@@ -162,25 +149,13 @@ def drain_friends_approval_cards(
             payload["message_thread_id"] = row["thread_id"]
         status, receipt = "uncertain", None
         try:
-            request = Request(
-                f"https://api.telegram.org/bot{token}/sendMessage",
-                data=json.dumps(payload, ensure_ascii=False).encode(),
-                headers={"Content-Type": "application/json"},
-                method="POST",
-            )
-            with (client or urlopen)(request, timeout=10) as response:
-                ack = json.loads(response.read().decode())
-            if (
-                ack.get("ok") is True
-                and isinstance(ack.get("result"), dict)
-                and ack["result"].get("message_id") is not None
-            ):
+            result = await adapter.send_friends_pilot_notice(payload)
+            if result.success is True and result.message_id:
                 status = "sent"
-                receipt = hashlib.sha256(
-                    str(ack["result"]["message_id"]).encode()
-                ).hexdigest()
+                receipt = hashlib.sha256(str(result.message_id).encode()).hexdigest()
                 delivered += 1
         except Exception:
+            # A started delivery without confirmation must never be retried.
             pass
         with _conn() as conn:
             conn.execute(
@@ -190,6 +165,6 @@ def drain_friends_approval_cards(
     return delivered
 
 
-def drain_friends_operator_events(profile_id: str) -> None:
-    drain_friends_approval_cards(profile_id)
-    drain_friends_exceptions(profile_id)
+async def drain_friends_operator_events(profile_id: str, *, adapter=None) -> None:
+    await drain_friends_approval_cards(profile_id, adapter=adapter)
+    await drain_friends_exceptions(profile_id, adapter=adapter)

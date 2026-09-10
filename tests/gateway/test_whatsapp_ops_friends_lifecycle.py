@@ -42,10 +42,14 @@ def pilot(tmp_path, monkeypatch):
         actions=["qualify", "present", "brief", "refer", "escalate", "stop"],
     )
     pending = batch.persist_friends_pending(
-        envelope, profile_id=tmp_path.name, chat_id="42", thread_id="", operator_id="7"
+        envelope,
+        profile_id=str(tmp_path.resolve()),
+        chat_id="42",
+        thread_id="",
+        operator_id="7",
     )
     authority = issue_authenticated_friends_authority(
-        profile_id=tmp_path.name,
+        profile_id=str(tmp_path.resolve()),
         chat_id="42",
         thread_id="",
         operator_id="7",
@@ -83,7 +87,7 @@ def pilot(tmp_path, monkeypatch):
 
     def dispatcher(**kwargs):
         return FriendsBatchDispatcher(
-            profile_id=tmp_path.name,
+            profile_id=str(tmp_path.resolve()),
             generator=kwargs.pop("generator", Generator()),
             send_client=kwargs.pop("send_client", send),
             send_config=cfg,
@@ -111,7 +115,7 @@ def pilot(tmp_path, monkeypatch):
             "dispatcher": dispatcher,
             "inbound": inbound,
             "send": send,
-            "profile": tmp_path.name,
+            "profile": str(tmp_path.resolve()),
         }
     finally:
         reset_hermes_home_override(token)
@@ -362,7 +366,8 @@ def test_inbound_transaction_rolls_back_if_queue_insert_fails(pilot, monkeypatch
         ).fetchone()
 
 
-def test_status_reports_whatsapp_receipts_and_exception_delivery_is_once(pilot):
+@pytest.mark.asyncio
+async def test_status_reports_whatsapp_receipts_and_exception_delivery_is_once(pilot):
     from hermes_cli.whatsapp_ops_batch_commands import (
         friends_pilot_status,
         select_current_grant,
@@ -375,24 +380,20 @@ def test_status_reports_whatsapp_receipts_and_exception_delivery_is_once(pilot):
     assert status["counts"]["sent"] == 3 and len(status["conversations"]) == 3
     assert select_current_grant() == p["grant"]["grant_id"]
     p["inbound"](0, "pare", "stop-notify")
+    from types import SimpleNamespace
+    from gateway.platforms.base import SendResult
+
     posted = []
 
-    class Response:
-        def __enter__(self):
-            return self
+    async def send(payload):
+        posted.append(payload)
+        return SendResult(success=True, message_id="123")
 
-        def __exit__(self, *args):
-            pass
-
-        def read(self):
-            return b'{"ok":true,"result":{"message_id":123}}'
-
-    def send(request, timeout):
-        posted.append(json.loads(request.data))
-        return Response()
-
-    assert drain_friends_exceptions(p["profile"], client=send, token="fixture") == 1
-    assert drain_friends_exceptions(p["profile"], client=send, token="fixture") == 0
+    adapter = SimpleNamespace(
+        friends_pilot_ready=lambda: True, send_friends_pilot_notice=send
+    )
+    assert await drain_friends_exceptions(p["profile"], adapter=adapter) == 1
+    assert await drain_friends_exceptions(p["profile"], adapter=adapter) == 0
     assert len(posted) == 1 and "551188" not in json.dumps(posted)
     assert posted[0]["chat_id"] == "42" and "actor-0" in posted[0]["text"]
 
