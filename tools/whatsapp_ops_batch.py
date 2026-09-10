@@ -70,7 +70,11 @@ def migrate_friends_batch_ledger(conn: sqlite3.Connection) -> None:
         "CREATE TABLE IF NOT EXISTS friends_outbox (outbox_id TEXT PRIMARY KEY,block_id TEXT NOT NULL UNIQUE REFERENCES friends_blocks(block_id),plan_id TEXT NOT NULL,status TEXT NOT NULL,idempotency_key TEXT NOT NULL UNIQUE,receipt_hash TEXT,error_code TEXT,created_at TEXT NOT NULL,updated_at TEXT NOT NULL)",
         "CREATE TABLE IF NOT EXISTS friends_conversation_leases (grant_id TEXT NOT NULL,contact_id TEXT NOT NULL,channel_id TEXT NOT NULL,fence_hash TEXT NOT NULL,expires_at TEXT NOT NULL,plan_id TEXT NOT NULL UNIQUE,PRIMARY KEY(grant_id,contact_id,channel_id))",
         "CREATE TABLE IF NOT EXISTS friends_suppressions (contact_id TEXT NOT NULL,channel_id TEXT NOT NULL,reason TEXT NOT NULL,created_at TEXT NOT NULL,PRIMARY KEY(contact_id,channel_id))",
+        "CREATE TABLE IF NOT EXISTS friends_conversations (profile_id TEXT NOT NULL,grant_id TEXT NOT NULL,contact_id TEXT NOT NULL,channel_id TEXT NOT NULL,processed_cursor TEXT,highwatermark TEXT,first_event_at TEXT,last_event_at TEXT,due_at TEXT,generation_version INTEGER NOT NULL DEFAULT 0,status TEXT NOT NULL DEFAULT 'idle',followup_due_at TEXT,followup_sent INTEGER NOT NULL DEFAULT 0,lease_fence_hash TEXT,lease_expires_at TEXT,PRIMARY KEY(profile_id,grant_id,contact_id,channel_id))",
+        "CREATE TABLE IF NOT EXISTS friends_inbound_queue (event_id TEXT NOT NULL UNIQUE,profile_id TEXT NOT NULL,grant_id TEXT NOT NULL,contact_id TEXT NOT NULL,channel_id TEXT NOT NULL,text TEXT NOT NULL,received_at TEXT NOT NULL,status TEXT NOT NULL DEFAULT 'pending',created_at TEXT NOT NULL)",
         "CREATE INDEX IF NOT EXISTS ix_friends_blocks_plan_state ON friends_blocks(plan_id,status,block_index)",
+        "CREATE INDEX IF NOT EXISTS ix_friends_queue_ready ON friends_inbound_queue(profile_id,grant_id,contact_id,channel_id,status,received_at)",
+        "CREATE TABLE IF NOT EXISTS friends_qualifications (grant_id TEXT NOT NULL,contact_id TEXT NOT NULL,channel_id TEXT NOT NULL,outcome TEXT NOT NULL,simulation INTEGER NOT NULL DEFAULT 1,detail_json TEXT NOT NULL,created_at TEXT NOT NULL,PRIMARY KEY(grant_id,contact_id,channel_id))",
     )
     conn.execute("SAVEPOINT friends_batch_v2")
     try:
@@ -932,6 +936,31 @@ def recover_friends_orphaned_reservations() -> dict[str, Any]:
         except BaseException:
             conn.rollback()
             raise
+
+
+def enqueue_friends_inbound(conn: sqlite3.Connection, *, event_id: str, contact_id: str,
+                            text: str, received_at: str, profile_id: str = "default") -> int:
+    """Insert matching grant work while the inbound transaction is still open."""
+    if not contact_id or not text.strip():
+        return 0
+    now = _now().isoformat()
+    created = 0
+    for grant in conn.execute("SELECT grant_id,contacts_json,starts_at,expires_at FROM friends_grants WHERE status='active'").fetchall():
+        when, starts, expires = _iso(received_at), _iso(grant['starts_at']), _iso(grant['expires_at'])
+        if not when or not starts or not expires or when < starts or when >= expires:
+            continue
+        for bound in json.loads(grant['contacts_json']):
+            if bound['contact_id'] != contact_id:
+                continue
+            try:
+                conn.execute("INSERT INTO friends_inbound_queue(event_id,profile_id,grant_id,contact_id,channel_id,text,received_at,status,created_at) VALUES (?,?,?,?,?,?,?,?,?)", (event_id, profile_id, grant['grant_id'], contact_id, bound['channel_id'], text.strip()[:4096], received_at, 'pending', now))
+            except sqlite3.IntegrityError:
+                continue
+            due = (when + timedelta(seconds=5)).isoformat()
+            conn.execute("INSERT INTO friends_conversations(profile_id,grant_id,contact_id,channel_id,highwatermark,first_event_at,last_event_at,due_at,status) VALUES (?,?,?,?,?,?,?,?,?) ON CONFLICT(profile_id,grant_id,contact_id,channel_id) DO UPDATE SET highwatermark=excluded.highwatermark,last_event_at=excluded.last_event_at,due_at=excluded.due_at,generation_version=friends_conversations.generation_version+1,status='pending'", (profile_id, grant['grant_id'], contact_id, bound['channel_id'], event_id, received_at, received_at, due, 'pending'))
+            conn.execute("UPDATE friends_plans SET status='cancelled',updated_at=? WHERE grant_id=? AND contact_id=? AND channel_id=? AND status IN ('ready','sending','paused')", (now, grant['grant_id'], contact_id, bound['channel_id']))
+            created += 1
+    return created
 
 
 def revoke_friends_grant(

@@ -3538,6 +3538,24 @@ def _sanitize_payload(value: Any) -> Any:
     return value
 
 
+def _extract_text_from_sanitized_payload(payload: Any) -> str:
+    if isinstance(payload, dict):
+        for key in ("text", "body", "conversation", "content", "caption"):
+            value = payload.get(key)
+            if isinstance(value, str) and value.strip():
+                return value.strip()[:4096]
+        for value in payload.values():
+            text = _extract_text_from_sanitized_payload(value)
+            if text:
+                return text
+    if isinstance(payload, list):
+        for value in payload:
+            text = _extract_text_from_sanitized_payload(value)
+            if text:
+                return text
+    return ""
+
+
 def record_inbound_event(
     *,
     source_event_id: str,
@@ -3545,6 +3563,7 @@ def record_inbound_event(
     thread_ref: str = "",
     payload: dict[str, Any] | None = None,
     status: str = "received",
+    resolved_contact_id: str = "",
 ) -> dict[str, Any]:
     init_db()
     if not source_event_id:
@@ -3558,8 +3577,8 @@ def record_inbound_event(
                 """
                 INSERT INTO inbound_events (
                     id, source_event_id_hash, contact_ref_hash, thread_ref_hash,
-                    payload_redacted_json, status, created_at
-                ) VALUES (?, ?, ?, ?, ?, ?, ?)
+                    payload_redacted_json, resolved_contact_id, status, created_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
                     event_id,
@@ -3567,10 +3586,14 @@ def record_inbound_event(
                     hash_text(contact_ref) if contact_ref else None,
                     hash_text(thread_ref) if thread_ref else None,
                     json.dumps(safe_payload, ensure_ascii=False, sort_keys=True),
+                    str(resolved_contact_id or "").strip() or None,
                     str(status or "received")[:40],
                     now,
                 ),
             )
+            if resolved_contact_id:
+                from tools.whatsapp_ops_batch import enqueue_friends_inbound
+                enqueue_friends_inbound(conn, event_id=event_id, contact_id=str(resolved_contact_id).strip(), text=_extract_text_from_sanitized_payload(safe_payload), received_at=now)
         except sqlite3.IntegrityError:
             row = conn.execute(
                 "SELECT id FROM inbound_events WHERE source_event_id_hash=?",

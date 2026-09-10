@@ -207,6 +207,8 @@ class WebhookAdapter(BasePlatformAdapter):
         ] = {}
         self._routes: Dict[str, dict] = dict(self._static_routes)
         self._runner = None
+        self._friends_dispatcher = None
+        self._friends_dispatch_task: asyncio.Task | None = None
         # Routes already warned about legacy V1 body-only signatures
         # (once-per-route so a busy sender doesn't spam the log).
         self._v1_signature_warned: set[str] = set()
@@ -354,9 +356,27 @@ class WebhookAdapter(BasePlatformAdapter):
         )
         # Plugin-registered native handlers (ctx.register_platform_handler).
         self._wire_plugin_handlers(None)
+        try:
+            from gateway.whatsapp_ops_batch_dispatch import FriendsBatchDispatcher
+            dispatcher = FriendsBatchDispatcher()
+            if dispatcher.enabled():
+                self._friends_dispatcher = dispatcher
+                self._friends_dispatch_task = asyncio.create_task(dispatcher.serve())
+        except Exception:
+            logger.exception("[webhook] friends pilot dispatcher did not start")
         return True
 
     async def disconnect(self) -> None:
+        if self._friends_dispatcher is not None:
+            self._friends_dispatcher.stop()
+        if self._friends_dispatch_task is not None:
+            self._friends_dispatch_task.cancel()
+            try:
+                await self._friends_dispatch_task
+            except asyncio.CancelledError:
+                pass
+            self._friends_dispatch_task = None
+            self._friends_dispatcher = None
         if self._runner:
             await self._runner.cleanup()
             self._runner = None

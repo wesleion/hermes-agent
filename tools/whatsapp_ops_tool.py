@@ -2968,24 +2968,22 @@ def wpp_ingest_inbound_event(payload: dict[str, Any]) -> str:
             or data.get("remoteJid")
             or ""
         )
+        resolved_contact_id = ""
+        if contact_ref.strip().casefold().endswith("@lid"):
+            resolved_contact_id = resolve_inbound_contact_by_lid(contact_ref) or ""
         result = record_inbound_event(
             source_event_id=source_event_id,
             contact_ref=contact_ref,
             thread_ref=thread_ref,
             payload=payload,
             status="received",
+            resolved_contact_id=resolved_contact_id,
         )
-        if result.get("ok") and contact_ref.strip().casefold().endswith("@lid"):
+        if result.get("ok") and resolved_contact_id:
             try:
-                resolved_contact_id = resolve_inbound_contact_by_lid(contact_ref)
-                if resolved_contact_id and persist_inbound_event_resolution(
-                    str(result.get("event_id") or ""), resolved_contact_id
-                ):
-                    _notify_operator_of_recognized_inbound(
-                        resolved_contact_id, _runtime_config()
-                    )
+                _notify_operator_of_recognized_inbound(resolved_contact_id, _runtime_config())
             except Exception:
-                pass  # LID resolution/notification are best-effort; never fail ingest
+                pass
         # Stage raw refs temporarily for registration use. For group messages,
         # expose both actionable targets: the group and the participant/contact.
         # Provider echoes from the connected account (fromme/key.fromMe) are not
