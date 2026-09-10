@@ -24,7 +24,8 @@ from tools.whatsapp_ops_crm import (
     crm_send_preflight,
     default_crm_config,
 )
-from tools.whatsapp_ops_policy import evaluate_send_guardrails
+from tools.whatsapp_ops_policy import evaluate_friends_batch_guardrails, evaluate_send_guardrails
+from tools.whatsapp_ops_batch import finish_friends_block, friends_plan_transport_target, reserve_friends_block
 from tools.whatsapp_ops_quepasa import pull_history_via_quepasa
 
 try:  # config loading is best-effort; tool remains fail-closed if unavailable
@@ -154,6 +155,7 @@ def _default_config() -> dict[str, Any]:
         "approval": {"required": True, "timeout_minutes": 60, "telegram": {}},
         "allowlists": {"contacts": [], "groups": []},
         "quepasa": {"backend": "n8n_or_http", "send_enabled": False},
+        "friends_pilot": {"enabled": False},
         "autonomy": {
             "mode": "assist",
             "allowed_areas": ["commercial_discovery", "commercial_drafts", "local_context"],
@@ -1063,6 +1065,49 @@ def _send_humanized_or_single(
     return response
 
 
+def _provider_receipt(result: dict[str, Any]) -> str:
+    """Accept only a provider-correlatable confirmation, never ``ok`` alone."""
+    if not isinstance(result, dict):
+        return ""
+    for key in ("message_id", "receipt_id", "id"):
+        value = result.get(key)
+        if isinstance(value, str) and value.strip():
+            return value.strip()[:500]
+    return ""
+
+
+def _send_friends_batch_block(plan_id: str, fence: str, cfg: dict[str, Any],
+                              client: Callable[[dict[str, Any], dict[str, Any]], dict[str, Any]]) -> dict[str, Any]:
+    """Consume exactly one frozen block through the canonical QuePasa client."""
+    target = friends_plan_transport_target(plan_id, fence)
+    if not target.get("ok"):
+        return target
+    raw_ref = get_transport_contact_ref(target["contact_id"], channel_id=target["channel_id"])
+    guard = evaluate_friends_batch_guardrails(
+        config=cfg, contact_authorized=bool(raw_ref), target_is_one_to_one=True, has_media=False,
+    )
+    if not guard.allowed:
+        return {"ok": False, "plan_id": plan_id, "reasons": guard.reasons}
+    reserved = reserve_friends_block(plan_id, fence)
+    if not reserved.get("ok"):
+        return reserved
+    block = reserved["block"]
+    payload = {"targets": [{"type": "contact", "contact_id": raw_ref}], "message": block["text"],
+               "idempotency_key": block["idempotency_key"], "friends_plan_id": plan_id,
+               "friends_block_digest": block["digest"]}
+    try:
+        provider = client(payload, cfg)
+    except Exception:
+        finish_friends_block(plan_id, reserved["reservation_id"], outcome="uncertain")
+        return {"ok": False, "plan_id": plan_id, "block_index": block["index"], "reasons": ["provider_uncertain"]}
+    receipt = _provider_receipt(provider)
+    if bool(provider.get("ok")) and receipt:
+        completed = finish_friends_block(plan_id, reserved["reservation_id"], outcome="sent", receipt=receipt)
+        return {"ok": bool(completed.get("ok")), "plan_id": plan_id, "block_index": block["index"], "status": completed.get("status")}
+    finish_friends_block(plan_id, reserved["reservation_id"], outcome="failed" if not bool(provider.get("ok")) else "uncertain")
+    return {"ok": False, "plan_id": plan_id, "block_index": block["index"], "reasons": ["provider_failed" if not bool(provider.get("ok")) else "provider_receipt_missing"]}
+
+
 def wpp_send_approved(
     draft_id: str,
     approval_token: str | None = None,
@@ -1071,6 +1116,9 @@ def wpp_send_approved(
     sleep_fn: Callable[[float], None] | None = None,
     presence_client: Callable[[dict[str, Any], dict[str, Any]], dict[str, Any]] | None = None,
     crm_client: Callable[[dict[str, Any], dict[str, Any]], dict[str, Any]] | None = None,
+    *,
+    batch_plan_id: str | None = None,
+    batch_lease_fence: str | None = None,
 ) -> str:
     """Send an explicitly human-approved draft only if guardrails allow it."""
     init_db()
@@ -1085,6 +1133,15 @@ def wpp_send_approved(
             }
         )
     cfg = _config_with_runtime_allowlist(base_cfg)
+    if batch_plan_id is not None:
+        if not isinstance(batch_plan_id, str) or not isinstance(batch_lease_fence, str):
+            return _json({"ok": False, "reasons": ["batch_plan_invalid"]})
+        if send_client is None:
+            from tools.whatsapp_ops_quepasa import send_via_quepasa
+            client = send_via_quepasa
+        else:
+            client = send_client
+        return _json(_send_friends_batch_block(batch_plan_id, batch_lease_fence, cfg, client))
     draft = get_draft(draft_id)
     approval = get_valid_approval(draft_id, approval_token)
     policy_draft = _draft_for_policy(draft)

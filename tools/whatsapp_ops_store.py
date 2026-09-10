@@ -631,6 +631,9 @@ def init_db() -> Path:
         _backfill_registration_staging_metadata(conn)
         _migrate_mission_ledger(conn)
         _migrate_campaign_ledger(conn)
+        # The friends pilot owns separate invariants from generic campaigns.
+        from tools.whatsapp_ops_batch import migrate_friends_batch_ledger
+        migrate_friends_batch_ledger(conn)
     return db_path
 
 

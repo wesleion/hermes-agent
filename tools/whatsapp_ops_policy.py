@@ -141,3 +141,20 @@ def evaluate_send_guardrails(
     # Keep deterministic, stable output.
     deduped = list(dict.fromkeys(reasons))
     return GuardrailResult(not deduped, deduped)
+
+
+def evaluate_friends_batch_guardrails(*, config: dict[str, Any], contact_authorized: bool,
+                                      target_is_one_to_one: bool, has_media: bool) -> GuardrailResult:
+    """Strict, approval-independent guard for an already human-granted batch plan."""
+    cfg = config if isinstance(config, dict) else {}
+    quepasa = cfg.get("quepasa") if isinstance(cfg.get("quepasa"), dict) else {}
+    friends = cfg.get("friends_pilot") if isinstance(cfg.get("friends_pilot"), dict) else {}
+    reasons: list[str] = []
+    if cfg.get("send_enabled") is not True: reasons.append("send_disabled")
+    if cfg.get("kill_switch") is True: reasons.append("kill_switch_active")
+    if quepasa.get("send_enabled") is not True: reasons.append("quepasa_send_disabled")
+    if friends.get("enabled") is not True: reasons.append("friends_pilot_disabled")
+    if not contact_authorized: reasons.append("target_not_whitelisted")
+    if not target_is_one_to_one: reasons.append("target_invalid")
+    if has_media: reasons.append("media_not_allowed")
+    return GuardrailResult(not reasons, reasons)
