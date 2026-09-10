@@ -370,9 +370,8 @@ class WebhookAdapter(BasePlatformAdapter):
         if self._friends_dispatcher is not None:
             self._friends_dispatcher.stop()
         if self._friends_dispatch_task is not None:
-            self._friends_dispatch_task.cancel()
             try:
-                await self._friends_dispatch_task
+                await asyncio.wait_for(self._friends_dispatch_task, timeout=3)
             except asyncio.CancelledError:
                 pass
             self._friends_dispatch_task = None

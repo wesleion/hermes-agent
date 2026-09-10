@@ -80,6 +80,10 @@ def migrate_friends_batch_ledger(conn: sqlite3.Connection) -> None:
     try:
         for statement in statements:
             conn.execute(statement)
+        columns = {row[1] for row in conn.execute("PRAGMA table_info(friends_conversations)")}
+        for name, spec in {"job_kind": "TEXT NOT NULL DEFAULT 'reply'", "active_plan_id": "TEXT", "generation_json": "TEXT"}.items():
+            if name not in columns:
+                conn.execute(f"ALTER TABLE friends_conversations ADD COLUMN {name} {spec}")
     except BaseException:
         conn.execute("ROLLBACK TO friends_batch_v2")
         conn.execute("RELEASE friends_batch_v2")
@@ -940,27 +944,10 @@ def recover_friends_orphaned_reservations() -> dict[str, Any]:
 
 def enqueue_friends_inbound(conn: sqlite3.Connection, *, event_id: str, contact_id: str,
                             text: str, received_at: str, profile_id: str = "default") -> int:
-    """Insert matching grant work while the inbound transaction is still open."""
-    if not contact_id or not text.strip():
-        return 0
-    now = _now().isoformat()
-    created = 0
-    for grant in conn.execute("SELECT grant_id,contacts_json,starts_at,expires_at FROM friends_grants WHERE status='active'").fetchall():
-        when, starts, expires = _iso(received_at), _iso(grant['starts_at']), _iso(grant['expires_at'])
-        if not when or not starts or not expires or when < starts or when >= expires:
-            continue
-        for bound in json.loads(grant['contacts_json']):
-            if bound['contact_id'] != contact_id:
-                continue
-            try:
-                conn.execute("INSERT INTO friends_inbound_queue(event_id,profile_id,grant_id,contact_id,channel_id,text,received_at,status,created_at) VALUES (?,?,?,?,?,?,?,?,?)", (event_id, profile_id, grant['grant_id'], contact_id, bound['channel_id'], text.strip()[:4096], received_at, 'pending', now))
-            except sqlite3.IntegrityError:
-                continue
-            due = (when + timedelta(seconds=5)).isoformat()
-            conn.execute("INSERT INTO friends_conversations(profile_id,grant_id,contact_id,channel_id,highwatermark,first_event_at,last_event_at,due_at,status) VALUES (?,?,?,?,?,?,?,?,?) ON CONFLICT(profile_id,grant_id,contact_id,channel_id) DO UPDATE SET highwatermark=excluded.highwatermark,last_event_at=excluded.last_event_at,due_at=excluded.due_at,generation_version=friends_conversations.generation_version+1,status='pending'", (profile_id, grant['grant_id'], contact_id, bound['channel_id'], event_id, received_at, received_at, due, 'pending'))
-            conn.execute("UPDATE friends_plans SET status='cancelled',updated_at=? WHERE grant_id=? AND contact_id=? AND channel_id=? AND status IN ('ready','sending','paused')", (now, grant['grant_id'], contact_id, bound['channel_id']))
-            created += 1
-    return created
+    """Keep enqueue atomic with the canonical inbound insertion."""
+    from tools.whatsapp_ops_friends_queue import enqueue
+    return enqueue(conn, event_id=event_id, contact_id=contact_id, text=text, received_at=received_at)
+
 
 
 def revoke_friends_grant(

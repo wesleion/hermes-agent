@@ -211,7 +211,10 @@ def _runtime_config() -> dict[str, Any]:
         return cfg
     whatsapp_ops = loaded.get("whatsapp_ops")
     if isinstance(whatsapp_ops, dict):
-        return _deep_merge(cfg, whatsapp_ops)
+        cfg = _deep_merge(cfg, whatsapp_ops)
+    # One profile opt-in governs both consumer and final sender; never require
+    # a second, undocumented switch inside whatsapp_ops.
+    cfg["friends_pilot"] = loaded.get("friends_pilot") if isinstance(loaded.get("friends_pilot"), dict) else {"enabled": False}
     return cfg
 
 
@@ -2861,7 +2864,7 @@ def _registration_message_type(payload: dict[str, Any], data: dict[str, Any]) ->
         return msg_type[:40]
     if payload.get("attachment") or payload.get("mediaUrl"):
         return "media"
-    message = data.get("message") if isinstance(data.get("message"), dict) else {}
+    message = data.get("message") if isinstance(data.get("message"), dict) else (payload.get("message") if isinstance(payload.get("message"), dict) else {})
     for key in ("imageMessage", "audioMessage", "videoMessage", "documentMessage"):
         if key in message:
             return key.removesuffix("Message").lower()
@@ -2874,7 +2877,7 @@ def _registration_has_media(payload: dict[str, Any], data: dict[str, Any], msg_t
         return True
     if msg_type in {"image", "audio", "video", "document", "media"}:
         return True
-    message = data.get("message") if isinstance(data.get("message"), dict) else {}
+    message = data.get("message") if isinstance(data.get("message"), dict) else (payload.get("message") if isinstance(payload.get("message"), dict) else {})
     return any(key in message for key in ("imageMessage", "audioMessage", "videoMessage", "documentMessage"))
 
 
@@ -2968,9 +2971,22 @@ def wpp_ingest_inbound_event(payload: dict[str, Any]) -> str:
             or data.get("remoteJid")
             or ""
         )
-        resolved_contact_id = ""
-        if contact_ref.strip().casefold().endswith("@lid"):
-            resolved_contact_id = resolve_inbound_contact_by_lid(contact_ref) or ""
+        from_self = _payload_from_self(payload)
+        registration_msg_type = _registration_message_type(payload, data)
+        from tools.whatsapp_ops_store import is_synthetic_contact_sync_payload as _is_synthetic_contact_sync
+        is_synthetic_contact_sync = _is_synthetic_contact_sync(payload)
+        is_external_individual = bool(contact_ref and contact_ref == thread_ref and not contact_ref.endswith("@g.us") and not from_self and registration_msg_type == "text" and not is_synthetic_contact_sync)
+        from tools.whatsapp_ops_store import resolve_inbound_contact_local
+        resolved_contact_id = resolve_inbound_contact_local(contact_ref) if is_external_individual else ""
+        if is_external_individual and contact_ref.strip().casefold().endswith("@lid"):
+            try:
+                resolved_contact_id = resolve_inbound_contact_by_lid(contact_ref) or ""
+                if resolved_contact_id:
+                    from tools.whatsapp_ops_store import is_friends_contact_authorized
+                    if not is_friends_contact_authorized(resolved_contact_id):
+                        resolved_contact_id = ""
+            except (LookupError, OSError, RuntimeError, ValueError, TypeError):
+                resolved_contact_id = ""
         result = record_inbound_event(
             source_event_id=source_event_id,
             contact_ref=contact_ref,
@@ -2979,10 +2995,10 @@ def wpp_ingest_inbound_event(payload: dict[str, Any]) -> str:
             status="received",
             resolved_contact_id=resolved_contact_id,
         )
-        if result.get("ok") and resolved_contact_id:
+        if result.get("ok") and not result.get("deduped") and resolved_contact_id:
             try:
                 _notify_operator_of_recognized_inbound(resolved_contact_id, _runtime_config())
-            except Exception:
+            except (RuntimeError, ValueError, TypeError):
                 pass
         # Stage raw refs temporarily for registration use. For group messages,
         # expose both actionable targets: the group and the participant/contact.

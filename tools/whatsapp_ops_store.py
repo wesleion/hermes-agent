@@ -620,6 +620,7 @@ def init_db() -> Path:
             );
             """
         )
+        conn.execute("BEGIN IMMEDIATE")
         _ensure_draft_columns(conn)
         _ensure_approval_columns(conn)
         _ensure_list_columns(conn)
@@ -945,6 +946,30 @@ def resolve_inbound_contact_by_lid(lid_ref: str) -> str:
         return str(row["contact_id"] or "") if row is not None else ""
     except Exception:
         return ""
+
+
+def resolve_inbound_contact_local(raw_ref: str) -> str:
+    """Exact normalized address lookup; never guesses a LID or queries a provider."""
+    try:
+        address = _normalize_whatsapp_address(raw_ref)
+        with _connect_read_only() as conn:
+            rows = conn.execute("SELECT DISTINCT contact_id FROM contact_channels WHERE address_hash=? AND is_active=1 AND validation_status='validated' AND revoked_at IS NULL", (hash_text(address),)).fetchall()
+        return str(rows[0]['contact_id']) if len(rows) == 1 else ""
+    except (ValueError, sqlite3.Error):
+        return ""
+
+
+def is_friends_contact_authorized(contact_id: str) -> bool:
+    """Return whether a resolved contact remains allowed for friends intake."""
+    value = str(contact_id or "").strip()
+    if not value:
+        return False
+    try:
+        with _connect_read_only() as conn:
+            row = conn.execute("SELECT 1 FROM contacts c WHERE c.id=? AND c.whitelisted=1 AND EXISTS (SELECT 1 FROM contact_channels ch WHERE ch.contact_id=c.id AND ch.channel_type='whatsapp' AND ch.is_active=1 AND ch.allow_send=1 AND ch.authorized_at IS NOT NULL AND ch.revoked_at IS NULL)", (value,)).fetchone()
+        return row is not None
+    except (sqlite3.Error, ValueError, TypeError):
+        return False
 
 
 def _safe_contact_channel(row: dict[str, Any]) -> dict[str, Any]:
@@ -3599,7 +3624,11 @@ def record_inbound_event(
                 "SELECT id FROM inbound_events WHERE source_event_id_hash=?",
                 (hash_text(source_event_id),),
             ).fetchone()
-            return {"ok": True, "event_id": row["id"] if row else "", "deduped": True}
+            if row is None or row['id'] == event_id:
+                # The source INSERT succeeded: this is an enqueue error, not
+                # a provider replay. Roll back both sides instead of ACKing loss.
+                raise
+            return {"ok": True, "event_id": row["id"], "deduped": True}
     return {"ok": True, "event_id": event_id, "deduped": False, "status": str(status or "received")[:40]}
 
 

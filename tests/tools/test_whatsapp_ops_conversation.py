@@ -41,6 +41,15 @@ def test_concrete_generator_is_zero_tool_and_validates_json():
     assert seen["skip_context_files"] is True and seen["fallback_model"] is None
 
 
+def test_generator_accepts_zero_block_terminal_actions_and_bounds_metadata():
+    from tools.whatsapp_ops_conversation import validate_friends_generation
+
+    terminal = {"stage": "handoff", "qualification": {"problem": "x"}, "action": "escalate", "blocks": [], "next_step": "human review", "escalation": True}
+    assert validate_friends_generation(terminal) == terminal
+    terminal["stage"] = "x" * 81
+    assert validate_friends_generation(terminal) is None
+
+
 def test_generator_rejects_unbounded_commercial_claim():
     from tools.whatsapp_ops_conversation import validate_friends_generation
 
