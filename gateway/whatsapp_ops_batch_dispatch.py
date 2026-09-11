@@ -201,11 +201,12 @@ class FriendsBatchDispatcher:
 
     def _media_pending(self, row) -> bool:
         """Do not generate partial replies while this inbound slot is decoding."""
-        if not str(row["highwatermark"] or "").startswith("inbound_"):
-            return False
+        from tools.whatsapp_ops_media_store import maintain_jobs
         with _conn() as conn:
-            job = conn.execute("SELECT status FROM media_jobs WHERE event_id=?", (row["highwatermark"],)).fetchone()
-        return bool(job and job["status"] in {"pending", "processing"})
+            conn.execute("BEGIN IMMEDIATE")
+            maintain_jobs(conn, self.clock())
+            job = conn.execute("SELECT 1 FROM media_jobs m JOIN friends_inbound_queue q ON q.event_id=m.event_id WHERE q.profile_id=? AND q.grant_id=? AND q.contact_id=? AND q.channel_id=? AND q.status='pending' AND m.status IN ('pending','processing') LIMIT 1", self._key(row)).fetchone()
+        return bool(job)
 
     def _process(self, row) -> bool:
         if self._media_pending(row):

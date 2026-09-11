@@ -370,14 +370,8 @@ class WebhookAdapter(BasePlatformAdapter):
         # The media worker owns all post-ACK download/CPU work. It starts only
         # when both independent consent switches are explicitly true.
         try:
-            from hermes_cli.config import load_config
             from gateway.whatsapp_ops_media_worker import WhatsAppOpsMediaWorker
-            from tools.whatsapp_ops_quepasa import download_media_via_quepasa_no_redirect
-            loaded = load_config() or {}
-            ops = dict(loaded.get("whatsapp_ops") or {})
-            ops["friends_pilot"] = loaded.get("friends_pilot") or {"enabled": False}
-            ops["auxiliary"] = loaded.get("auxiliary") or {}
-            worker = WhatsAppOpsMediaWorker(config=ops, downloader=lambda handle, cap: download_media_via_quepasa_no_redirect(handle, max_bytes=cap))
+            worker = WhatsAppOpsMediaWorker()
             if worker.enabled():
                 self._media_worker = worker
                 self._media_worker_task = asyncio.create_task(worker.serve())
@@ -392,11 +386,13 @@ class WebhookAdapter(BasePlatformAdapter):
         return runner.adapters.get(Platform.TELEGRAM) if runner is not None else None
 
     async def disconnect(self) -> None:
+        if self._friends_dispatcher is not None:
+            self._friends_dispatcher.stop()
         if self._media_worker is not None:
             self._media_worker.stop()
         if self._media_worker_task is not None:
             try:
-                await asyncio.wait_for(self._media_worker_task, timeout=35)
+                await asyncio.wait_for(self._media_worker_task, timeout=90)
             except asyncio.CancelledError:
                 pass
             self._media_worker_task = None

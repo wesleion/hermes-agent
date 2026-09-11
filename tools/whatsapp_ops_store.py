@@ -660,6 +660,8 @@ def init_db() -> Path:
         # The friends pilot owns separate invariants from generic campaigns.
         from tools.whatsapp_ops_batch import migrate_friends_batch_ledger
         migrate_friends_batch_ledger(conn)
+        from tools.whatsapp_ops_media_store import migrate_media_ledger
+        migrate_media_ledger(conn)
     return db_path
 
 
@@ -3622,6 +3624,8 @@ def record_inbound_event(
     event_id = "inbound_" + uuid.uuid4().hex[:12]
     now = utc_now()
     safe_payload = _sanitize_payload(payload or {})
+    if media:
+        get_db_path().chmod(0o600)
     with _connect() as conn:
         try:
             conn.execute(
@@ -3652,13 +3656,10 @@ def record_inbound_event(
                 from tools.whatsapp_ops_batch import enqueue_friends_inbound
                 enqueue_friends_inbound(conn, event_id=event_id, contact_id=str(resolved_contact_id).strip(), text=queue_text, received_at=now)
             if resolved_contact_id and media_value.get("kind"):
-                handle = str(media_value.get("provider_handle") or "").strip()
-                if not handle:
-                    raise ValueError("media_handle_required")
-                conn.execute(
-                    "INSERT INTO media_jobs(event_id,provider_handle,kind,mime,size_hint,status,attempt,fence,lease_expires_at,created_at,updated_at) VALUES (?,?,?,?,?,'pending',0,NULL,NULL,?,?)",
-                    (event_id, handle, str(media_value["kind"])[:20], str(media_value.get("mime") or "")[:100], max(0, min(int(media_value.get("size_hint") or 0), 20 * 1024 * 1024)), now, now),
-                )
+                from tools.whatsapp_ops_media_store import admit_media
+                # Admitting a registered contact is not enough: only an actual
+                # active Friends queue binding may own a private provider handle.
+                admit_media(conn, event_id=event_id, descriptor=media_value, received_at=now)
         except sqlite3.IntegrityError:
             row = conn.execute(
                 "SELECT id FROM inbound_events WHERE source_event_id_hash=?",

@@ -2978,10 +2978,13 @@ def wpp_ingest_inbound_event(payload: dict[str, Any]) -> str:
         from tools.whatsapp_ops_media import classify_inbound_media
         media_descriptor = classify_inbound_media(payload)
         media_kind = str(media_descriptor.get("kind") or "none")
-        supported_media = media_kind in {"audio", "image", "sticker", "animation"}
+        runtime_cfg = _runtime_config()
+        from tools.whatsapp_ops_media_store import media_enabled as _media_is_enabled
+        media_enabled = _media_is_enabled(runtime_cfg)
+        supported_media = media_kind in {"audio", "image", "sticker", "animation", "unsupported"}
         # Authorization happens before a provider handle enters the private media
         # ledger. Groups, self echoes, cards and unknown media stay receive-only.
-        is_external_individual = bool(contact_ref and contact_ref == thread_ref and not contact_ref.endswith("@g.us") and not from_self and registration_msg_type != "system" and not is_synthetic_contact_sync)
+        is_external_individual = bool(contact_ref and contact_ref == thread_ref and not contact_ref.strip().casefold().endswith("@g.us") and not from_self and registration_msg_type != "system" and not is_synthetic_contact_sync and (registration_msg_type == "text" or (media_enabled and supported_media)))
         from tools.whatsapp_ops_store import resolve_inbound_contact_local
         resolved_contact_id = resolve_inbound_contact_local(contact_ref) if is_external_individual else ""
         if is_external_individual and contact_ref.strip().casefold().endswith("@lid"):
@@ -2993,14 +2996,11 @@ def wpp_ingest_inbound_event(payload: dict[str, Any]) -> str:
                         resolved_contact_id = ""
             except (LookupError, OSError, RuntimeError, ValueError, TypeError):
                 resolved_contact_id = ""
-        runtime_cfg = _runtime_config()
-        media_cfg = runtime_cfg.get("media_perception") if isinstance(runtime_cfg, dict) else {}
-        media_enabled = bool(isinstance(media_cfg, dict) and media_cfg.get("enabled") is True and runtime_cfg.get("friends_pilot", {}).get("enabled") is True)
         inbound_media = None
-        if resolved_contact_id and media_enabled and supported_media and "://" not in source_event_id and not source_event_id.casefold().startswith(("data:", "blob:")):
-            # Provider id is a durable private handle, never copied to the
-            # sanitized public inbound payload or conversation evidence.
-            inbound_media = {**media_descriptor, "provider_handle": source_event_id}
+        if resolved_contact_id and media_enabled and supported_media:
+            from tools.whatsapp_ops_media_store import media_settings
+            inbound_media = {**media_descriptor, "provider_handle": source_event_id,
+                             "worker_timeout_seconds": media_settings(runtime_cfg).get("worker_timeout_seconds", 180)}
         result = record_inbound_event(
             source_event_id=source_event_id,
             contact_ref=contact_ref,
