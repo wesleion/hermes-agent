@@ -2,10 +2,14 @@
 
 from __future__ import annotations
 import asyncio
+from contextlib import contextmanager
 from datetime import datetime, timedelta, timezone
+import fcntl
+import os
 from pathlib import Path
 import secrets
 import shutil
+import stat
 import tempfile
 import threading
 from typing import Any, Callable
@@ -160,7 +164,50 @@ class WhatsAppOpsMediaWorker:
             raise ValueError("media_cache_invalid")
         root.mkdir(mode=0o700, parents=True, exist_ok=True)
         root.chmod(0o700)
+        root_stat = root.stat()
+        if (
+            not stat.S_ISDIR(root_stat.st_mode)
+            or root_stat.st_uid != os.getuid()
+            or stat.S_IMODE(root_stat.st_mode) & 0o077
+        ):
+            raise ValueError("media_cache_invalid")
         return root
+
+    @staticmethod
+    def _open_cache_dir(directory):
+        flags = (
+            os.O_RDONLY | getattr(os, "O_DIRECTORY", 0) | getattr(os, "O_NOFOLLOW", 0)
+        )
+        return os.open(directory, flags)
+
+    @contextmanager
+    def _cache_root_lock(self, root):
+        flags = os.O_RDWR | os.O_CREAT | getattr(os, "O_NOFOLLOW", 0)
+        fd = os.open(root / ".media_cache.lock", flags, 0o600)
+        try:
+            if not stat.S_ISREG(os.fstat(fd).st_mode):
+                raise ValueError("media_cache_invalid")
+            fcntl.flock(fd, fcntl.LOCK_EX)
+            yield
+        finally:
+            fcntl.flock(fd, fcntl.LOCK_UN)
+            os.close(fd)
+
+    @contextmanager
+    def _cache_dir(self):
+        root = self._cache_root()
+        with self._cache_root_lock(root):
+            directory = Path(tempfile.mkdtemp(prefix="media_", dir=root))
+            fd = self._open_cache_dir(directory)
+            fcntl.flock(fd, fcntl.LOCK_EX)
+        try:
+            yield str(directory)
+        finally:
+            try:
+                shutil.rmtree(directory, ignore_errors=True)
+            finally:
+                fcntl.flock(fd, fcntl.LOCK_UN)
+                os.close(fd)
 
     def _cleanup(self):
         root = self._cache_root()
@@ -168,14 +215,36 @@ class WhatsAppOpsMediaWorker:
             media_settings(self.config).get("cache_ttl_seconds"), 86400, 86400
         )
         cutoff = self.clock().timestamp() - ttl
-        for item in root.iterdir():
-            if (
-                item.name.startswith("media_")
-                and not item.is_symlink()
-                and item.is_dir()
-                and item.stat().st_mtime < cutoff
-            ):
-                shutil.rmtree(item)
+        with self._cache_root_lock(root):
+            for item in root.iterdir():
+                if not item.name.startswith("media_") or item.is_symlink():
+                    continue
+                try:
+                    before = item.stat(follow_symlinks=False)
+                    if not stat.S_ISDIR(before.st_mode):
+                        continue
+                    fd = self._open_cache_dir(item)
+                except OSError:
+                    continue
+                try:
+                    current = os.fstat(fd)
+                    if (current.st_dev, current.st_ino) != (
+                        before.st_dev,
+                        before.st_ino,
+                    ):
+                        continue
+                    try:
+                        fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                    except BlockingIOError:
+                        continue
+                    locked = os.fstat(fd)
+                    if (locked.st_dev, locked.st_ino) != (before.st_dev, before.st_ino):
+                        continue
+                    if locked.st_mtime < cutoff:
+                        shutil.rmtree(item, ignore_errors=True)
+                finally:
+                    fcntl.flock(fd, fcntl.LOCK_UN)
+                    os.close(fd)
 
     def _decode(self, data, kind, mime, settings, tmp):
         if self.decoder is not None:
@@ -246,9 +315,7 @@ class WhatsAppOpsMediaWorker:
                 return False
             if not isinstance(data, bytes) or not data or len(data) > cap:
                 raise ValueError("media_size_invalid")
-            with tempfile.TemporaryDirectory(
-                prefix="media_", dir=self._cache_root()
-            ) as tmp:
+            with self._cache_dir() as tmp:
                 decoded = self._decode(data, kind, mime, settings, tmp)
                 if not self._current(row, fence):
                     return False
