@@ -266,9 +266,15 @@ class WhatsAppOpsMediaWorker:
         if kind == "audio":
             perception = self.perception
             if perception is None:
-                from tools.whatsapp_ops_local_perception import LocalMediaPerception
+                audio = settings.get("audio")
+                if audio is not None:
+                    from tools.whatsapp_ops_groq_perception import GroqMediaPerception
 
-                perception = LocalMediaPerception(settings.get("local", {}))
+                    perception = GroqMediaPerception(audio)
+                else:
+                    from tools.whatsapp_ops_local_perception import LocalMediaPerception
+
+                    perception = LocalMediaPerception(settings.get("local", {}))
             return perception.transcribe_audio(decoded["audio_path"])
         return describe_images(
             decoded["frames"], self.config, client=self.vision_client
@@ -419,6 +425,10 @@ class WhatsAppOpsMediaWorker:
             "stt_timeout",
             "stt_failed",
             "invalid_audio_input",
+            "groq_configuration_invalid",
+            "groq_not_configured",
+            "groq_transcription_failed",
+            "groq_invalid_response",
             "vision_not_configured",
             "vision_call_failed",
             "vision_invalid_output",
