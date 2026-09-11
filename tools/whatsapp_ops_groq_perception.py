@@ -163,7 +163,11 @@ class GroqMediaPerception:
             _ENDPOINT,
             data=body,
             method="POST",
-            headers={"Authorization": f"Bearer {key}", "Content-Type": content_type},
+            headers={
+                "Authorization": f"Bearer {key}",
+                "Content-Type": content_type,
+                "User-Agent": "Hunter-Audio-Eval/1",
+            },
         )
         try:
             with self._opener(request, timeout=timeout) as response:

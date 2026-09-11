@@ -73,6 +73,7 @@ def test_transcribes_normalized_wav_with_narrow_request(tmp_path, monkeypatch):
     assert len(calls) == 1 and calls[0][1] == 30
     request = calls[0][0]
     assert request.full_url == "https://api.groq.com/openai/v1/audio/transcriptions"
+    assert request.get_header("User-agent") == "Hunter-Audio-Eval/1"
     assert (
         b'filename="audio.wav"' in request.data
         and str(audio).encode() not in request.data
