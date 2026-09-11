@@ -8,6 +8,7 @@ from __future__ import annotations
 import json
 import math
 import os
+import secrets
 import stat
 import urllib.error
 import urllib.request
@@ -59,8 +60,12 @@ def _default_opener() -> Callable[..., Any]:
 
 
 def _multipart(audio: bytes, *, language: str) -> tuple[bytes, str]:
-    boundary = "----hunter-groq-audio-boundary"
-    fields = [("model", _MODEL), ("response_format", "verbose_json")]
+    boundary = "----hunter-groq-" + secrets.token_hex(12)
+    fields = [
+        ("model", _MODEL),
+        ("response_format", "verbose_json"),
+        ("temperature", "0"),
+    ]
     if language == "pt":
         fields.append(("language", language))
     chunks: list[bytes] = []

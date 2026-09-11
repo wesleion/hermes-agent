@@ -56,6 +56,19 @@ def test_injected_perception_precedes_explicit_groq_selection():
     assert result["text"] == "injected" and seen == ["/tmp/normalized.wav"]
 
 
+def test_explicit_null_audio_config_is_invalid_not_legacy_fallback(monkeypatch):
+    from tools import whatsapp_ops_local_perception as local
+
+    def forbidden(*args, **kwargs):
+        raise AssertionError("invalid explicit audio configuration fell back to local")
+
+    monkeypatch.setattr(local, "LocalMediaPerception", forbidden)
+    result = WhatsAppOpsMediaWorker(config={})._perceive(
+        {"audio_path": "/tmp/not-read.wav"}, "audio", {"audio": None}
+    )
+    assert not result["ok"] and result["error"] == "groq_configuration_invalid"
+
+
 def test_safe_error_keeps_only_allowlisted_groq_errors():
     assert (
         WhatsAppOpsMediaWorker._safe_error("groq_not_configured")

@@ -666,31 +666,104 @@ def test_voice_optout_completion_stops_before_any_reply(pilot):
         )
 
 
-
-
 @pytest.mark.asyncio
 async def test_concurrent_scavenger_preserves_actual_inflight_normalized_audio(pilot):
     import os
-    p=pilot;entered=threading.Event();release=threading.Event();paths=[]
-    p.cfg['whatsapp_ops']['media_perception']['cache_ttl_seconds']=1
+
+    p = pilot
+    entered = threading.Event()
+    release = threading.Event()
+    paths = []
+    p.cfg["whatsapp_ops"]["media_perception"]["cache_ttl_seconds"] = 1
+
     class Delayed:
-        def transcribe_audio(self,path):
-            paths.append(Path(path));entered.set();release.wait(5)
-            return {'ok':True,'text':'agenda','truncated':False}
-    p.ingest(event='active-cache-regression')
-    worker_a=p.worker(perception=Delayed());worker_b=p.worker()
-    task=asyncio.create_task(asyncio.to_thread(worker_a.run_once))
+        def transcribe_audio(self, path):
+            paths.append(Path(path))
+            entered.set()
+            release.wait(5)
+            return {"ok": True, "text": "agenda", "truncated": False}
+
+    p.ingest(event="active-cache-regression")
+    worker_a = p.worker(perception=Delayed())
+    worker_b = p.worker()
+    task = asyncio.create_task(asyncio.to_thread(worker_a.run_once))
     try:
-        assert await asyncio.to_thread(entered.wait,4)
+        assert await asyncio.to_thread(entered.wait, 4)
         assert paths[0].is_file()
-        old=p.now[0].timestamp()-2
-        os.utime(paths[0].parent,(old,old))
+        old = p.now[0].timestamp() - 2
+        os.utime(paths[0].parent, (old, old))
         worker_b._cleanup()
-        active_preserved=paths[0].is_file()
+        active_preserved = paths[0].is_file()
     finally:
-        release.set();await asyncio.wait_for(task,5)
-    assert active_preserved,'scavenger deleted active normalized audio under perception'
-    assert len(p.downloads)==1 and not p.calls
+        release.set()
+        await asyncio.wait_for(task, 5)
+    assert active_preserved, (
+        "scavenger deleted active normalized audio under perception"
+    )
+    assert len(p.downloads) == 1 and not p.calls
+
+
+def test_real_media_pipeline_selects_groq_and_records_evidence_once(pilot, monkeypatch):
+    import wave
+    from tools import whatsapp_ops_groq_perception as groq
+
+    p = pilot
+    requests = []
+    m = p.cfg["whatsapp_ops"]["media_perception"]
+    m["audio"] = {
+        "provider": "groq",
+        "model": "whisper-large-v3-turbo",
+        "timeout": 30,
+        "language": "",
+    }
+    m["local"].update(
+        ffmpeg_binary="/home/won-agent/.cache/hunter-multimodal/ffmpeg-static/bin/ffmpeg",
+        ffprobe_binary="/home/won-agent/.cache/hunter-multimodal/ffmpeg-static/bin/ffprobe",
+    )
+    b = io.BytesIO()
+    with wave.open(b, "wb") as w:
+        w.setparams((1, 2, 16000, 0, "NONE", "NONE"))
+        w.writeframes(b"\0\0" * 1600)
+
+    class Response:
+        status = 200
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *args):
+            return False
+
+        def read(self, size):
+            return b'{"text":"Quero organizar a agenda","language":"Portuguese"}'
+
+    def network(request, **kwargs):
+        requests.append(request)
+        assert (
+            request.get_method() == "POST" and b"whisper-large-v3-turbo" in request.data
+        )
+        return Response()
+
+    monkeypatch.setenv("GROQ_API_KEY", "synthetic-key")
+    monkeypatch.setattr(groq, "_default_opener", lambda: network)
+    p.ingest(event="groq-pipeline")
+    worker = p.worker(
+        perception=None, decoder=None, downloader=lambda *_: (b.getvalue(), "audio/wav")
+    )
+    assert worker.run_once()
+    with store._connect() as conn:
+        assert (
+            conn.execute("SELECT status FROM media_jobs").fetchone()[0] == "completed"
+        )
+        assert (
+            conn.execute("SELECT text FROM media_evidence").fetchone()[0]
+            == "Quero organizar a agenda"
+        )
+    p.now[0] += timedelta(seconds=5)
+    assert p.dispatcher.run_once() == 1
+    p.ingest(event="groq-pipeline")
+    assert not worker.run_once()
+    assert len(requests) == 1 and len(p.calls) == 1
 
 
 def test_completed_job_cache_cleanup_never_follows_symlink(pilot):

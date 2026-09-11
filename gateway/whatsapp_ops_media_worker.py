@@ -267,7 +267,7 @@ class WhatsAppOpsMediaWorker:
             perception = self.perception
             if perception is None:
                 audio = settings.get("audio")
-                if audio is not None:
+                if "audio" in settings:
                     from tools.whatsapp_ops_groq_perception import GroqMediaPerception
 
                     perception = GroqMediaPerception(audio)

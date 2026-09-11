@@ -80,6 +80,7 @@ def test_transcribes_normalized_wav_with_narrow_request(tmp_path, monkeypatch):
     assert (
         b"whisper-large-v3-turbo" in request.data and b"response_format" in request.data
     )
+    assert b'name="temperature"\r\n\r\n0\r\n' in request.data
     assert response.read_sizes == [64 * 1024 + 1]
 
 
