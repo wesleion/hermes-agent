@@ -5,11 +5,15 @@ Inputs must already be normalized mono WAV files; normalization belongs to the c
 """
 from __future__ import annotations
 
+import json
 import math
-import multiprocessing
 import os
 import re
+import select
 import signal
+import subprocess
+import sys
+import tempfile
 import time
 import wave
 from pathlib import Path
@@ -19,6 +23,11 @@ _MAX_TEXT_CHARS = 16_000
 _MAX_SEGMENTS = 512
 _MAX_AUDIO_BYTES = 64 * 1024 * 1024
 _AUDIO_TIMEOUT_SECONDS = 60.0
+_CHILD_OUTPUT_BYTES = 32 * 1024
+_WORKER_ADDRESS_SPACE_BYTES = 1536 * 1024 * 1024
+_WORKER_CPU_SECONDS = 60
+_WORKER_NOFILE = 64
+_WORKER_FILE_BYTES = 32 * 1024 * 1024
 _LANGUAGE_RE = re.compile(r"^[A-Za-z]{2,8}(?:[-_][A-Za-z0-9]{2,8})?$")
 
 
@@ -36,22 +45,31 @@ def _result(*, ok: bool, text: str = "", language: str = "", duration: float = 0
     return value
 
 
-def _local_directory(value: Any) -> Path | None:
+def _safe_path(value: Any, *, directory: bool) -> Path | None:
     if not isinstance(value, str) or not value or value != value.strip() or "://" in value:
         return None
     try:
         path = Path(value)
-        return path if path.is_dir() and not path.is_symlink() else None
+        if not path.is_absolute() or path.is_symlink():
+            return None
+        resolved = path.resolve(strict=True)
+        if resolved != path or (not resolved.is_dir() if directory else not resolved.is_file()):
+            return None
+        return path
     except (OSError, ValueError):
         return None
 
 
+def _local_directory(value: Any) -> Path | None:
+    return _safe_path(value, directory=True)
+
+
 def _normalized_wav(value: Any) -> tuple[Path, float] | None:
-    if not isinstance(value, str) or not value or value != value.strip() or "://" in value:
+    path = _safe_path(value, directory=False)
+    if path is None:
         return None
     try:
-        path = Path(value)
-        if path.is_symlink() or not path.is_file() or path.stat().st_size > _MAX_AUDIO_BYTES:
+        if path.stat().st_size > _MAX_AUDIO_BYTES:
             return None
         with wave.open(str(path), "rb") as handle:
             if (handle.getnchannels(), handle.getsampwidth(), handle.getframerate(), handle.getcomptype()) != (1, 2, 16_000, "NONE"):
@@ -67,19 +85,33 @@ def _safe_language(value: Any) -> str:
     return text if _LANGUAGE_RE.fullmatch(text) else ""
 
 
-def _worker(model_path: str, audio_path: str, threads: int, connection: Any) -> None:
-    """One finite child owns the native model, so its deadline is enforceable."""
+def _set_limit(resource_type: int, value: int) -> None:
+    import resource
+
+    _, hard = resource.getrlimit(resource_type)
+    ceiling = value if hard == resource.RLIM_INFINITY else min(value, hard)
+    resource.setrlimit(resource_type, (ceiling, hard))
+
+
+def _apply_worker_limits() -> None:
+    """Apply limits before importing native inference code in the isolated child."""
+    import resource
+
+    _set_limit(resource.RLIMIT_AS, _WORKER_ADDRESS_SPACE_BYTES)
+    _set_limit(resource.RLIMIT_CPU, _WORKER_CPU_SECONDS)
+    _set_limit(resource.RLIMIT_NOFILE, _WORKER_NOFILE)
+    _set_limit(resource.RLIMIT_FSIZE, _WORKER_FILE_BYTES)
+
+
+def _worker(model_path: str, audio_path: str, threads: int) -> dict[str, Any]:
     try:
-        os.environ.update({
-            "OMP_NUM_THREADS": str(threads), "OPENBLAS_NUM_THREADS": str(threads),
-            "MKL_NUM_THREADS": str(threads), "CT2_VERBOSE": "0",
-        })
         from faster_whisper import WhisperModel
         model = WhisperModel(model_path, device="cpu", compute_type="int8", cpu_threads=threads,
                              num_workers=1, local_files_only=True)
         segments, info = model.transcribe(audio_path, vad_filter=True)
         chunks: list[str] = []
         truncated = False
+        used = 0
         for index, segment in enumerate(segments):
             if index >= _MAX_SEGMENTS:
                 truncated = True
@@ -87,7 +119,7 @@ def _worker(model_path: str, audio_path: str, threads: int, connection: Any) -> 
             text = getattr(segment, "text", "")
             if not isinstance(text, str):
                 continue
-            remaining = _MAX_TEXT_CHARS - sum(len(chunk) for chunk in chunks)
+            remaining = _MAX_TEXT_CHARS - used
             if remaining <= 0:
                 truncated = True
                 break
@@ -96,13 +128,72 @@ def _worker(model_path: str, audio_path: str, threads: int, connection: Any) -> 
                 truncated = True
                 break
             chunks.append(text)
-        connection.send({"ok": True, "text": "".join(chunks).strip(),
-                         "language": _safe_language(getattr(info, "language", "")),
-                         "truncated": truncated})
+            used += len(text)
+        return {"ok": True, "text": "".join(chunks).strip(),
+                "language": _safe_language(getattr(info, "language", "")), "truncated": truncated}
     except Exception:
-        connection.send({"ok": False})
-    finally:
-        connection.close()
+        return {"ok": False}
+
+
+def _child_main(argv: list[str]) -> int:
+    if len(argv) != 5 or argv[1] != "--_hunter_stt_child":
+        return 2
+    model_path = _local_directory(argv[2])
+    audio = _normalized_wav(argv[3])
+    try:
+        threads = int(argv[4])
+    except ValueError:
+        threads = 0
+    message: dict[str, Any] = {"ok": False}
+    if model_path is not None and audio is not None and threads in (1, 2):
+        try:
+            _apply_worker_limits()
+            message = _worker(str(model_path), str(audio[0]), threads)
+        except (OSError, ValueError):
+            message = {"ok": False}
+    payload = json.dumps(message, separators=(",", ":"))[:_CHILD_OUTPUT_BYTES]
+    try:
+        os.write(sys.stdout.fileno(), payload.encode("utf-8") + b"\n")
+    except OSError:
+        return 1
+    return 0
+
+
+def _child_environment(threads: int, home: str) -> dict[str, str]:
+    source = str(Path(__file__).resolve().parent)
+    return {
+        "HOME": home,
+        "HERMES_HOME": str(Path(home) / ".hermes"),
+        "PYTHONPATH": source,
+        "HF_HUB_OFFLINE": "1",
+        "TRANSFORMERS_OFFLINE": "1",
+        "OMP_NUM_THREADS": str(threads),
+        "OPENBLAS_NUM_THREADS": str(threads),
+        "MKL_NUM_THREADS": str(threads),
+        "CT2_VERBOSE": "0",
+        "PYTHONDONTWRITEBYTECODE": "1",
+    }
+
+
+def _kill_process_group(process: subprocess.Popen[str]) -> None:
+    pid = process.pid
+    if pid is None or pid == os.getpid():
+        return
+    for signum, timeout in ((signal.SIGTERM, 2), (signal.SIGKILL, 2)):
+        try:
+            os.killpg(pid, signum)
+        except ProcessLookupError:
+            pass
+        try:
+            process.wait(timeout=timeout)
+        except subprocess.TimeoutExpired:
+            continue
+        if signum == signal.SIGKILL:
+            return
+    try:
+        process.wait(timeout=2)
+    except subprocess.TimeoutExpired:
+        pass
 
 
 class LocalMediaPerception:
@@ -126,28 +217,28 @@ class LocalMediaPerception:
         if candidate is None:
             return _result(ok=False, error="invalid_audio_input")
         audio_path, duration = candidate
-        receive, send = multiprocessing.Pipe(duplex=False)
-        process = multiprocessing.get_context("fork").Process(
-            target=_worker, args=(str(model_path), str(audio_path), self._threads, send), daemon=True)
-        process.start()
-        send.close()
-        deadline = time.monotonic() + self._AUDIO_TIMEOUT_SECONDS
         message: dict[str, Any] | None = None
-        try:
-            remaining = max(0.0, deadline - time.monotonic())
-            if receive.poll(remaining):
-                possible = receive.recv()
-                message = possible if isinstance(possible, dict) else None
-        except (EOFError, OSError):
-            message = None
-        finally:
-            receive.close()
-            if process.is_alive():
-                process.terminate()
-                process.join(2)
-            if process.is_alive() and process.pid is not None:
-                os.kill(process.pid, signal.SIGKILL)
-                process.join(1)
+        with tempfile.TemporaryDirectory(prefix="hunter-stt-") as home:
+            process = subprocess.Popen(
+                [sys.executable, str(Path(__file__).resolve()), "--_hunter_stt_child",
+                 str(model_path), str(audio_path), str(self._threads)],
+                stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
+                text=True, env=_child_environment(self._threads, home), start_new_session=True,
+            )
+            try:
+                assert process.stdout is not None
+                ready, _, _ = select.select([process.stdout], [], [], self._AUDIO_TIMEOUT_SECONDS)
+                if ready:
+                    payload = process.stdout.readline(_CHILD_OUTPUT_BYTES + 1)
+                    if len(payload) <= _CHILD_OUTPUT_BYTES:
+                        possible = json.loads(payload)
+                        message = possible if isinstance(possible, dict) else None
+            except (OSError, ValueError, json.JSONDecodeError):
+                message = None
+            finally:
+                _kill_process_group(process)
+                if process.stdout is not None:
+                    process.stdout.close()
         if message is None:
             return _result(ok=False, error="stt_timeout")
         if not message.get("ok"):
@@ -155,3 +246,7 @@ class LocalMediaPerception:
         return _result(ok=True, text=str(message.get("text", "")),
                        language=_safe_language(message.get("language")), duration=duration,
                        truncated=bool(message.get("truncated")))
+
+
+if __name__ == "__main__":
+    raise SystemExit(_child_main(sys.argv))
