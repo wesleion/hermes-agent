@@ -209,6 +209,8 @@ class WebhookAdapter(BasePlatformAdapter):
         self._runner = None
         self._friends_dispatcher = None
         self._friends_dispatch_task: asyncio.Task | None = None
+        self._media_worker = None
+        self._media_worker_task: asyncio.Task | None = None
         # Routes already warned about legacy V1 body-only signatures
         # (once-per-route so a busy sender doesn't spam the log).
         self._v1_signature_warned: set[str] = set()
@@ -365,6 +367,22 @@ class WebhookAdapter(BasePlatformAdapter):
                 self._friends_dispatch_task = asyncio.create_task(dispatcher.serve())
         except Exception:
             logger.exception("[webhook] friends pilot dispatcher did not start")
+        # The media worker owns all post-ACK download/CPU work. It starts only
+        # when both independent consent switches are explicitly true.
+        try:
+            from hermes_cli.config import load_config
+            from gateway.whatsapp_ops_media_worker import WhatsAppOpsMediaWorker
+            from tools.whatsapp_ops_quepasa import download_media_via_quepasa_no_redirect
+            loaded = load_config() or {}
+            ops = dict(loaded.get("whatsapp_ops") or {})
+            ops["friends_pilot"] = loaded.get("friends_pilot") or {"enabled": False}
+            ops["auxiliary"] = loaded.get("auxiliary") or {}
+            worker = WhatsAppOpsMediaWorker(config=ops, downloader=lambda handle, cap: download_media_via_quepasa_no_redirect(handle, max_bytes=cap))
+            if worker.enabled():
+                self._media_worker = worker
+                self._media_worker_task = asyncio.create_task(worker.serve())
+        except Exception:
+            logger.exception("[webhook] media worker did not start")
         return True
 
     def _friends_operator_adapter(self):
@@ -374,6 +392,15 @@ class WebhookAdapter(BasePlatformAdapter):
         return runner.adapters.get(Platform.TELEGRAM) if runner is not None else None
 
     async def disconnect(self) -> None:
+        if self._media_worker is not None:
+            self._media_worker.stop()
+        if self._media_worker_task is not None:
+            try:
+                await asyncio.wait_for(self._media_worker_task, timeout=35)
+            except asyncio.CancelledError:
+                pass
+            self._media_worker_task = None
+            self._media_worker = None
         if self._friends_dispatcher is not None:
             self._friends_dispatcher.stop()
         if self._friends_dispatch_task is not None:
@@ -1261,7 +1288,16 @@ class WebhookAdapter(BasePlatformAdapter):
             if isinstance(route_config, dict) and isinstance(route_config.get("stt"), dict)
             else {}
         )
-        if not deduped and stt_config.get("enabled") is True:
+        # Legacy route-local STT remains available only while the durable media
+        # pipeline is off; it must never download inline after a media ACK.
+        media_pipeline = False
+        try:
+            from tools.whatsapp_ops_tool import _runtime_config
+            config_media = _runtime_config().get("media_perception") or {}
+            media_pipeline = bool(config_media.get("enabled") is True and _runtime_config().get("friends_pilot", {}).get("enabled") is True)
+        except Exception:
+            media_pipeline = False
+        if not deduped and not media_pipeline and stt_config.get("enabled") is True:
             try:
                 from tools.whatsapp_ops_stt import (
                     provider_message_id_from_payload,

@@ -199,7 +199,17 @@ class FriendsBatchDispatcher:
         finally:
             pool.shutdown(wait=False, cancel_futures=True)
 
+    def _media_pending(self, row) -> bool:
+        """Do not generate partial replies while this inbound slot is decoding."""
+        if not str(row["highwatermark"] or "").startswith("inbound_"):
+            return False
+        with _conn() as conn:
+            job = conn.execute("SELECT status FROM media_jobs WHERE event_id=?", (row["highwatermark"],)).fetchone()
+        return bool(job and job["status"] in {"pending", "processing"})
+
     def _process(self, row) -> bool:
+        if self._media_pending(row):
+            return False
         fence = self._claim(row)
         if not fence:
             return False

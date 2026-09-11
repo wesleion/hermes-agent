@@ -570,6 +570,31 @@ def init_db() -> Path:
                 status TEXT NOT NULL,
                 created_at TEXT NOT NULL
             );
+            CREATE TABLE IF NOT EXISTS media_jobs (
+                event_id TEXT PRIMARY KEY REFERENCES inbound_events(id),
+                provider_handle TEXT NOT NULL,
+                kind TEXT NOT NULL,
+                mime TEXT NOT NULL DEFAULT '',
+                size_hint INTEGER NOT NULL DEFAULT 0,
+                status TEXT NOT NULL CHECK(status IN ('pending','processing','completed','failed','cancelled')),
+                attempt INTEGER NOT NULL DEFAULT 0,
+                fence TEXT,
+                lease_expires_at TEXT,
+                created_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL
+            );
+            CREATE INDEX IF NOT EXISTS ix_media_jobs_ready ON media_jobs(status, lease_expires_at, created_at);
+            CREATE TABLE IF NOT EXISTS media_evidence (
+                event_id TEXT PRIMARY KEY REFERENCES inbound_events(id),
+                kind TEXT NOT NULL,
+                source TEXT NOT NULL,
+                text TEXT NOT NULL DEFAULT '',
+                uncertain INTEGER NOT NULL DEFAULT 0,
+                truncated INTEGER NOT NULL DEFAULT 0,
+                status TEXT NOT NULL,
+                created_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL
+            );
             CREATE TABLE IF NOT EXISTS media_transcriptions (
                 id TEXT PRIMARY KEY,
                 event_id TEXT NOT NULL UNIQUE REFERENCES inbound_events(id),
@@ -3589,6 +3614,7 @@ def record_inbound_event(
     payload: dict[str, Any] | None = None,
     status: str = "received",
     resolved_contact_id: str = "",
+    media: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     init_db()
     if not source_event_id:
@@ -3616,9 +3642,23 @@ def record_inbound_event(
                     now,
                 ),
             )
+            queue_text = _extract_text_from_sanitized_payload(safe_payload)
+            media_value = media if isinstance(media, dict) else {}
             if resolved_contact_id:
+                # A pending attachment is immediately a conversation event.  The
+                # status placeholder intentionally contains no handle or URL.
+                if media_value.get("kind") and not queue_text:
+                    queue_text = "[mídia aguardando análise]"
                 from tools.whatsapp_ops_batch import enqueue_friends_inbound
-                enqueue_friends_inbound(conn, event_id=event_id, contact_id=str(resolved_contact_id).strip(), text=_extract_text_from_sanitized_payload(safe_payload), received_at=now)
+                enqueue_friends_inbound(conn, event_id=event_id, contact_id=str(resolved_contact_id).strip(), text=queue_text, received_at=now)
+            if resolved_contact_id and media_value.get("kind"):
+                handle = str(media_value.get("provider_handle") or "").strip()
+                if not handle:
+                    raise ValueError("media_handle_required")
+                conn.execute(
+                    "INSERT INTO media_jobs(event_id,provider_handle,kind,mime,size_hint,status,attempt,fence,lease_expires_at,created_at,updated_at) VALUES (?,?,?,?,?,'pending',0,NULL,NULL,?,?)",
+                    (event_id, handle, str(media_value["kind"])[:20], str(media_value.get("mime") or "")[:100], max(0, min(int(media_value.get("size_hint") or 0), 20 * 1024 * 1024)), now, now),
+                )
         except sqlite3.IntegrityError:
             row = conn.execute(
                 "SELECT id FROM inbound_events WHERE source_event_id_hash=?",

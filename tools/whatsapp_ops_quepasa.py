@@ -647,6 +647,37 @@ def download_media_via_quepasa(
     return data, content_type
 
 
+class _DenyRedirect(urllib.request.HTTPRedirectHandler):
+    def redirect_request(self, req, fp, code, msg, headers, newurl):
+        raise RuntimeError("quepasa_download_redirect_denied")
+
+
+def download_media_via_quepasa_no_redirect(provider_message_id: str, *, max_bytes: int = 20 * 1024 * 1024) -> tuple[bytes, str]:
+    """Media-worker-only downloader: redirects fail before credentials travel."""
+    message_id = str(provider_message_id or "").strip()
+    if not message_id:
+        raise ValueError("provider_message_id_missing")
+    cap = max(1, min(int(max_bytes), 20 * 1024 * 1024))
+    url = _normalize_download_url(_quepasa_base_url({}), message_id)
+    api_key = _quepasa_api_key()
+    if not url or not api_key:
+        raise RuntimeError("quepasa_download_not_configured")
+    request = urllib.request.Request(url, headers={"Accept": "application/octet-stream", "X-QUEPASA-TOKEN": api_key}, method="GET")
+    try:
+        with urllib.request.build_opener(_DenyRedirect()).open(request, timeout=30) as response:
+            data = response.read(cap + 1); content_type = str(response.headers.get("Content-Type") or "")[:120]
+    except RuntimeError:
+        raise
+    except urllib.error.HTTPError as exc:
+        if 300 <= int(exc.code) < 400: raise RuntimeError("quepasa_download_redirect_denied") from None
+        raise RuntimeError(f"quepasa_download_http_{int(exc.code)}") from None
+    except Exception as exc:
+        raise RuntimeError("quepasa_download_error") from exc
+    if not data: raise ValueError("quepasa_download_empty")
+    if len(data) > cap: raise ValueError("quepasa_download_too_large")
+    return data, content_type
+
+
 def send_presence_via_quepasa(payload: dict[str, Any], config: dict[str, Any]) -> dict[str, Any]:
     """Best-effort typing/presence call; never exposes target or provider body."""
     quepasa_raw = (config or {}).get("quepasa")
