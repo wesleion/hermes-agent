@@ -3,6 +3,7 @@
 The helper deliberately has no downloader, network client, persistence, or fallback.
 Inputs must already be normalized mono WAV files; normalization belongs to the caller.
 """
+
 from __future__ import annotations
 
 import json
@@ -23,7 +24,7 @@ _MAX_TEXT_CHARS = 16_000
 _MAX_SEGMENTS = 512
 _MAX_AUDIO_BYTES = 64 * 1024 * 1024
 _AUDIO_TIMEOUT_SECONDS = 60.0
-_CHILD_OUTPUT_BYTES = 32 * 1024
+_CHILD_OUTPUT_BYTES = 128 * 1024
 _WORKER_ADDRESS_SPACE_BYTES = 1536 * 1024 * 1024
 _WORKER_CPU_SECONDS = 60
 _WORKER_NOFILE = 64
@@ -31,8 +32,15 @@ _WORKER_FILE_BYTES = 32 * 1024 * 1024
 _LANGUAGE_RE = re.compile(r"^[A-Za-z]{2,8}(?:[-_][A-Za-z0-9]{2,8})?$")
 
 
-def _result(*, ok: bool, text: str = "", language: str = "", duration: float = 0.0,
-            truncated: bool = False, error: str | None = None) -> dict[str, Any]:
+def _result(
+    *,
+    ok: bool,
+    text: str = "",
+    language: str = "",
+    duration: float = 0.0,
+    truncated: bool = False,
+    error: str | None = None,
+) -> dict[str, Any]:
     value: dict[str, Any] = {
         "ok": ok,
         "text": text[:_MAX_TEXT_CHARS] if ok else "",
@@ -46,14 +54,21 @@ def _result(*, ok: bool, text: str = "", language: str = "", duration: float = 0
 
 
 def _safe_path(value: Any, *, directory: bool) -> Path | None:
-    if not isinstance(value, str) or not value or value != value.strip() or "://" in value:
+    if (
+        not isinstance(value, str)
+        or not value
+        or value != value.strip()
+        or "://" in value
+    ):
         return None
     try:
         path = Path(value)
         if not path.is_absolute() or path.is_symlink():
             return None
         resolved = path.resolve(strict=True)
-        if resolved != path or (not resolved.is_dir() if directory else not resolved.is_file()):
+        if resolved != path or (
+            not resolved.is_dir() if directory else not resolved.is_file()
+        ):
             return None
         return path
     except (OSError, ValueError):
@@ -72,7 +87,12 @@ def _normalized_wav(value: Any) -> tuple[Path, float] | None:
         if path.stat().st_size > _MAX_AUDIO_BYTES:
             return None
         with wave.open(str(path), "rb") as handle:
-            if (handle.getnchannels(), handle.getsampwidth(), handle.getframerate(), handle.getcomptype()) != (1, 2, 16_000, "NONE"):
+            if (
+                handle.getnchannels(),
+                handle.getsampwidth(),
+                handle.getframerate(),
+                handle.getcomptype(),
+            ) != (1, 2, 16_000, "NONE"):
                 return None
             duration = handle.getnframes() / 16_000
         return path, duration if math.isfinite(duration) and duration >= 0 else 0.0
@@ -90,7 +110,7 @@ def _set_limit(resource_type: int, value: int) -> None:
 
     _, hard = resource.getrlimit(resource_type)
     ceiling = value if hard == resource.RLIM_INFINITY else min(value, hard)
-    resource.setrlimit(resource_type, (ceiling, hard))
+    resource.setrlimit(resource_type, (ceiling, ceiling))
 
 
 def _apply_worker_limits() -> None:
@@ -106,8 +126,15 @@ def _apply_worker_limits() -> None:
 def _worker(model_path: str, audio_path: str, threads: int) -> dict[str, Any]:
     try:
         from faster_whisper import WhisperModel
-        model = WhisperModel(model_path, device="cpu", compute_type="int8", cpu_threads=threads,
-                             num_workers=1, local_files_only=True)
+
+        model = WhisperModel(
+            model_path,
+            device="cpu",
+            compute_type="int8",
+            cpu_threads=threads,
+            num_workers=1,
+            local_files_only=True,
+        )
         segments, info = model.transcribe(audio_path, vad_filter=True)
         chunks: list[str] = []
         truncated = False
@@ -129,8 +156,12 @@ def _worker(model_path: str, audio_path: str, threads: int) -> dict[str, Any]:
                 break
             chunks.append(text)
             used += len(text)
-        return {"ok": True, "text": "".join(chunks).strip(),
-                "language": _safe_language(getattr(info, "language", "")), "truncated": truncated}
+        return {
+            "ok": True,
+            "text": "".join(chunks).strip(),
+            "language": _safe_language(getattr(info, "language", "")),
+            "truncated": truncated,
+        }
     except Exception:
         return {"ok": False}
 
@@ -151,7 +182,9 @@ def _child_main(argv: list[str]) -> int:
             message = _worker(str(model_path), str(audio[0]), threads)
         except (OSError, ValueError):
             message = {"ok": False}
-    payload = json.dumps(message, separators=(",", ":"))[:_CHILD_OUTPUT_BYTES]
+    payload = json.dumps(message, separators=(",", ":"))
+    if len(payload.encode("utf-8")) > _CHILD_OUTPUT_BYTES:
+        payload = '{"ok":false}'
     try:
         os.write(sys.stdout.fileno(), payload.encode("utf-8") + b"\n")
     except OSError:
@@ -196,6 +229,35 @@ def _kill_process_group(process: subprocess.Popen[str]) -> None:
         pass
 
 
+def _read_child_message(process: subprocess.Popen, timeout: float) -> dict | None:
+    """One absolute deadline covers every partial read, not only first-byte wait."""
+    assert process.stdout is not None
+    deadline = time.monotonic() + min(_AUDIO_TIMEOUT_SECONDS, timeout)
+    data = bytearray()
+    try:
+        while len(data) <= _CHILD_OUTPUT_BYTES:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                return None
+            ready, _, _ = select.select([process.stdout], [], [], remaining)
+            if not ready:
+                return None
+            part = os.read(
+                process.stdout.fileno(), min(65536, _CHILD_OUTPUT_BYTES + 1 - len(data))
+            )
+            if not part:
+                break
+            data.extend(part)
+            if b"\n" in part:
+                break
+        if len(data) > _CHILD_OUTPUT_BYTES:
+            return None
+        value = json.loads(data)
+        return value if isinstance(value, dict) else None
+    except (OSError, ValueError):
+        return None
+
+
 class LocalMediaPerception:
     """Local audio perception only; image perception is intentionally not implemented here."""
 
@@ -220,19 +282,22 @@ class LocalMediaPerception:
         message: dict[str, Any] | None = None
         with tempfile.TemporaryDirectory(prefix="hunter-stt-") as home:
             process = subprocess.Popen(
-                [sys.executable, str(Path(__file__).resolve()), "--_hunter_stt_child",
-                 str(model_path), str(audio_path), str(self._threads)],
-                stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
-                text=True, env=_child_environment(self._threads, home), start_new_session=True,
+                [
+                    sys.executable,
+                    str(Path(__file__).resolve()),
+                    "--_hunter_stt_child",
+                    str(model_path),
+                    str(audio_path),
+                    str(self._threads),
+                ],
+                stdin=subprocess.DEVNULL,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.DEVNULL,
+                env=_child_environment(self._threads, home),
+                start_new_session=True,
             )
             try:
-                assert process.stdout is not None
-                ready, _, _ = select.select([process.stdout], [], [], self._AUDIO_TIMEOUT_SECONDS)
-                if ready:
-                    payload = process.stdout.readline(_CHILD_OUTPUT_BYTES + 1)
-                    if len(payload) <= _CHILD_OUTPUT_BYTES:
-                        possible = json.loads(payload)
-                        message = possible if isinstance(possible, dict) else None
+                message = _read_child_message(process, self._AUDIO_TIMEOUT_SECONDS)
             except (OSError, ValueError, json.JSONDecodeError):
                 message = None
             finally:
@@ -243,9 +308,13 @@ class LocalMediaPerception:
             return _result(ok=False, error="stt_timeout")
         if not message.get("ok"):
             return _result(ok=False, error="stt_failed")
-        return _result(ok=True, text=str(message.get("text", "")),
-                       language=_safe_language(message.get("language")), duration=duration,
-                       truncated=bool(message.get("truncated")))
+        return _result(
+            ok=True,
+            text=str(message.get("text", "")),
+            language=_safe_language(message.get("language")),
+            duration=duration,
+            truncated=bool(message.get("truncated")),
+        )
 
 
 if __name__ == "__main__":

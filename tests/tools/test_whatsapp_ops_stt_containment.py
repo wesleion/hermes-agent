@@ -1,4 +1,5 @@
 """OS-level containment contracts for the private local STT child."""
+
 from __future__ import annotations
 
 import json
@@ -18,7 +19,9 @@ sys.path.insert(0, str(TOOLS))
 
 def _state(pid: int) -> str | None:
     try:
-        return Path(f"/proc/{pid}/stat").read_text(encoding="utf-8").split(") ", 1)[1][0]
+        return (
+            Path(f"/proc/{pid}/stat").read_text(encoding="utf-8").split(") ", 1)[1][0]
+        )
     except FileNotFoundError:
         return None
 
@@ -29,13 +32,17 @@ def _wait_gone(pid: int, timeout: float = 5) -> None:
         state = _state(pid)
         if state is None:
             return
-        if state == "Z":
-            pytest.fail("STT descendant survived as a zombie")
+        # Orphans are reaped by init asynchronously. Observe until the bounded
+        # deadline; a transient zombie is not a live descendant or a leak.
         time.sleep(0.05)
+    if _state(pid) == "Z":
+        pytest.fail("STT descendant remained a zombie past the reap deadline")
     pytest.fail("STT descendant remained alive")
 
 
-def _probe(tmp_path: Path, *, contained: bool) -> tuple[subprocess.Popen[str], dict[str, object]]:
+def _probe(
+    tmp_path: Path, *, contained: bool
+) -> tuple[subprocess.Popen[str], dict[str, object]]:
     probe = tmp_path / ("contained.py" if contained else "legacy.py")
     apply = "_apply_worker_limits()" if contained else ""
     probe.write_text(
@@ -54,15 +61,22 @@ def _probe(tmp_path: Path, *, contained: bool) -> tuple[subprocess.Popen[str], d
         encoding="utf-8",
     )
     process = subprocess.Popen(
-        [sys.executable, str(probe)], stdout=subprocess.PIPE, text=True, start_new_session=True
+        [sys.executable, str(probe)],
+        stdout=subprocess.PIPE,
+        text=True,
+        start_new_session=True,
     )
     assert process.stdout is not None
     return process, json.loads(process.stdout.readline())
 
 
 @pytest.mark.live_system_guard_bypass
-@pytest.mark.skipif(os.name == "nt", reason="RLIMIT and process groups are POSIX contracts")
-def test_private_stt_child_applies_limits_and_group_kill_reaps_descendant(tmp_path: Path) -> None:
+@pytest.mark.skipif(
+    os.name == "nt", reason="RLIMIT and process groups are POSIX contracts"
+)
+def test_private_stt_child_applies_limits_and_group_kill_reaps_descendant(
+    tmp_path: Path,
+) -> None:
     """Reproduces legacy PID-only escape, then verifies real child limits and cleanup."""
     from whatsapp_ops_local_perception import _kill_process_group
 
@@ -71,7 +85,9 @@ def test_private_stt_child_applies_limits_and_group_kill_reaps_descendant(tmp_pa
     try:
         legacy.terminate()
         legacy.wait(timeout=5)
-        assert _state(legacy_child) not in (None, "Z"), "legacy PID-only cleanup must leak a live child"
+        assert _state(legacy_child) not in (None, "Z"), (
+            "legacy PID-only cleanup must leak a live child"
+        )
     finally:
         if _state(legacy_child) not in (None, "Z"):
             os.kill(legacy_child, signal.SIGKILL)
