@@ -22,8 +22,21 @@ def _state(pid: int) -> str | None:
         return (
             Path(f"/proc/{pid}/stat").read_text(encoding="utf-8").split(") ", 1)[1][0]
         )
-    except FileNotFoundError:
+    except (FileNotFoundError, ProcessLookupError):
         return None
+
+
+def test_process_disappearance_during_proc_read_is_gone(monkeypatch) -> None:
+    original = Path.read_text
+    sentinel = Path("/proc/987654321/stat")
+
+    def disappeared(path, *args, **kwargs):
+        if path == sentinel:
+            raise ProcessLookupError(3, "synthetic process exit during proc read")
+        return original(path, *args, **kwargs)
+
+    monkeypatch.setattr(Path, "read_text", disappeared)
+    assert _state(987654321) is None
 
 
 def _wait_gone(pid: int, timeout: float = 5) -> None:
