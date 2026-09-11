@@ -464,6 +464,186 @@ def test_legacy_media_switch_off_creates_no_media_job_and_leaves_text_running(pi
     assert p.dispatcher.run_once() == 1
 
 
+@pytest.mark.parametrize(
+    "fmt,kind",
+    [("PNG", "image"), ("JPEG", "image"), ("WEBP", "sticker"), ("GIF", "image")],
+)
+def test_candidate_package_config_decodes_real_pixels_before_vision(pilot, fmt, kind):
+    import yaml
+
+    p = pilot
+    # Same schema as the package, with only the allowed pilot enabled in tempDB.
+    template = Path(
+        "/home/won-agent/worktrees/nyx-hunter-multimodal-20260910/profiles/hunter-won-wpp-ops/config.template.yaml"
+    )
+    cfg = yaml.safe_load(template.read_text())
+    p.cfg["whatsapp_ops"]["media_perception"] = cfg["whatsapp_ops"]["media_perception"]
+    m = p.cfg["whatsapp_ops"]["media_perception"]
+    m["enabled"] = True
+    m["local"].update(
+        ffmpeg_binary="/home/won-agent/.cache/hunter-multimodal/ffmpeg-static/bin/ffmpeg",
+        ffprobe_binary="/home/won-agent/.cache/hunter-multimodal/ffmpeg-static/bin/ffprobe",
+    )
+    out = io.BytesIO()
+    frames = [Image.new("RGB", (32, 24), color) for color in ("red", "blue")]
+    if fmt in ("WEBP", "GIF"):
+        frames[0].save(
+            out,
+            format=fmt,
+            save_all=True,
+            append_images=frames[1:],
+            duration=100,
+            lossless=True,
+        )
+    else:
+        frames[0].save(out, format=fmt)
+    requests = []
+
+    class Vision:
+        def __init__(self):
+            self.chat = SimpleNamespace(completions=self)
+
+        def create(self, **kw):
+            requests.append(kw)
+            assert kw["messages"][0]["content"][1]["image_url"]["url"].startswith(
+                "data:image/png;base64,"
+            )
+            return SimpleNamespace(
+                choices=[
+                    SimpleNamespace(
+                        message=SimpleNamespace(
+                            content='{"ocr_text":"","description":"imagem sintética colorida","uncertainty":"figurinha não prova consentimento"}'
+                        )
+                    )
+                ]
+            )
+
+    p.ingest(kind=kind, event="real-" + fmt)
+    worker = p.worker(
+        decoder=None,
+        downloader=lambda *_: (out.getvalue(), "application/octet-stream"),
+        vision_client=Vision(),
+    )
+    assert worker.run_once()
+    p.now[0] += timedelta(seconds=5)
+    assert p.dispatcher.run_once() == 1
+    assert len(requests) == 1
+    with store._connect() as conn:
+        assert (
+            conn.execute("SELECT status FROM media_jobs").fetchone()[0] == "completed"
+        )
+        assert (
+            "imagem sintética"
+            in conn.execute("SELECT text FROM media_evidence").fetchone()[0]
+        )
+
+
+@pytest.mark.asyncio
+async def test_http_png_to_default_decoder_evidence_conversation_and_receipt(
+    pilot, monkeypatch
+):
+    import hashlib, hmac, time
+    from aiohttp import ClientSession
+    from gateway.config import PlatformConfig
+    from gateway.platforms.webhook import WebhookAdapter
+    import gateway.whatsapp_ops_media_worker as workers
+    import gateway.whatsapp_ops_batch_dispatch as dispatchers
+
+    p = pilot
+    p.cfg["whatsapp_ops"]["media_perception"]["local"].update(
+        ffmpeg_binary="/home/won-agent/.cache/hunter-multimodal/ffmpeg-static/bin/ffmpeg",
+        ffprobe_binary="/home/won-agent/.cache/hunter-multimodal/ffmpeg-static/bin/ffprobe",
+    )
+    out = io.BytesIO()
+    Image.new("RGB", (24, 24), "blue").save(out, format="PNG")
+    reached = threading.Event()
+    calls = []
+
+    class Vision:
+        def __init__(self):
+            self.chat = SimpleNamespace(completions=self)
+
+        def create(self, **kw):
+            calls.append(kw)
+            assert kw["messages"][0]["content"][1]["image_url"]["url"].startswith(
+                "data:image/png;base64,"
+            )
+            reached.set()
+            return SimpleNamespace(
+                choices=[
+                    SimpleNamespace(
+                        message=SimpleNamespace(
+                            content='{"ocr_text":"","description":"quadro azul de teste","uncertainty":""}'
+                        )
+                    )
+                ]
+            )
+
+    worker = p.worker(
+        decoder=None,
+        downloader=lambda *_: (out.getvalue(), "image/png"),
+        vision_client=Vision(),
+    )
+    monkeypatch.setattr(workers, "WhatsAppOpsMediaWorker", lambda: worker)
+    monkeypatch.setattr(dispatchers, "FriendsBatchDispatcher", lambda: p.dispatcher)
+    adapter = WebhookAdapter(
+        PlatformConfig(
+            enabled=True,
+            extra={
+                "host": "127.0.0.1",
+                "port": 0,
+                "routes": {"media": {"kind": "quepasa_inbound", "secret": "test-hmac"}},
+            },
+        )
+    )
+    adapter.handle_message = AsyncMock()
+    adapter._direct_deliver = AsyncMock()
+    assert await adapter.connect()
+    try:
+        port = next(iter(adapter._runner.sites))._server.sockets[0].getsockname()[1]
+        data = json.dumps(p.payload(kind="image", event="e2e-png")).encode()
+        headers = {
+            "X-Webhook-Signature": hmac.new(
+                b"test-hmac", data, hashlib.sha256
+            ).hexdigest()
+        }
+        async with ClientSession() as client:
+            async with client.post(
+                f"http://127.0.0.1:{port}/webhooks/media", data=data, headers=headers
+            ) as response:
+                assert response.status == 200
+            assert await asyncio.to_thread(reached.wait, 15)
+            for _ in range(80):
+                with store._connect() as conn:
+                    done = conn.execute(
+                        "SELECT count(*) FROM media_jobs WHERE status='completed'"
+                    ).fetchone()[0]
+                if done:
+                    break
+                await asyncio.sleep(0.05)
+            assert done == 1
+            p.now[0] += timedelta(seconds=5)
+            await asyncio.to_thread(p.dispatcher.run_once)
+            assert len(p.calls) == 1
+            assert any("quadro azul" in x["text"] for x in p.inputs[-1]["messages"])
+            async with client.post(
+                f"http://127.0.0.1:{port}/webhooks/media", data=data, headers=headers
+            ) as response:
+                assert response.status == 200
+            assert len(calls) == 1
+            with store._connect() as conn:
+                assert (
+                    conn.execute(
+                        "SELECT count(*) FROM friends_inbound_queue"
+                    ).fetchone()[0]
+                    == 1
+                )
+    finally:
+        await adapter.disconnect()
+    adapter.handle_message.assert_not_called()
+    adapter._direct_deliver.assert_not_called()
+
+
 def test_voice_optout_completion_stops_before_any_reply(pilot):
     p = pilot
     p.ingest()

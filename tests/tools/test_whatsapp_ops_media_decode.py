@@ -216,6 +216,53 @@ def test_short_mp4_samples_distinct_frames(tmp_path):
     assert len(set(pixels)) > 1
 
 
+def _animated_webp(duration=200):
+    frames = [Image.new("RGB", (16, 16), color) for color in ("red", "blue")]
+    out = io.BytesIO()
+    frames[0].save(
+        out,
+        format="WEBP",
+        save_all=True,
+        append_images=frames[1:],
+        duration=duration,
+        lossless=True,
+    )
+    return out.getvalue()
+
+
+def test_animated_sticker_duration_is_checked_even_without_animation_flag(tmp_path):
+    assert (
+        _decode(_animated_webp(9000), "sticker", tmp_path)["error"]
+        == "animation_duration_exceeded"
+    )
+
+
+def test_single_requested_animation_frame_does_not_divide_by_zero(tmp_path):
+    result = _decode(_animated_webp(), "sticker", tmp_path, max_vision_frames=1)
+    assert result["ok"] and result["frame_count"] == 1
+
+
+def test_decoder_timeout_terminates_the_whole_process_group(monkeypatch):
+    import signal
+    from tools import whatsapp_ops_media_decode as module
+
+    calls = []
+
+    class Child:
+        pid = 987654321
+
+        def communicate(self, *args, **kwargs):
+            if kwargs.get("timeout"):
+                raise subprocess.TimeoutExpired("bounded-child", kwargs["timeout"])
+            calls.append("reaped")
+            return "", None
+
+    monkeypatch.setattr(module.subprocess, "Popen", lambda *a, **k: Child())
+    monkeypatch.setattr(module.os, "killpg", lambda pid, sig: calls.append((pid, sig)))
+    assert module._run_child({}) == {"ok": False, "error": "decode_timeout"}
+    assert calls == [(987654321, signal.SIGKILL), "reaped"]
+
+
 def test_animation_duration_limit(tmp_path):
     video = tmp_path / "long.mp4"
     _ffmpeg(

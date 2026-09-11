@@ -182,7 +182,16 @@ class WhatsAppOpsMediaWorker:
             return self.decoder(data, kind, mime, settings, tmp)
         from tools.whatsapp_ops_media_decode import decode_media
 
-        return decode_media(data, kind, mime, settings, tmp)
+        local = settings.get("local", {})
+        local = local if isinstance(local, dict) else {}
+        decode_config = {
+            **settings,
+            **{
+                k: local.get(k)
+                for k in ("ffmpeg_binary", "ffprobe_binary", "max_threads")
+            },
+        }
+        return decode_media(data, kind, mime, decode_config, tmp)
 
     def _perceive(self, decoded, kind, settings):
         if kind == "audio":
@@ -316,6 +325,18 @@ class WhatsAppOpsMediaWorker:
     @staticmethod
     def _safe_error(error):
         allowed = {
+            "unsupported_media",
+            "output_dir_invalid",
+            "audio_bytes_exceeded",
+            "image_bytes_exceeded",
+            "audio_duration_exceeded",
+            "animation_duration_exceeded",
+            "image_pixels_exceeded",
+            "image_frames_exceeded",
+            "audio_stream_missing",
+            "video_stream_missing",
+            "decode_failed",
+            "decoder_unavailable",
             "media_corrupt",
             "media_size_invalid",
             "media_decode_failed",

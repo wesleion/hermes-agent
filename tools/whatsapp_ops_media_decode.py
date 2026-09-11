@@ -6,11 +6,11 @@ are returned to the caller-owned private directory.
 
 from __future__ import annotations
 
-# fmt: off
 import io
 import json
 import math
 import os
+import signal
 import stat
 import subprocess
 import sys
@@ -18,6 +18,7 @@ import uuid
 import wave
 from pathlib import Path
 from typing import Any
+
 _MAX_AUDIO_BYTES = 20 * 1024 * 1024
 _MAX_IMAGE_BYTES = 10 * 1024 * 1024
 _MAX_IMAGE_PIXELS = 20_000_000
@@ -49,32 +50,82 @@ _MAGIC = (
     (b"OggS", "audio/ogg", ".ogg"),
     (b"ID3", "audio/mpeg", ".mp3"),
 )
-def decode_media(data: bytes, kind: str, declared_mime: str, config: dict, output_dir: str) -> dict:
+
+
+def decode_media(
+    data: bytes, kind: str, declared_mime: str, config: dict, output_dir: str
+) -> dict:
     """Decode known media bytes in a finite isolated child process."""
     del declared_mime
-    if not isinstance(data, bytes) or kind not in {"audio", "image", "sticker", "animation"}: return _failure("unsupported_media")
+    if not isinstance(data, bytes) or kind not in {
+        "audio",
+        "image",
+        "sticker",
+        "animation",
+    }:
+        return _failure("unsupported_media")
     directory = _safe_directory(output_dir)
     detected = _sniff(data)
-    if directory is None: return _failure("output_dir_invalid")
-    if detected is None: return _failure("unsupported_media")
+    if directory is None:
+        return _failure("output_dir_invalid")
+    if detected is None:
+        return _failure("unsupported_media")
     mime, suffix = detected
-    accepted = (kind == "audio" and (mime.startswith("audio/") or mime == "video/mp4")) or (kind != "audio" and mime.startswith("image/")) or (kind == "animation" and mime == "video/mp4")
-    if not accepted: return _failure("unsupported_media")
+    accepted = (
+        (kind == "audio" and (mime.startswith("audio/") or mime == "video/mp4"))
+        or (kind != "audio" and mime.startswith("image/"))
+        or (kind == "animation" and mime == "video/mp4")
+    )
+    if not accepted:
+        return _failure("unsupported_media")
     limits = _limits(config)
-    if len(data) > limits["max_audio_bytes" if kind == "audio" else "max_image_bytes"]: return _failure("audio_bytes_exceeded" if kind == "audio" else "image_bytes_exceeded")
+    if len(data) > limits["max_audio_bytes" if kind == "audio" else "max_image_bytes"]:
+        return _failure(
+            "audio_bytes_exceeded" if kind == "audio" else "image_bytes_exceeded"
+        )
     binaries = _binaries(config)
-    if binaries is None: return _failure("decoder_unavailable")
-    token = uuid.uuid4().hex; input_path = directory / f".hunter-decode-{token}{suffix}"
+    if binaries is None:
+        return _failure("decoder_unavailable")
+    token = uuid.uuid4().hex
+    input_path = directory / f".hunter-decode-{token}{suffix}"
     try:
-        with os.fdopen(os.open(input_path, os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_NOFOLLOW", 0), 0o600), "wb") as handle: handle.write(data)
-        result = _run_child({"input": str(input_path), "output": str(directory), "token": token, "kind": kind, "mime": mime, "ffmpeg": binaries[0], "ffprobe": binaries[1], "limits": limits})
-        return _validate_result(result, directory, token, kind) if result.get("ok") else _failure(result.get("error", "decode_failed"))
-    except OSError: return _failure("decode_failed")
+        with os.fdopen(
+            os.open(
+                input_path,
+                os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_NOFOLLOW", 0),
+                0o600,
+            ),
+            "wb",
+        ) as handle:
+            handle.write(data)
+        result = _run_child({
+            "input": str(input_path),
+            "output": str(directory),
+            "token": token,
+            "kind": kind,
+            "mime": mime,
+            "ffmpeg": binaries[0],
+            "ffprobe": binaries[1],
+            "limits": limits,
+        })
+        return (
+            _validate_result(result, directory, token, kind)
+            if result.get("ok")
+            else _failure(result.get("error", "decode_failed"))
+        )
+    except OSError:
+        return _failure("decode_failed")
     finally:
-        try: input_path.unlink(missing_ok=True)
-        except OSError: pass
+        try:
+            input_path.unlink(missing_ok=True)
+        except OSError:
+            pass
+
+
 def _failure(code: str) -> dict:
     return {"ok": False, "error": code if code in _ERRORS else "decode_failed"}
+
+
 def _sniff(data: bytes) -> tuple[str, str] | None:
     for marker, mime, suffix in _MAGIC:
         if data.startswith(marker):
@@ -89,66 +140,197 @@ def _sniff(data: bytes) -> tuple[str, str] | None:
         return "video/mp4", ".mp4"
     return None
 
+
 def _limits(config: dict) -> dict:
     source = config if isinstance(config, dict) else {}
-    defaults = {"max_audio_bytes": _MAX_AUDIO_BYTES, "max_image_bytes": _MAX_IMAGE_BYTES, "max_image_pixels": _MAX_IMAGE_PIXELS, "max_audio_seconds": 300, "max_animation_seconds": 15, "max_vision_frames": 4, "max_threads": 2}
+    defaults = {
+        "max_audio_bytes": _MAX_AUDIO_BYTES,
+        "max_image_bytes": _MAX_IMAGE_BYTES,
+        "max_image_pixels": _MAX_IMAGE_PIXELS,
+        "max_audio_seconds": 300,
+        "max_animation_seconds": 15,
+        "max_vision_frames": 4,
+        "max_threads": 2,
+    }
+
     def cap(key, value):
-        try: return max(1, min(int(source.get(key, value)), value))
-        except (TypeError, ValueError): return value
+        try:
+            return max(1, min(int(source.get(key, value)), value))
+        except (TypeError, ValueError):
+            return value
+
     return {key: cap(key, value) for key, value in defaults.items()}
+
+
 def _binaries(config: dict) -> tuple[str, str] | None:
-    values = (config.get("ffmpeg_binary"), config.get("ffprobe_binary")) if isinstance(config, dict) else ()
-    return values if len(values) == 2 and all(isinstance(value, str) and os.path.isabs(value) and os.path.isfile(value) and os.access(value, os.X_OK) for value in values) else None
+    values = (
+        (config.get("ffmpeg_binary"), config.get("ffprobe_binary"))
+        if isinstance(config, dict)
+        else ()
+    )
+    return (
+        values
+        if len(values) == 2
+        and all(
+            isinstance(value, str)
+            and os.path.isabs(value)
+            and os.path.isfile(value)
+            and os.access(value, os.X_OK)
+            for value in values
+        )
+        else None
+    )
+
+
 def _safe_directory(value: str) -> Path | None:
-    if not isinstance(value, str) or not os.path.isabs(value): return None
+    if not isinstance(value, str) or not os.path.isabs(value):
+        return None
     try:
         path = Path(value)
-        if not path.is_dir() or any(part.is_symlink() for part in (path, *path.parents)): return None
+        if not path.is_dir() or any(
+            part.is_symlink() for part in (path, *path.parents)
+        ):
+            return None
         return path.resolve(strict=True)
-    except OSError: return None
+    except OSError:
+        return None
+
 
 def _run_child(spec: dict) -> dict:
     root = str(Path(__file__).resolve().parent.parent)
+    process = None
     try:
-        done = subprocess.run([sys.executable, "-m", "tools.whatsapp_ops_media_decode", "--child"], input=json.dumps(spec), text=True, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, timeout=30, start_new_session=True, cwd=root, env={"PATH": os.defpath, "LANG": "C", "LC_ALL": "C", "PYTHONPATH": root}, check=False)
-        return json.loads(done.stdout) if done.returncode == 0 and len(done.stdout) <= 8192 else _failure("decode_failed")
-    except subprocess.TimeoutExpired: return _failure("decode_timeout")
-    except (OSError, ValueError, TypeError): return _failure("decode_failed")
+        process = subprocess.Popen(
+            [sys.executable, "-m", "tools.whatsapp_ops_media_decode", "--child"],
+            stdin=subprocess.PIPE,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.DEVNULL,
+            text=True,
+            start_new_session=True,
+            cwd=root,
+            env={
+                "PATH": os.defpath,
+                "LANG": "C",
+                "LC_ALL": "C",
+                "PYTHONPATH": root,
+                "PYTHONDONTWRITEBYTECODE": "1",
+            },
+        )
+        output, _ = process.communicate(json.dumps(spec), timeout=30)
+        result = (
+            json.loads(output)
+            if process.returncode == 0 and len(output) <= 8192
+            else None
+        )
+        return result if isinstance(result, dict) else _failure("decode_failed")
+    except subprocess.TimeoutExpired:
+        return _failure("decode_timeout")
+    except (OSError, ValueError, TypeError):
+        return _failure("decode_failed")
+    finally:
+        if process is not None:
+            try:
+                os.killpg(process.pid, signal.SIGKILL)
+            except ProcessLookupError:
+                pass
+            process.communicate()
+
+
 def _validate_result(result: dict, directory: Path, token: str, kind: str) -> dict:
     def owned(value, suffix):
         try:
             path = Path(value)
             info = path.lstat()
-            return path if path.parent == directory and path.name.startswith(f".hunter-decode-{token}-") and path.suffix == suffix and stat.S_ISREG(info.st_mode) and not stat.S_ISLNK(info.st_mode) else None
-        except (TypeError, OSError): return None
+            return (
+                path
+                if path.parent == directory
+                and path.name.startswith(f".hunter-decode-{token}-")
+                and path.suffix == suffix
+                and stat.S_ISREG(info.st_mode)
+                and not stat.S_ISLNK(info.st_mode)
+                else None
+            )
+        except (TypeError, OSError):
+            return None
+
     if kind == "audio":
         path = owned(result.get("audio_path"), ".wav")
         try:
-            with wave.open(str(path), "rb") as decoded: valid = decoded.getnchannels() == 1 and decoded.getframerate() == 16_000 and decoded.getsampwidth() == 2
-        except (OSError, wave.Error): valid = False
-        return {"ok": True, "kind": "audio", "audio_path": str(path), "duration_seconds": float(result["duration_seconds"]), "mime": str(result["mime"])} if path and valid else _failure("decode_failed")
-    paths = [owned(item, ".png") for item in result.get("frames", [])] if isinstance(result.get("frames"), list) else []
-    if not 1 <= len(paths) <= _MAX_VISION_FRAMES or any(path is None or path.stat().st_size > 20 * 1024 * 1024 for path in paths): return _failure("decode_failed")
-    return {"ok": True, "kind": kind, "frames": [path.read_bytes() for path in paths], "duration_seconds": float(result["duration_seconds"]), "frame_count": len(paths), "sampled": bool(result["sampled"]), "mime": str(result["mime"])}
+            with wave.open(str(path), "rb") as decoded:
+                valid = (
+                    decoded.getnchannels() == 1
+                    and decoded.getframerate() == 16_000
+                    and decoded.getsampwidth() == 2
+                )
+        except (OSError, wave.Error):
+            valid = False
+        return (
+            {
+                "ok": True,
+                "kind": "audio",
+                "audio_path": str(path),
+                "duration_seconds": float(result["duration_seconds"]),
+                "mime": str(result["mime"]),
+            }
+            if path and valid
+            else _failure("decode_failed")
+        )
+    paths = (
+        [owned(item, ".png") for item in result.get("frames", [])]
+        if isinstance(result.get("frames"), list)
+        else []
+    )
+    if not 1 <= len(paths) <= _MAX_VISION_FRAMES or any(
+        path is None or path.stat().st_size > 20 * 1024 * 1024 for path in paths
+    ):
+        return _failure("decode_failed")
+    return {
+        "ok": True,
+        "kind": kind,
+        "frames": [path.read_bytes() for path in paths],
+        "duration_seconds": float(result["duration_seconds"]),
+        "frame_count": len(paths),
+        "sampled": bool(result["sampled"]),
+        "mime": str(result["mime"]),
+    }
+
 
 def _child_main() -> None:
     try:
         import resource
+
         resource.setrlimit(resource.RLIMIT_AS, (1024 * 1024 * 1024, 1024 * 1024 * 1024))
         resource.setrlimit(resource.RLIMIT_CPU, (20, 20))
+        resource.setrlimit(resource.RLIMIT_FSIZE, (32 * 1024 * 1024, 32 * 1024 * 1024))
+        resource.setrlimit(resource.RLIMIT_NOFILE, (64, 64))
+        os.umask(0o077)
         spec = json.loads(sys.stdin.read(8192))
         result = _child_decode(spec)
     except Exception:
         result = _failure("decode_failed")
     sys.stdout.write(json.dumps(result, separators=(",", ":")))
+
+
 def _child_decode(spec: Any) -> dict:
-    if not isinstance(spec, dict): return _failure("decode_failed")
-    input_path, output, token = (Path(str(spec.get(key, ""))) for key in ("input", "output", "token"))
-    if not input_path.is_file() or output != input_path.parent or len(token.name) != 32: return _failure("decode_failed")
+    if not isinstance(spec, dict):
+        return _failure("decode_failed")
+    input_path, output, token = (
+        Path(str(spec.get(key, ""))) for key in ("input", "output", "token")
+    )
+    if not input_path.is_file() or output != input_path.parent or len(token.name) != 32:
+        return _failure("decode_failed")
     kind, mime, limits = spec.get("kind"), spec.get("mime"), spec.get("limits")
-    if kind == "audio": return _decode_audio(input_path, output, token.name, mime, limits, spec)
-    if kind in {"image", "sticker", "animation"}: return _decode_mp4(input_path, output, token.name, kind, mime, limits, spec) if mime == "video/mp4" else _decode_pillow(input_path, output, token.name, kind, mime, limits)
+    if kind == "audio":
+        return _decode_audio(input_path, output, token.name, mime, limits, spec)
+    if kind in {"image", "sticker", "animation"}:
+        return (
+            _decode_mp4(input_path, output, token.name, kind, mime, limits, spec)
+            if mime == "video/mp4"
+            else _decode_pillow(input_path, output, token.name, kind, mime, limits)
+        )
     return _failure("decode_failed")
+
+
 def _probe(path: Path, spec: dict) -> dict | None:
     command = [
         spec["ffprobe"],
@@ -174,6 +356,8 @@ def _probe(path: Path, spec: dict) -> dict | None:
         return json.loads(done.stdout) if done.returncode == 0 else None
     except (OSError, ValueError, subprocess.TimeoutExpired):
         return None
+
+
 def _probe_duration(probe: dict) -> float | None:
     values = [(probe.get("format") or {}).get("duration")] + [
         stream.get("duration")
@@ -188,6 +372,8 @@ def _probe_duration(probe: dict) -> float | None:
         except (TypeError, ValueError):
             pass
     return None
+
+
 def _decode_audio(
     input_path: Path, output: Path, token: str, mime: str, limits: dict, spec: dict
 ) -> dict:
@@ -219,6 +405,8 @@ def _decode_audio(
         "file,pipe",
         "-i",
         str(input_path),
+        "-t",
+        str(limits["max_audio_seconds"] + 0.1),
         "-map",
         "0:a:0",
         "-vn",
@@ -251,11 +439,13 @@ def _decode_audio(
         "mime": mime,
     }
 
+
 def _decode_pillow(
     input_path: Path, output: Path, token: str, kind: str, mime: str, limits: dict
 ) -> dict:
     try:
         from PIL import Image, ImageOps
+
         with Image.open(input_path) as source:
             count, width, height = (
                 int(getattr(source, "n_frames", 1)),
@@ -266,12 +456,14 @@ def _decode_pillow(
                 return _failure("image_frames_exceeded")
             if width * height > limits["max_image_pixels"]:
                 return _failure("image_pixels_exceeded")
-            durations = [
-                max(0, int(source.seek(index) or source.info.get("duration", 0)))
-                for index in range(count)
-            ]
+            durations = []
+            for index in range(count):
+                source.seek(index)
+                # WebP publishes per-frame duration only after load(), unlike GIF.
+                source.load()
+                durations.append(max(0, int(source.info.get("duration", 0))))
             duration = sum(durations) / 1000.0
-            if kind == "animation" and duration > limits["max_animation_seconds"]:
+            if count > 1 and duration > limits["max_animation_seconds"]:
                 return _failure("animation_duration_exceeded")
             indexes = _sample_indexes(count, durations, limits["max_vision_frames"])
             frames = []
@@ -295,8 +487,12 @@ def _decode_pillow(
         "sampled": count > 1,
         "mime": mime,
     }
+
+
 def _sample_indexes(count: int, durations: list[int], maximum: int) -> list[int]:
     selected = min(count, maximum)
+    if selected == 1:
+        return [0]
     if selected == count:
         return list(range(count))
     total = sum(durations)
@@ -311,6 +507,8 @@ def _sample_indexes(count: int, durations: list[int], maximum: int) -> list[int]
             cursor += 1
         points.append(cursor)
     return points
+
+
 def _decode_mp4(
     input_path: Path,
     output: Path,
@@ -394,6 +592,8 @@ def _decode_mp4(
         "sampled": count > 1,
         "mime": mime,
     }
+
+
 def _command(command: list[str]) -> bool:
     try:
         return (
@@ -408,6 +608,7 @@ def _command(command: list[str]) -> bool:
         )
     except (OSError, subprocess.TimeoutExpired):
         return False
+
+
 if __name__ == "__main__" and sys.argv[1:] == ["--child"]:
     _child_main()
-# fmt: on
