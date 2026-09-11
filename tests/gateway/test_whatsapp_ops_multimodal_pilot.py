@@ -666,6 +666,33 @@ def test_voice_optout_completion_stops_before_any_reply(pilot):
         )
 
 
+
+
+@pytest.mark.asyncio
+async def test_concurrent_scavenger_preserves_actual_inflight_normalized_audio(pilot):
+    import os
+    p=pilot;entered=threading.Event();release=threading.Event();paths=[]
+    p.cfg['whatsapp_ops']['media_perception']['cache_ttl_seconds']=1
+    class Delayed:
+        def transcribe_audio(self,path):
+            paths.append(Path(path));entered.set();release.wait(5)
+            return {'ok':True,'text':'agenda','truncated':False}
+    p.ingest(event='active-cache-regression')
+    worker_a=p.worker(perception=Delayed());worker_b=p.worker()
+    task=asyncio.create_task(asyncio.to_thread(worker_a.run_once))
+    try:
+        assert await asyncio.to_thread(entered.wait,4)
+        assert paths[0].is_file()
+        old=p.now[0].timestamp()-2
+        os.utime(paths[0].parent,(old,old))
+        worker_b._cleanup()
+        active_preserved=paths[0].is_file()
+    finally:
+        release.set();await asyncio.wait_for(task,5)
+    assert active_preserved,'scavenger deleted active normalized audio under perception'
+    assert len(p.downloads)==1 and not p.calls
+
+
 def test_completed_job_cache_cleanup_never_follows_symlink(pilot):
     p = pilot
     p.ingest()
