@@ -939,6 +939,21 @@ class _RefreshDone(Exception):
         self.result = result
 
 
+def _codex_plan(entry: PooledCredential) -> str:
+    """Return the ChatGPT plan claim carried by a Codex access token."""
+    claims = _decode_jwt_claims(entry.access_token) or {}
+    auth_claim = claims.get("https://api.openai.com/auth")
+    return str(auth_claim.get("chatgpt_plan_type") or "").lower() if isinstance(auth_claim, dict) else ""
+
+
+def _prefer_codex_plan(entries: list[PooledCredential]) -> list[PooledCredential]:
+    """Prefer Plus for normal routes and Free only for delegated children."""
+    from agent.delegation_context import is_delegated_child_context
+    want_free = is_delegated_child_context()
+    preferred = [entry for entry in entries if (_codex_plan(entry) == "free") == want_free]
+    return preferred or entries
+
+
 class CredentialPool(CredentialPoolSelectionMixin, CredentialPoolAdminMixin, CredentialPoolModelCooldownMixin):
     def __init__(self, provider: str, entries: list[PooledCredential]):
         self.provider = provider
@@ -2072,6 +2087,8 @@ class CredentialPool(CredentialPoolSelectionMixin, CredentialPoolAdminMixin, Cre
             self._entries = [e for e in self._entries if e.id not in pruned_ids]
         if cleared_any:
             self._persist(removed_ids=entries_to_prune)
+        if self.provider == "openai-codex" and len(available) > 1:
+            available = _prefer_codex_plan(available)
         return available, pending_refresh
 
     def _log_no_available_entries(self) -> None:
@@ -2261,6 +2278,9 @@ class CredentialPool(CredentialPoolSelectionMixin, CredentialPoolAdminMixin, Cre
             # Mirror select(): a pool whose entries all needed a deferred
             # refresh must retry once they are back in rotation, or the caller
             # sees "no credentials available" after a successful refresh.
+            if chosen_id is not None and self.provider == "openai-codex":
+                self.release_lease(chosen_id)
+                chosen_id = None
             if chosen_id is None:
                 chosen_id, _ = self._acquire_lease_under_lock(credential_id)
         return chosen_id

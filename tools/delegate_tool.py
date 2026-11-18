@@ -403,7 +403,11 @@ def _run_single_child(
     """
     child_progress_cb = getattr(child, "tool_progress_callback", None)
     try:
-        child_pool, leased_cred_id = _lease_child_credential(child)
+        # local-patch (weslei, codex-free-plus): lease selection uses child-only Codex plan preference;
+        # the parent route stays Plus-first.
+        from agent.delegation_context import delegated_child_context
+        with delegated_child_context(str(getattr(child, "session_id", "") or "")):
+            child_pool, leased_cred_id = _lease_child_credential(child)
         # Heartbeat keeps the parent's _last_activity_ts moving so the gateway inactivity timeout doesn't fire while
         # the child works; once the child looks stale (see _HEARTBEAT_STALE_CYCLES_*) it also ends await_child's wait.
         heartbeat = _Heartbeat(child, parent_agent, task_index)

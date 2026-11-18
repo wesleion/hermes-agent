@@ -33,7 +33,7 @@ class CredentialPoolSelectionMixin:
         if pending_refresh:
             self._refresh_pending_entries(pending_refresh)
             # Re-select now that the refreshed entries are back in the pool.
-            if entry is None:
+            if entry is None or (self.provider == "openai-codex" and len(pending_refresh) > 0):  # local-patch (weslei, codex-free-plus)
                 entry, _ = self._select_under_lock(model=model, endpoint_url=endpoint_url)
         if entry is not None:
             self._unmatched_rotation_streak = 0

@@ -44,6 +44,9 @@ def model_cooldown_until(entry: PooledCredential, model: Optional[str]) -> Optio
     values = cooldowns.values() if not model else (cooldowns.get(model),)
     now = time.time()
     active = [float(until) for until in values if isinstance(until, (int, float)) and until > now]
+    if not model:
+        # Entitlement benches are model-specific; an unscoped route may still use the account.
+        active = [until for until in active if until - now < MODEL_ENTITLEMENT_BENCH_SECONDS / 2]
     return max(active) if active else None
 
 
