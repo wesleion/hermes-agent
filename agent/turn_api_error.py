@@ -150,6 +150,23 @@ def handle_api_error(
     if _recovered:
         return _verdict("continue")
 
+    # local-patch (weslei): subscription/quota 429s on providers whose account
+    # pool cannot recover must enter the configured model chain before
+    # compute_error_backoff() can honor a provider Retry-After (up to 600s).
+    # Anthropic and the external agy bridge are deliberately narrow here:
+    # providers with a real credential pool still get pool rotation first.
+    if (
+        classified.reason == FailoverReason.rate_limit
+        and getattr(agent, "provider", "") in {"anthropic", "antigravity-agy"}
+        and agent._has_pending_fallback()
+    ):
+        reset_at = error_context.get("reset_at") if isinstance(error_context, dict) else None
+        if agent._try_activate_fallback(reason=classified.reason, reset_at=reset_at):
+            from agent.conversation_loop import _arm_fallback_restart
+            active_system_prompt = _arm_fallback_restart(agent, api_messages, active_system_prompt, _retry)
+            retry_count = compression_attempts = 0
+            return _verdict("break")
+
     retry_count += 1
     elapsed_time = time.time() - api_start_time
     # Liveness/watchdog label only (never shown in chat), so the classifier's
